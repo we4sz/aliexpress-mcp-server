@@ -9,7 +9,7 @@ Read-only by design: it searches, fetches product details, and checks shipping. 
 - `search_products(query, min_rating, max_price, sort_by)` — searches the public wholesale search URL and parses the embedded JSON.
 - `get_product_details(item_id | url)` — title, price, discount, rating, sold count, seller, shipping cost & ETA.
 - `get_shipping_estimate(item_id)` — shipping cost + ETA to the configured country.
-- `view_cart()` — stub; see *Known Limitations* below.
+- `view_cart()` — current cart contents via the signed `mtop.aliexpress.trade.cart.render` endpoint. Read-only.
 
 ## How it works
 
@@ -59,9 +59,8 @@ Search still uses the simpler HTML path (embedded `window.runParams` JSON from t
 
 ## Known limitations
 
-- **Cart viewer is a stub.** The cart page is CSR too — a working version needs its own MTOP endpoint call (likely `mtop.aliexpress.trade.cart.queryCart`). Tracked as future work.
 - **Low-volume / brand-new listings** sometimes return empty MTOP responses (endpoint returns `SUCCESS` but an empty data block). Likely a region/visibility gate. Search results still show the listing fine.
-- **Cookies expire.** When tool calls start returning "session expired", re-open aliexpress.com in Chrome and click **Save AliExpress** again.
+- **Cookies expire / lag the cart.** When tool calls start returning "session expired" — or `view_cart` reports an empty cart despite having items — re-open aliexpress.com in Chrome and click **Save AliExpress** again to capture fresh session cookies. The `_m_h5_tk` token and cart state rotate together; stale cookies show an empty server-side cart.
 - **Rate limiting** is the user's responsibility. The server sends realistic Chrome headers but doesn't throttle; don't hammer the search.
 
 ## Architecture

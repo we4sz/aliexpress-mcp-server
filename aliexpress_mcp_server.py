@@ -208,13 +208,16 @@ def mtop_call(
         ret = data.get("ret", [])
         ret_str = ret[0] if ret else ""
 
-        # Retry once if the token expired (the server will have set fresh cookies)
+        # Retry once if the token expired (the server will have set fresh cookies).
+        # httpx.Response.cookies iterates as cookie-name strings, so pull values by key.
         if retries > 0 and any(
             s in ret_str for s in ("FAIL_SYS_TOKEN_EMPTY", "FAIL_SYS_TOKEN_EXOIRED", "TOKEN_EMPTY", "TOKEN_EXPIRED")
         ):
             new_cookies = dict(cookies)
-            for ck in resp.cookies:
-                new_cookies[ck.name] = ck.value
+            for name in resp.cookies:
+                val = resp.cookies.get(name)
+                if val is not None:
+                    new_cookies[name] = val
             return mtop_call(api, version, payload, cookies=new_cookies, retries=retries - 1, referer=referer)
 
         return data
@@ -1064,53 +1067,295 @@ def get_shipping_estimate(item_id: str) -> str:
     return "\n".join(lines)
 
 
+def _cents_to_float(amt_dict: Any) -> tuple[Optional[float], Optional[str]]:
+    """AliExpress cart prices are nested dicts: {amount: {cent: 804, currencyCode: 'USD'}}."""
+    if not isinstance(amt_dict, dict):
+        return None, None
+    amount = amt_dict.get("amount") if "amount" in amt_dict else amt_dict
+    if isinstance(amount, dict):
+        cent = amount.get("cent")
+        code = amount.get("currencyCode")
+        if isinstance(cent, (int, float)):
+            return round(cent / 100.0, 2), code
+    fmt = amt_dict.get("formattedAmount")
+    if isinstance(fmt, str):
+        return parse_price(fmt), None
+    return None, None
+
+
+def _extract_cart(render_response: dict) -> dict:
+    """
+    Pull structured cart content from a `mtop.aliexpress.trade.cart.render` v1.0
+    response. The response's `data.data` is a flat block-map keyed by block ID.
+    We recognize these tags:
+
+        product_item_component  → a cart line
+        store_title_component   → seller/shop heading
+        summary_component       → totals / checkout summary
+        cart_header_component   → the top bar (contains `count`)
+
+    Each item block's `itemId` is the real product ID; prices live in
+    `prices.children.retailPrice.amount.{cent,currencyCode}`; quantity is
+    `quantity.current`; variant text is `sku.skuInfo`.
+    """
+    result: dict[str, Any] = {
+        "items": [],
+        "shops": {},              # sellerId -> shop dict
+        "count": None,
+        "currency": None,
+        "subtotal": None,
+        "shipping_fee": None,
+        "total": None,
+    }
+
+    data = render_response.get("data", {})
+    blocks = data.get("data", {}) if isinstance(data.get("data"), dict) else {}
+
+    for bid, b in blocks.items():
+        if not isinstance(b, dict):
+            continue
+        tag = b.get("tag") or ""
+        fields = b.get("fields") or {}
+        if not isinstance(fields, dict):
+            continue
+
+        if tag.startswith("cart_header_component"):
+            c = fields.get("count")
+            if c is not None:
+                try:
+                    result["count"] = int(c)
+                except (TypeError, ValueError):
+                    pass
+
+        elif tag.startswith("store_title_component"):
+            sid = fields.get("sellerId") or fields.get("shopId")
+            url = fields.get("url") or ""
+            if isinstance(url, str) and url.startswith("//"):
+                url = "https:" + url
+            result["shops"][str(sid)] = {
+                "name": fields.get("title"),
+                "url": url,
+                "shop_id": fields.get("shopId"),
+                "seller_id": sid,
+            }
+
+        elif tag.startswith("product_item_component"):
+            item_id = fields.get("itemId") or fields.get("productId")
+            title = fields.get("title")
+            if not item_id or not title:
+                continue
+
+            item: dict[str, Any] = {
+                "item_id": str(item_id),
+                "title": str(title)[:200],
+                "sku_info": (fields.get("sku") or {}).get("skuInfo") if isinstance(fields.get("sku"), dict) else None,
+                "sku_id": fields.get("skuId"),
+                "image_url": fields.get("img"),
+                "url": f"{BASE_URL}/item/{item_id}.html",
+                "valid": fields.get("valid", True),
+                "status": fields.get("status"),
+                "cart_id": fields.get("cartId"),
+            }
+
+            # Quantity
+            q = fields.get("quantity") or {}
+            if isinstance(q, dict):
+                item["quantity"] = q.get("current") or q.get("origin") or 1
+            else:
+                try:
+                    item["quantity"] = int(q)
+                except (TypeError, ValueError):
+                    item["quantity"] = 1
+
+            # Prices: current sale price
+            prices_node = fields.get("prices") or {}
+            children = prices_node.get("children") if isinstance(prices_node, dict) else None
+            if isinstance(children, dict):
+                retail = children.get("retailPrice") or children.get("salePrice")
+                if isinstance(retail, dict):
+                    p, c = _cents_to_float(retail)
+                    item["price"] = p
+                    if c and not item.get("currency"):
+                        item["currency"] = c
+
+            # Original (strike) price
+            orig = fields.get("originalPrice")
+            if isinstance(orig, dict):
+                fmt = orig.get("formattedAmount")
+                if fmt:
+                    item["original_price"] = parse_price(fmt)
+
+            # Freight
+            freight = fields.get("freightInfo") or {}
+            svc_list = freight.get("availableFreightServices") if isinstance(freight, dict) else None
+            if isinstance(svc_list, list) and svc_list:
+                chosen = next((s for s in svc_list if s.get("chosen")), svc_list[0])
+                if isinstance(chosen, dict):
+                    fcost = chosen.get("freightCost") or ""
+                    # Format: "Shipping: $1.99" or "Free shipping"
+                    if isinstance(fcost, str):
+                        if "free" in fcost.lower():
+                            item["shipping_cost"] = 0.0
+                        else:
+                            item["shipping_cost"] = parse_price(fcost)
+                    item["delivery_date"] = chosen.get("deliveryDate")
+
+            result["items"].append(item)
+
+        elif tag.startswith("summary_component"):
+            # Real structure:
+            #   fields.summary.priceMap.total
+            #   fields.summary.priceDetail[*].priceMap.{subTotal, total, shippingFee}
+            # Also fallback: fields.checkout.orderDetail[*].priceMap.*
+            summary = fields.get("summary") or {}
+            pm = summary.get("priceMap") if isinstance(summary, dict) else None
+            if isinstance(pm, dict):
+                t = pm.get("total")
+                if isinstance(t, dict):
+                    v, c = _cents_to_float(t)
+                    result["total"] = v
+                    if c:
+                        result["currency"] = c
+
+            # Walk priceDetail groups — they have subTotal/shippingFee per order group
+            pd = summary.get("priceDetail") if isinstance(summary, dict) else None
+            if isinstance(pd, list):
+                for grp in pd:
+                    grp_pm = grp.get("priceMap") if isinstance(grp, dict) else None
+                    if not isinstance(grp_pm, dict):
+                        continue
+                    if result["subtotal"] is None and "subTotal" in grp_pm:
+                        result["subtotal"] = _cents_to_float(grp_pm["subTotal"])[0]
+                    if result["shipping_fee"] is None and "shippingFee" in grp_pm:
+                        result["shipping_fee"] = _cents_to_float(grp_pm["shippingFee"])[0]
+                    if result["total"] is None and "total" in grp_pm:
+                        v, c = _cents_to_float(grp_pm["total"])
+                        result["total"] = v
+                        if c and not result.get("currency"):
+                            result["currency"] = c
+
+            # Last-ditch: checkout.orderDetail
+            checkout = fields.get("checkout") or {}
+            if isinstance(checkout, dict):
+                for grp in checkout.get("orderDetail") or []:
+                    grp_pm = grp.get("priceMap") if isinstance(grp, dict) else None
+                    if not isinstance(grp_pm, dict):
+                        continue
+                    if result["total"] is None and "total" in grp_pm:
+                        v, c = _cents_to_float(grp_pm["total"])
+                        result["total"] = v
+                        if c and not result.get("currency"):
+                            result["currency"] = c
+
+    return result
+
+
 @mcp.tool()
 def view_cart() -> str:
     """
     View current AliExpress cart contents (read-only).
 
-    Known limitation: the AliExpress cart page is client-side-rendered (same
-    as the PDP), so HTML scraping only ever sees the shell. A proper fix needs
-    its own signed MTOP call (e.g. `mtop.aliexpress.trade.cart.queryCart`).
-    For now this tool falls back to HTML and will typically return empty.
+    Calls the signed MTOP endpoint `mtop.aliexpress.trade.cart.render` v1.0.
+    Requires a fresh session — if you see an empty cart despite having items,
+    re-save AliExpress cookies via the MCP Auth Bridge extension.
     """
-    client = get_client(require_auth=True, referer=f"{BASE_URL}/")
+    cookies = load_cookies()
+    if not cookies:
+        return AUTH_EXPIRED_MSG
+
     try:
-        resp = client.get("/p/shoppingcart/index.html")
-        if check_auth_redirect(resp):
-            return AUTH_EXPIRED_MSG
-        resp.raise_for_status()
+        resp = mtop_call(
+            "mtop.aliexpress.trade.cart.render",
+            "1.0",
+            {"platformType": "DESKTOP"},
+            cookies=cookies,
+            referer=f"{BASE_URL}/p/shoppingcart/index.html",
+        )
+    except Exception as e:
+        return f"Cart MTOP call failed: {e}"
 
-        cart = parse_cart(resp.text)
+    ret = resp.get("ret", [])
+    ret_str = ret[0] if ret else ""
+    if not any("SUCCESS" in r for r in ret):
+        return (
+            f"Cart API returned: {ret_str}. "
+            "If this says TOKEN_EXPIRED, re-save AliExpress cookies via the MCP Auth Bridge."
+        )
 
-        if not cart["items"]:
+    cart = _extract_cart(resp)
+    items = cart["items"]
+    count = cart["count"]
+
+    if not items:
+        if count == 0:
             return (
-                "Cart contents are not visible to this tool — the AliExpress cart "
-                "page is JavaScript-rendered, so scraping only sees the shell. "
-                "A future version will call the MTOP cart API directly. For now, "
-                "check your cart in the browser."
+                "Your AliExpress cart is empty (server count: 0). "
+                "If you just added items, re-save AliExpress cookies via the "
+                "MCP Auth Bridge extension to refresh the session, then retry."
             )
+        return (
+            f"Cart render succeeded but no item blocks matched. Server count: {count}. "
+            "The cart-line block shape may have changed."
+        )
 
-        lines = [f"Cart ({len(cart['items'])} item(s)):"]
-        for it in cart["items"]:
-            line = f"- {it['title']}"
-            if it["price"] is not None:
-                line += f" — ${it['price']:.2f} {CURRENCY}"
-            if it["quantity"] and it["quantity"] != 1:
-                line += f" × {it['quantity']}"
-            line += f"\n  item_id: {it['item_id']}"
-            lines.append(line)
+    # Group items by shop
+    by_shop: dict[str, list[dict]] = {}
+    for it in items:
+        # Each item's parentId would map to shop; we don't store that, so we
+        # just use the first shop as the fallback label
+        by_shop.setdefault("__all__", []).append(it)
 
-        if cart["subtotal"] is not None:
-            lines.append(f"\nSubtotal: ${cart['subtotal']:.2f} {CURRENCY}")
-        if cart["shipping_total"] is not None:
-            lines.append(f"Shipping: ${cart['shipping_total']:.2f} {CURRENCY}")
-        if cart["grand_total"] is not None:
-            lines.append(f"Total: ${cart['grand_total']:.2f} {CURRENCY}")
+    currency = cart.get("currency") or CURRENCY
 
-        return "\n".join(lines)
-    finally:
-        client.close()
+    lines = [f"Cart ({len(items)} item(s), server count: {count}):"]
+
+    # Show each shop header if we have shop info
+    shop_labels = list(cart.get("shops", {}).values())
+    if shop_labels:
+        # Single-shop case: prepend shop name
+        lines.append("")
+        for s in shop_labels:
+            if s.get("name"):
+                lines.append(f"Shop: {s['name']}")
+                if s.get("url"):
+                    lines.append(f"  {s['url']}")
+
+    lines.append("")
+    for it in items:
+        line = f"- {it['title']}"
+        if it.get("price") is not None:
+            line += f" — ${it['price']:.2f} {it.get('currency') or currency}"
+        if it.get("original_price") and it["original_price"] > (it.get("price") or 0):
+            line += f" (was ${it['original_price']:.2f})"
+        qty = it.get("quantity") or 1
+        try:
+            if int(qty) != 1:
+                line += f" × {qty}"
+        except (TypeError, ValueError):
+            pass
+        if it.get("sku_info"):
+            line += f"\n  variant: {it['sku_info']}"
+        if it.get("shipping_cost") is not None:
+            ship_str = "Free" if it["shipping_cost"] == 0 else f"${it['shipping_cost']:.2f}"
+            line += f"\n  shipping: {ship_str}"
+        if it.get("delivery_date"):
+            line += f"\n  delivery: {it['delivery_date']}"
+        if not it.get("valid", True):
+            line += "\n  ⚠️ invalid (sold out or removed)"
+        line += f"\n  item_id: {it['item_id']}"
+        lines.append(line)
+
+    # Totals
+    if cart.get("subtotal") is not None or cart.get("shipping_fee") is not None or cart.get("total") is not None:
+        lines.append("")
+        if cart.get("subtotal") is not None:
+            lines.append(f"Subtotal: ${cart['subtotal']:.2f} {currency}")
+        if cart.get("shipping_fee") is not None:
+            lines.append(f"Shipping: ${cart['shipping_fee']:.2f} {currency}")
+        if cart.get("total") is not None:
+            lines.append(f"Estimated total: ${cart['total']:.2f} {currency}")
+
+    return "\n".join(lines)
 
 
 # ─── Main ───────────────────────────────────────────────────────────────────
