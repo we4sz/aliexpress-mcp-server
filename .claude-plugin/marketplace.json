@@ -1,0 +1,20 @@
+{
+  "name": "aliexpress",
+  "description": "AliExpress read-only research and account tools (MCP server + skill).",
+  "owner": {
+    "name": "Alex Sabaka",
+    "email": "alex.love.broadcast@gmail.com"
+  },
+  "plugins": [
+    {
+      "name": "aliexpress",
+      "source": "./",
+      "description": "Read-only AliExpress: search, deals, product details, per-SKU pricing, reviews, seller reputation, shipping, cart, orders, and wishlist. Bundles the signed-MTOP MCP server and the aliexpress-shopping skill.",
+      "version": "1.0.0",
+      "author": { "name": "Alex Sabaka" },
+      "homepage": "https://github.com/AlexSabaka/aliexpress-mcp-server",
+      "repository": "https://github.com/AlexSabaka/aliexpress-mcp-server",
+      "keywords": ["aliexpress", "mcp", "shopping", "ecommerce"]
+    }
+  ]
+}
