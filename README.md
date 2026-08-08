@@ -59,9 +59,15 @@ Token refresh is handled automatically: a stale `_m_h5_tk` makes MTOP return `FA
    **As a Claude Code plugin (recommended).** The repo ships `.claude-plugin/marketplace.json` and `.mcp.json`, which together register the MCP server and the `aliexpress-shopping` skill in one step, launched via `uv run` (no separate `pip install` — `uv` resolves `mcp<2`, `httpx[http2]` and `beautifulsoup4` itself from `.mcp.json`):
 
    ```
-   /plugin marketplace add AlexSabaka/aliexpress-mcp-server
+   /plugin marketplace add we4sz/aliexpress-mcp-server
    /plugin install aliexpress@aliexpress
    ```
+
+   `aliexpress@aliexpress` is `<plugin>@<marketplace>`; both are named `aliexpress`
+   in `.claude-plugin/marketplace.json`. Point `marketplace add` at whichever
+   repo actually holds the code you want — this fork carries fixes (seller
+   identity on aggregation listings, cart-selection convergence, the HTTP header
+   profile) that upstream `AlexSabaka/aliexpress-mcp-server` does not.
 
    **Manual Claude Desktop config**, for setups that don't go through a Claude Code plugin marketplace:
 
