@@ -1598,12 +1598,16 @@ def set_cart_selection(selected: bool, item_id: str = "", url: str = "",
         if net_stalled:
             out += ["",
                     f"⛔ This call ticked {len(landed)} line(s) and the cart's total ticked "
-                    f"count did not rise ({ticked_at_entry} → {total_ticked}). Ticking a "
-                    "line is knocking another one off, so re-running will NOT get further "
-                    "— five different cart sizes have all settled at exactly 20 ticked "
-                    "lines through this API path.",
-                    "   Use the AliExpress site or app's own \"Select all\" instead; that "
-                    "control is not subject to this and sets the whole cart in one action."]
+                    f"count did not rise ({ticked_at_entry} → {total_ticked}). Re-running "
+                    "will NOT get further.",
+                    f"   This looks like an AliExpress limit on how many lines ONE order "
+                    "may contain, not a fault here. Six cart sizes have now settled at "
+                    "exactly 20 ticked. The site's own \"Select all\" does not beat it "
+                    "either: it optimistically shows every line ticked and then persists "
+                    "only ~20 — reload the cart page and the rest have quietly dropped "
+                    "off. Nothing announces this; reachLimitNotice stays false.",
+                    "   So a cart bigger than that cannot be ordered in one go. Order in "
+                    "batches: tick a set, check out, then tick the next."]
         elif ran_out_of_time and stuck:
             # Say how much more work is left in CALLS, not seconds — the caller
             # can act on "run this twice more", not on a duration.
