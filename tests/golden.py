@@ -28,7 +28,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 os.environ.setdefault("ALIEXPRESS_COUNTRY", "SE")
 os.environ.setdefault("ALIEXPRESS_CURRENCY", "SEK")
 
-import aliexpress_mcp_server as srv  # noqa: E402
+import aliexpress_mcp_server as srv  # noqa: E402  (exercises the shim import path)
+import aliexpress_mcp.server as _server_module  # noqa: E402  (where the @mcp.tool defs actually live)
 
 ROOT = Path(__file__).resolve().parent
 
@@ -63,7 +64,10 @@ VOLATILE = [
 
 
 def unwrap(name):
-    fn = getattr(srv, name, None)
+    # aliexpress_mcp_server.py is now a thin shim (imports `mcp` only) — the
+    # actual @mcp.tool functions live in aliexpress_mcp.server. Check the shim
+    # first (harmless no-op today) so this keeps working if that ever changes.
+    fn = getattr(srv, name, None) or getattr(_server_module, name, None)
     return getattr(fn, "fn", fn) if fn else None
 
 
