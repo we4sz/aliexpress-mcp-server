@@ -38,7 +38,7 @@ from aliexpress_mcp.scrape import parse_product_detail
 from aliexpress_mcp.catalog import (
     apply_sort,
     SEARCH_RENDER_ATTEMPTS, search_with_notes, search_by_title,
-    _relevant_fraction, RELEVANCE_FLOOR,
+    _relevant_fraction, RELEVANCE_FLOOR, shipping_line, choice_line,
     normalize_ship_from, _format_product_lines,
     _fetch_pdp_mtop, _informative_tax_note, _lot_note,
     _pdp_error_code, _pdp_unavailable_msg, _extract_pdp_fields, _delivery_days,
@@ -421,12 +421,17 @@ def get_product_details(item_id: str = "", url: str = "") -> str:
                 "per the page's EU trader disclosure is the store above. Feedback and "
                 "age figures describe the pooled listing, not this merchant, so they "
                 "are omitted here rather than misattributed.")
-    if d.get("ship_unreachable"):
-        lines.append(f"Shipping: does not ship to {COUNTRY}")
-    elif d.get("shipping_cost") is not None:
-        lines.append("Shipping: " + ("Free" if d["shipping_cost"] == 0 else _fmt_money(d["shipping_cost"], cur)))
-    else:
-        lines.append("Shipping: not available (AliExpress needs a saved delivery address to quote it)")
+    # shipping_line/choice_line, not a bare number. The figure was never the
+    # problem — the extractor returned 154.29 and 22.61 correctly all along —
+    # the SENTENCE was: a flat per-ORDER Choice fee of 18.68 rendered as
+    # "Shipping: 18.68 SEK" reads as this line's freight, so a basket of twelve
+    # Choice listings looks like twelve charges of 18.68 when the order pays it
+    # once, or not at all above the threshold. Which regime a number belongs to
+    # matters more than the number.
+    lines.append(shipping_line(d))
+    ch = choice_line(d)
+    if ch:
+        lines.append(f"  {ch}")
     for alt in d.get("shipping_alternatives") or []:
         bits = []
         if alt.get("cost") is not None:
