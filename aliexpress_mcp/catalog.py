@@ -15,7 +15,7 @@ from urllib.parse import quote_plus
 import httpx
 
 from aliexpress_mcp.core import (
-    BASE_URL, COUNTRY, CURRENCY, LANG, USER_AGENT, ACCEPT_LANGUAGE, logger,
+    BASE_URL, COUNTRY, CURRENCY, LANG, USER_AGENT, ACCEPT_LANGUAGE, HTTP2, logger,
     load_cookies, get_client, check_auth_redirect,
     AUTH_EXPIRED_MSG, _pace, mtop_call, ret_problem,
     _msrp_flag, _fmt_money, parse_price, _normalize_price, _strip_html,
@@ -1155,7 +1155,7 @@ def _fetch_reviews(item_id: str, page: int = 1, page_size: int = 20, filt: str =
         "filter": filt or "all",
         "sort": "complex_default",
     }
-    with httpx.Client(timeout=30.0, follow_redirects=True) as c:
+    with httpx.Client(timeout=30.0, follow_redirects=True, http2=HTTP2) as c:
         resp = c.get(FEEDBACK_URL, params=params, headers=headers)
         try:
             return resp.json().get("data")

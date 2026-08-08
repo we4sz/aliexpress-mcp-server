@@ -11,6 +11,7 @@ must NOT import `bs4` (BeautifulSoup parsing lives only in scrape.py).
 """
 
 import hashlib
+import importlib.util
 import json
 import logging
 import os
@@ -115,21 +116,34 @@ logger = logging.getLogger("aliexpress-mcp")
 #     what AliExpress's own JS actually sends).
 #
 # WHAT THIS CANNOT MATCH, so nobody mistakes closer headers for undetectable:
-#   - HTTP/2 framing. Real Chrome negotiates h2 via ALPN and sends HTTP/2's
-#     pseudo-headers (:method, :authority, :scheme, :path) as a block ahead of
-#     regular headers, with no `Connection` header at all (h2 forbids hop-by-
-#     hop headers). This client speaks plain HTTP/1.1 — the `h2` package
-#     isn't a dependency — so it always sends `Connection: keep-alive` the
-#     way a pre-2015 browser would. Any fingerprinter reading the HTTP/2
-#     settings frame or ALPN handshake (not just header bytes) sees this
-#     immediately, independent of anything below. Adding h2 support is a
-#     dependency change (requirements.txt), which is outside this task's
-#     file scope — flagged for a separate decision, not attempted here.
+#   - HTTP/2 framing DETAIL, though no longer the protocol itself. h2 is now a
+#     dependency and negotiated when present (see HTTP2 below), so this client
+#     speaks the same protocol Chrome does and omits `Connection` accordingly.
+#     What still differs is everything below the header names: HTTP/2 SETTINGS
+#     frame values, window sizes, priority tree and pseudo-header order are
+#     Chrome-specific and are hyperframe/h2's defaults here — Akamai's HTTP/2
+#     fingerprint reads exactly those.
 #   - TLS ClientHello fingerprinting (JA3/JA3S/JA4/Akamai's HTTP/2
 #     fingerprint). httpx delegates TLS to Python's `ssl` module over
 #     OpenSSL; Chrome links BoringSSL. Cipher list, extension order, and
 #     ALPN offer all differ at the TLS layer, before a single HTTP header is
 #     read. No header change closes this gap.
+# HTTP/2, when the optional `h2` package is present.
+#
+# This was the largest remaining gap between this client and a real browser,
+# and it is visible before a single header is parsed: Chrome negotiates h2 via
+# ALPN and sends HTTP/2's pseudo-headers with NO `Connection` header at all
+# (h2 forbids hop-by-hop headers), while HTTP/1.1 clients announce themselves
+# as pre-2015 browsers with `Connection: keep-alive`. Matching every header
+# byte and then handshaking as HTTP/1.1 is a contradiction a fingerprinter
+# reads for free.
+#
+# Degrades rather than crashes: `h2` is an extra (`httpx[http2]`), so an
+# install without it keeps working on HTTP/1.1 exactly as before instead of
+# raising ImportError at client construction. Both requirements.txt and
+# .mcp.json request it, so the normal path has it.
+HTTP2 = importlib.util.find_spec("h2") is not None
+
 CHROME_VERSION_MATCH = re.search(r"Chrome/(\d+)\.", USER_AGENT)
 CHROME_MAJOR_VERSION = CHROME_VERSION_MATCH.group(1) if CHROME_VERSION_MATCH else "131"
 
@@ -231,6 +245,25 @@ def load_cookies() -> dict[str, str]:
     return cookies
 
 
+def _drop_hop_by_hop(client: httpx.Client) -> httpx.Client:
+    """
+    Remove `Connection` when the client will negotiate HTTP/2.
+
+    It stays in the header DICTS above rather than being conditionally omitted
+    there, because omitting it lets httpx re-insert its own default in httpx's
+    fixed slot (observed: it reappeared at index 1, ahead of every header we
+    carefully ordered). Listing it and then dropping it here keeps the ordering
+    control and still sends nothing.
+
+    h2 tolerated the header in practice — a live request succeeded with it
+    present — but "it did not error" is not "it is not on the wire", and this
+    file has been wrong twice already about things that looked fine.
+    """
+    if HTTP2:
+        client.headers.pop("Connection", None)
+    return client
+
+
 def get_client(referer: str = BASE_URL) -> httpx.Client:
     """
     Create an HTTP client with session cookies and Chrome's own navigation
@@ -278,12 +311,13 @@ def get_client(referer: str = BASE_URL) -> httpx.Client:
     if cookie_str:
         headers["Cookie"] = cookie_str
 
-    return httpx.Client(
+    return _drop_hop_by_hop(httpx.Client(
         base_url=BASE_URL,
         headers=headers,
         follow_redirects=True,
         timeout=30.0,
-    )
+        http2=HTTP2,
+    ))
 
 
 def check_auth_redirect(response: httpx.Response) -> bool:
@@ -493,10 +527,16 @@ def mtop_call(
         "Accept-Encoding": "gzip, deflate, br, zstd",
         "Connection": "keep-alive",
     }
+    if HTTP2:
+        # Per-request headers bypass the client-level strip in
+        # _drop_hop_by_hop, so this dict needs the same treatment. It is listed
+        # in the dict above purely to hold its slot in the ordering.
+        headers.pop("Connection", None)
+
     url = f"{MTOP_BASE}/h5/{api}/{version}/"
 
     _pace()
-    with httpx.Client(timeout=40.0, follow_redirects=True) as c:
+    with _drop_hop_by_hop(httpx.Client(timeout=40.0, follow_redirects=True, http2=HTTP2)) as c:
         if method.upper() == "POST":
             # Some payloads (the cart's compressed component tree) run to several
             # KB — far past the URL length MTOP's front end accepts, which answers

@@ -1511,13 +1511,31 @@ class TestGetClientHeaderOrder(unittest.TestCase):
         finally:
             client.close()
         order = [k.decode() for k, _v in req.headers.raw]
-        self.assertEqual(order, [
+        expected = [
             "Host", "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
             "Upgrade-Insecure-Requests", "User-Agent", "Accept",
             "Sec-Fetch-Site", "Sec-Fetch-Mode", "Sec-Fetch-User", "Sec-Fetch-Dest",
             "Referer", "Priority", "Accept-Encoding", "Accept-Language",
-            "Connection", "Cookie",
-        ])
+            "Cookie",
+        ]
+        # `Connection` is hop-by-hop and HTTP/2 forbids it — real Chrome sends
+        # none on h2 either. It appears only on the HTTP/1.1 fallback, so the
+        # expectation depends on whether the optional `h2` extra is installed.
+        if not core.HTTP2:
+            expected.insert(expected.index("Cookie"), "Connection")
+        self.assertEqual(order, expected)
+
+    def test_connection_header_only_on_http1(self):
+        """
+        Sending `Connection: keep-alive` over h2 is both a protocol violation
+        and a fingerprint — it is precisely what a non-browser client does.
+        """
+        client = core.get_client()
+        try:
+            req = client.build_request("GET", "/")
+        finally:
+            client.close()
+        self.assertEqual("Connection" in req.headers, not core.HTTP2)
 
     def test_navigation_is_same_origin_with_a_referrer(self):
         """
@@ -1604,8 +1622,8 @@ class TestMtopCallHeaderOrder(unittest.TestCase):
             "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
             "User-Agent", "Accept", "Origin", "Sec-Fetch-Site", "Sec-Fetch-Mode",
             "Sec-Fetch-Dest", "Referer", "Priority", "Accept-Encoding",
-            "Accept-Language", "Connection", "Cookie",
-        ]))
+            "Accept-Language", "Cookie",
+        ] + ([] if core.HTTP2 else ["Connection"])))
         self.assertEqual(len(order), len(set(order)), "a header was sent twice")
         req = self.captured[-1]
         # acs.aliexpress.com from www.aliexpress.com: different host, same
@@ -1638,8 +1656,10 @@ class TestMtopCallHeaderOrder(unittest.TestCase):
         self.assertLess(order.index("Content-Type"), len(order) - 1,
                         "Content-Type was appended last — the ordered copy was bypassed")
         # It belongs with the content-negotiation headers, ahead of the
-        # transport ones httpx keeps at the tail.
-        self.assertLess(order.index("Content-Type"), order.index("Connection"))
+        # transport ones at the tail. `Connection` is the natural marker for
+        # that boundary but only exists on HTTP/1.1, so fall back to Cookie.
+        tail = "Connection" if "Connection" in order else "Cookie"
+        self.assertLess(order.index("Content-Type"), order.index(tail))
 
     def test_get_has_no_content_type(self):
         """No body on GET -> no Content-Type, matching what a real browser sends."""

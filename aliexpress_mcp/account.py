@@ -507,9 +507,15 @@ def _wishlist_delete_item(cookies: dict, item_id: str, group_id: str = "0") -> s
         "deviceType": "PC", "_lang": LANG, "_currency": CURRENCY, "wishGroupId": scope,
     }
     _pace("cart_write", CART_WRITE_MIN_INTERVAL)
+    # POST, like the cart's sibling droplet endpoint. These payloads carry the
+    # whole component tree — and unlike the cart's, uncompressed — so on a GET
+    # they ride in the query string and a large enough wishlist would overflow
+    # what MTOP's front end accepts ("Http-Header-Length-Exceed", the exact
+    # wall that forced cart.async to POST). The signature covers the same
+    # `data` string either way, so this is free.
     resp = mtop_call(WISHLIST_API, "1.0", payload, cookies=cookies,
                      referer=f"{BASE_URL}/p/wish-manage/index.html",
-                     extra_query={"needLogin": "true"})
+                     method="POST", extra_query={"needLogin": "true"})
     ret = (resp.get("ret") or ["?"])[0]
     if ret.startswith("SUCCESS") and not (resp.get("data") or {}).get("succeed", True):
         return f"FAILED::{((resp.get('data') or {}).get('message')) or 'server reported no success'}"
@@ -564,9 +570,15 @@ def _wishlist_delete_group(cookies: dict, group_id: str) -> str:
         "deviceType": "PC", "_lang": LANG, "_currency": CURRENCY,
     }
     _pace("cart_write", CART_WRITE_MIN_INTERVAL)
+    # POST, like the cart's sibling droplet endpoint. These payloads carry the
+    # whole component tree — and unlike the cart's, uncompressed — so on a GET
+    # they ride in the query string and a large enough wishlist would overflow
+    # what MTOP's front end accepts ("Http-Header-Length-Exceed", the exact
+    # wall that forced cart.async to POST). The signature covers the same
+    # `data` string either way, so this is free.
     resp = mtop_call(WISHLIST_GROUPS_API, "1.0", payload, cookies=cookies,
                      referer=f"{BASE_URL}/p/wish-manage/index.html",
-                     extra_query={"needLogin": "true"})
+                     method="POST", extra_query={"needLogin": "true"})
     ret = (resp.get("ret") or ["?"])[0]
     if ret.startswith("SUCCESS") and not (resp.get("data") or {}).get("succeed", True):
         return f"FAILED::{((resp.get('data') or {}).get('message')) or 'server reported no success'}"
