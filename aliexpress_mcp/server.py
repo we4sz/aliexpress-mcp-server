@@ -762,10 +762,13 @@ def get_variants(item_id: str = "", url: str = "") -> str:
     map that `get_product_details`' price range can't give you.
 
     Reading the output: `[sku_id: …]` is what add_to_cart needs to pick that exact
-    config. A trailing `img#N` appears only when the configs do not all share one
-    photo; rows with the same N share a photo, so a listing whose "Color" values
-    each carry their own N is often a grab-bag of unrelated products sold under
-    one item_id. A discount identical on every config is stated once under the
+    config. `← DEFAULT` marks the config add_to_cart buys when no sku_id is
+    passed — it is usually the cheapest and rarely the one the user meant, so
+    pass an explicit sku_id whenever size, colour, length or gender matters. A
+    trailing `img#N` appears only when the configs do not all share one photo;
+    rows with the same N share a photo, so a listing whose "Color" values each
+    carry their own N is often a grab-bag of unrelated products sold under one
+    item_id. A discount identical on every config is stated once under the
     header instead of on every row.
 
     Args:
@@ -897,6 +900,16 @@ def get_variants(item_id: str = "", url: str = "") -> str:
             line += "  [sku_ids: " + ", ".join(s for s, _ok, _st in covered) + "]"
         if images_vary and v.get("image"):
             line += f" img#{img_ix[v['image']]}"
+        # Which config add_to_cart buys when no sku_id is passed. Without this
+        # the fallback is invisible: the caller cannot tell which row it would
+        # get, and it is usually the cheapest rather than the intended one —
+        # that is how one session added 28 AWG wire instead of 22 and male
+        # headers instead of female. On a collapsed row the default may not be
+        # the row's own sku_id, so name the exact id rather than implying it.
+        if v.get("is_default"):
+            line += " ← DEFAULT"
+            if v.get("default_sku_id") and v["default_sku_id"] != v["sku_id"]:
+                line += f" (sku {v['default_sku_id']})"
         lines.append(line)
         if len(covered) > 1:
             # Never let one of these read as "the" sku_id for the row: they are

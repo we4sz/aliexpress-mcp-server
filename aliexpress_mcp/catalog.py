@@ -21,7 +21,7 @@ from aliexpress_mcp.core import (
     _msrp_flag, _fmt_money, parse_price, _normalize_price, _strip_html,
     _parse_sold_count,
 )
-from aliexpress_mcp.scrape import parse_search_results
+from aliexpress_mcp.scrape import parse_search_results, SEARCH_SOURCE_GAPS
 
 
 SORT_MAP = {
@@ -405,8 +405,16 @@ def _format_product_lines(products: list[dict], header: str, limit: int = 25) ->
         vc = p.get("variant_count")
         if isinstance(vc, int) and vc > 1:
             line += f" · {vc} variants"
+        # "listed 2.8y ago", never "2.8y old" — the latter was read as the SELLER's
+        # age in a review of this tool, and the search payload carries no seller
+        # age at all, so that reading is always wrong.
         if p.get("listing_age"):
-            line += f" · {p['listing_age']}"
+            line += f" · listed {p['listing_age']} ago"
+        # The only stock figure a search card ever carries (see `_search_signals`).
+        # It rides on a promo badge, so its absence says nothing about stock —
+        # which is why there is no "in stock" counterpart here.
+        if isinstance(p.get("stock_left"), int):
+            line += f" · ⚠ only {p['stock_left']} left"
         # Only the minority lacking a free-shipping badge is worth a mark; the
         # rest would just repeat themselves 48 times.
         if p.get("free_shipping") is False:
@@ -418,7 +426,31 @@ def _format_product_lines(products: list[dict], header: str, limit: int = 25) ->
         # docstring legend now and only the value is repeated 25 times.
         line += f" [{p['item_id']}]"
         lines.append(line)
+
+    gaps = _degraded_source_note(products[:limit])
+    if gaps:
+        lines.append(gaps)
     return "\n".join(lines)
+
+
+def _degraded_source_note(products: list[dict]) -> Optional[str]:
+    """
+    Name the fields a fallback parser could not supply, when one was used.
+
+    Printed only when it applies, which is close to never: the SSR parser handles
+    every live page seen so far and the fallbacks exist for the day it stops. That
+    is exactly when the caller most needs telling, because rows missing a warehouse
+    and an age otherwise look like listings that simply have neither.
+    """
+    used = {p.get("data_source") for p in products}
+    degraded = sorted(s for s in used if s in SEARCH_SOURCE_GAPS)
+    if not degraded:
+        return None
+    missing = sorted({f for s in degraded for f in SEARCH_SOURCE_GAPS[s]})
+    scope = "Some rows" if len(used) > len(degraded) else "These rows"
+    return (f"⚠ {scope} came from a fallback parser because AliExpress's usual search "
+            f"payload was missing. Not reported for them: {', '.join(missing)} — "
+            "unavailable here, not absent from the listing.")
 
 
 def _fetch_pdp_mtop(item_id: str) -> Optional[dict]:
@@ -1396,6 +1428,8 @@ def _extract_variants(result: dict) -> list[dict]:
             "currency": currency,
             "in_stock": bool(p.get("salable")),
             "stock": p.get("skuStock"),
+            "is_default": False,
+            "default_sku_id": None,
         })
 
     # Collapse indistinguishable rows: some listings carry an extra unnamed

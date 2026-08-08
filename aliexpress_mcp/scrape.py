@@ -28,12 +28,18 @@ FREE_SHIPPING_SOURCES = {"platformFreeShipping_atm", "Free_Shipping_atm"}
 def _listing_age(lunch_time: Any) -> Optional[str]:
     """
     Render a search card's `lunchTime` (the listing's publish date, sic) as a
-    compact age: "8d old", "14mo old", "5.5y old".
+    compact age: "8d", "14mo", "5.5y".
 
     Age is a relister/dropshipper tell that no other field carries: a ★4.7 built
     from 21 orders on a listing published four days ago is a very different bet
     from the same rating on a three-year-old listing. Live values span 8 days to
     5.5 years, and every one of 120 sampled cards had the field.
+
+    This is the LISTING's age, not the store's — the search payload carries no
+    store age at all. The bare number is returned without a trailing "old" so the
+    renderer can say "listed 5.5y ago"; the previous "5.5y old" was read as the
+    seller's age in a review of this tool, which is the one wrong conclusion it
+    must not invite.
     """
     if not isinstance(lunch_time, str) or not lunch_time.strip():
         return None
@@ -50,10 +56,10 @@ def _listing_age(lunch_time: Any) -> Optional[str]:
     if days < 0:
         return None
     if days < 90:
-        return f"{days}d old"
+        return f"{days}d"
     if days < 730:
-        return f"{days // 30}mo old"
-    return f"{days / 365.0:.1f}y old"
+        return f"{days // 30}mo"
+    return f"{days / 365.0:.1f}y"
 
 
 def _sku_count(it: dict) -> Optional[int]:
@@ -113,7 +119,7 @@ def _search_signals(it: dict) -> dict:
     out: dict[str, Any] = {
         "ship_from": None, "is_choice": False, "sold_exact": None,
         "listing_age": None, "duty_offset": None, "free_shipping": None,
-        "variant_count": None, "price_sku_id": None,
+        "variant_count": None, "price_sku_id": None, "stock_left": None,
     }
     trace = it.get("trace") if isinstance(it.get("trace"), dict) else {}
 
@@ -153,11 +159,23 @@ def _search_signals(it: dict) -> dict:
         if not isinstance(sp, dict):
             continue
         sources.add(sp.get("source"))
-        if sp.get("source") == "npieces":
-            tc = sp.get("tagContent") if isinstance(sp.get("tagContent"), dict) else {}
-            txt = tc.get("tagText")
-            if isinstance(txt, str) and txt.strip():
-                out["duty_offset"] = txt.strip()
+        tc = sp.get("tagContent") if isinstance(sp.get("tagContent"), dict) else {}
+        txt = tc.get("tagText")
+        txt = txt.strip() if isinstance(txt, str) and txt.strip() else None
+        if sp.get("source") == "npieces" and txt:
+            out["duty_offset"] = txt
+        # The ONLY remaining-stock figure anywhere on a search card. It rides on
+        # the "Early bird deal" badge rather than any inventory field: 14 of 300
+        # live cards carried one, reading "only 1 left" (5), "only 2 left" (4),
+        # "only 4 left" (4) and "only 15 left" (1). Small enough to change what
+        # you order first, and invisible until now.
+        if sp.get("source") == "earlyBird" and txt:
+            m = re.search(r"only\s+(\d[\d,]*)\s+left", txt, re.IGNORECASE)
+            if m:
+                try:
+                    out["stock_left"] = int(m.group(1).replace(",", ""))
+                except ValueError:
+                    pass
     if sps:
         out["free_shipping"] = bool(sources & FREE_SHIPPING_SOURCES)
     return out
@@ -267,8 +285,52 @@ def _extract_search_items(html: str) -> list[dict]:
     return max(found, key=len) if found else []
 
 
+# Every field a parsed search row can carry, with "not known" as the default.
+#
+# There are three parsers below and they used to emit three different key sets:
+# the SSR path returned warehouse, listing age, free-shipping and the rest, while
+# the two fallbacks returned eight keys and nothing else. Nothing crashed — the
+# renderer reads the extras with .get() — so a fallback parse simply produced rows
+# that looked like items with no warehouse and no age, which is indistinguishable
+# from items whose warehouse and age AliExpress didn't state. One is a fact about
+# the listing, the other a fact about which parser ran, and the caller could not
+# tell them apart. Now every row has every key, and `data_source` says which
+# parser produced it so the renderer can name the difference.
+SEARCH_ROW_FIELDS: dict[str, Any] = {
+    "item_id": None, "title": None, "url": None,
+    "price": None, "original_price": None, "discount_pct": None,
+    "seller_discount_pct": None, "currency": None, "price_sku_id": None,
+    "rating": None, "sold_count": None, "sold_count_num": None,
+    "ship_from": None, "is_choice": False, "listing_age": None,
+    "duty_offset": None, "free_shipping": None, "variant_count": None,
+    "stock_left": None, "data_source": None,
+}
+
+# What each parser cannot supply, named so the renderer can say which facts are
+# unavailable rather than letting them read as absent. The SSR path supplies
+# everything, so it is not listed.
+SEARCH_SOURCE_GAPS = {
+    "legacy": ("warehouse country", "listing age", "free-shipping badge",
+               "variant count", "stock"),
+    "html": ("warehouse country", "listing age", "free-shipping badge",
+             "variant count", "stock", "currency"),
+}
+
+
+def _search_row(**fields: Any) -> dict:
+    """One search row, with every key present and unknowns left as None."""
+    row = dict(SEARCH_ROW_FIELDS)
+    row.update(fields)
+    return row
+
+
 def parse_search_results(html: str) -> list[dict]:
-    """Parse product cards from an AliExpress search results page."""
+    """
+    Parse product cards from an AliExpress search results page.
+
+    Rows always carry the full `SEARCH_ROW_FIELDS` key set regardless of which of
+    the three parsers produced them; `data_source` records which one did.
+    """
     products: list[dict] = []
     seen_ids: set[str] = set()
 
@@ -335,26 +397,28 @@ def parse_search_results(html: str) -> list[dict]:
             sold_count = f"{sig['sold_exact']:,} sold"
 
         seen_ids.add(pid)
-        products.append({
-            "item_id": pid,
-            "title": str(title).strip(),
-            "price": price,
-            "original_price": original_price,
-            "discount_pct": discount_pct,
-            "seller_discount_pct": seller_discount_pct,
-            "currency": currency,
-            "rating": rating,
-            "sold_count": sold_count,
-            "sold_count_num": sig["sold_exact"],
-            "ship_from": sig["ship_from"],
-            "is_choice": sig["is_choice"],
-            "listing_age": sig["listing_age"],
-            "duty_offset": sig["duty_offset"],
-            "free_shipping": sig["free_shipping"],
-            "variant_count": sig["variant_count"],
-            "price_sku_id": sig["price_sku_id"],
-            "url": f"{BASE_URL}/item/{pid}.html",
-        })
+        products.append(_search_row(
+            item_id=pid,
+            title=str(title).strip(),
+            price=price,
+            original_price=original_price,
+            discount_pct=discount_pct,
+            seller_discount_pct=seller_discount_pct,
+            currency=currency,
+            rating=rating,
+            sold_count=sold_count,
+            sold_count_num=sig["sold_exact"],
+            ship_from=sig["ship_from"],
+            is_choice=sig["is_choice"],
+            listing_age=sig["listing_age"],
+            duty_offset=sig["duty_offset"],
+            free_shipping=sig["free_shipping"],
+            variant_count=sig["variant_count"],
+            price_sku_id=sig["price_sku_id"],
+            stock_left=sig["stock_left"],
+            data_source="ssr",
+            url=f"{BASE_URL}/item/{pid}.html",
+        ))
 
     if products:
         return products
@@ -438,16 +502,17 @@ def parse_search_results(html: str) -> list[dict]:
                         rating = None
 
             seen_ids.add(pid)
-            products.append({
-                "item_id": pid,
-                "title": title.strip(),
-                "price": sale_price,
-                "original_price": original_price,
-                "discount_pct": discount_pct,
-                "rating": rating,
-                "sold_count": sold_count,
-                "url": f"{BASE_URL}/item/{pid}.html",
-            })
+            products.append(_search_row(
+                item_id=pid,
+                title=title.strip(),
+                price=sale_price,
+                original_price=original_price,
+                discount_pct=discount_pct,
+                rating=rating,
+                sold_count=sold_count,
+                data_source="legacy",
+                url=f"{BASE_URL}/item/{pid}.html",
+            ))
 
         if products:
             return products
@@ -497,16 +562,17 @@ def parse_search_results(html: str) -> list[dict]:
                 pass
 
         seen_ids.add(pid)
-        products.append({
-            "item_id": pid,
-            "title": title[:200],
-            "price": sale_price,
-            "original_price": original_price,
-            "discount_pct": discount_pct,
-            "rating": rating,
-            "sold_count": sold_count,
-            "url": f"{BASE_URL}/item/{pid}.html",
-        })
+        products.append(_search_row(
+            item_id=pid,
+            title=title[:200],
+            price=sale_price,
+            original_price=original_price,
+            discount_pct=discount_pct,
+            rating=rating,
+            sold_count=sold_count,
+            data_source="html",
+            url=f"{BASE_URL}/item/{pid}.html",
+        ))
 
     return products
 

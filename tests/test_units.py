@@ -20,12 +20,15 @@ import base64
 import gzip
 import json
 import os
+import re
 import sys
 import time
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
+
+import httpx
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # Pinned before import: several helpers read the configured country at module
@@ -277,13 +280,16 @@ class TestListingAge(unittest.TestCase):
         return (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d %H:%M:%S")
 
     def test_days_months_years(self):
-        self.assertEqual(scrape._listing_age(self._ago(8)), "8d old")
-        self.assertEqual(scrape._listing_age(self._ago(120)), "4mo old")
-        self.assertEqual(scrape._listing_age(self._ago(1095)), "3.0y old")
+        self.assertEqual(scrape._listing_age(self._ago(8)), "8d")
+        self.assertEqual(scrape._listing_age(self._ago(120)), "4mo")
+        self.assertEqual(scrape._listing_age(self._ago(1095)), "3.0y")
 
     def test_date_only_format(self):
         day = (datetime.now() - timedelta(days=10)).strftime("%Y-%m-%d")
-        self.assertEqual(scrape._listing_age(day), "10d old")
+        self.assertEqual(scrape._listing_age(day), "10d")
+
+    def test_it_never_says_old_which_was_read_as_the_sellers_age(self):
+        self.assertNotIn("old", scrape._listing_age(self._ago(1095)))
 
     def test_future_and_garbage_are_none(self):
         future = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d")
@@ -1243,6 +1249,329 @@ class TestAddManyToCart(unittest.TestCase):
                                return_value=self._result(descr='"spec"')):
             out = self.fn(["1005006"])
         self.assertIn("Nothing has been ordered or paid for.", out)
+
+
+class TestDefaultVariantMarker(unittest.TestCase):
+    """
+    add_to_cart with no sku_id buys the preselected config, and get_variants gave
+    no way to tell which row that is. It was the cheapest on 17 of 20 live
+    listings — and the DEAREST on two.
+    """
+
+    @staticmethod
+    def _result(default, paths, prices=None):
+        prices = prices or {}
+        return {
+            "SKU": {"selectedSkuIdStr": default, "skuPaths": paths},
+            "PRICE": {"skuPriceInfoMap": {
+                k: {"salePriceString": v} for k, v in prices.items()}},
+        }
+
+    def test_the_default_row_is_marked_and_others_are_not(self):
+        res = self._result("222", [
+            {"skuIdStr": "111", "skuAttr": "14:1#Red", "salable": True},
+            {"skuIdStr": "222", "skuAttr": "14:2#Blue", "salable": True},
+        ], {"111": "10,00kr", "222": "20,00kr"})
+        rows = catalog._extract_variants(res)
+        marked = [v for v in rows if v["is_default"]]
+        self.assertEqual(len(marked), 1)
+        self.assertEqual(marked[0]["sku_id"], "222")
+        self.assertEqual(marked[0]["default_sku_id"], "222")
+
+    def test_a_default_hiding_inside_a_collapsed_row_is_still_found(self):
+        """Collapsed rows share spec+price; the survivor may not be the default."""
+        res = self._result("222", [
+            {"skuIdStr": "111", "skuAttr": "14:1#Red", "salable": True},
+            {"skuIdStr": "222", "skuAttr": "14:1#Red", "salable": True},
+        ], {"111": "10,00kr", "222": "10,00kr"})
+        rows = catalog._extract_variants(res)
+        self.assertEqual(len(rows), 1)                    # collapsed
+        self.assertNotEqual(rows[0]["sku_id"], "222")     # survivor is not the default
+        self.assertTrue(rows[0]["is_default"])
+        self.assertEqual(rows[0]["default_sku_id"], "222")
+
+    def test_the_numeric_field_is_read_too(self):
+        res = {"SKU": {"selectedSkuId": 222,
+                       "skuPaths": [{"skuIdStr": "222", "skuAttr": "14:1#Red", "salable": True}]},
+               "PRICE": {}}
+        self.assertTrue(catalog._extract_variants(res)[0]["is_default"])
+
+    def test_no_default_marks_nothing(self):
+        res = self._result(None, [{"skuIdStr": "111", "skuAttr": "14:1#Red", "salable": True}])
+        self.assertFalse(any(v["is_default"] for v in catalog._extract_variants(res)))
+
+    def test_an_unknown_default_marks_nothing_rather_than_guessing(self):
+        res = self._result("999", [{"skuIdStr": "111", "skuAttr": "14:1#Red", "salable": True}])
+        self.assertFalse(any(v["is_default"] for v in catalog._extract_variants(res)))
+
+    def test_every_row_carries_the_keys_even_when_unmarked(self):
+        res = self._result("999", [{"skuIdStr": "111", "skuAttr": "14:1#Red", "salable": True}])
+        for v in catalog._extract_variants(res):
+            self.assertIn("is_default", v)
+            self.assertIn("default_sku_id", v)
+
+
+class TestSearchRowSchema(unittest.TestCase):
+    """
+    Three parsers used to emit three key sets, so a fallback parse produced rows
+    that looked like listings with no warehouse and no age.
+    """
+
+    def test_every_parser_emits_the_same_keys(self):
+        rows = [
+            scrape._search_row(item_id="1", data_source="ssr"),
+            scrape._search_row(item_id="2", data_source="legacy"),
+            scrape._search_row(item_id="3", data_source="html"),
+        ]
+        for r in rows:
+            self.assertEqual(set(r), set(scrape.SEARCH_ROW_FIELDS))
+
+    def test_unknowns_default_to_none_not_to_a_value(self):
+        row = scrape._search_row(item_id="1")
+        for field in ("ship_from", "listing_age", "free_shipping", "variant_count",
+                      "stock_left", "currency"):
+            self.assertIsNone(row[field], field)
+
+    def test_a_fallback_parse_says_which_facts_it_cannot_supply(self):
+        note = catalog._degraded_source_note([{"data_source": "legacy"}])
+        self.assertIn("warehouse country", note)
+        self.assertIn("unavailable here, not absent", note)
+
+    def test_the_healthy_path_says_nothing(self):
+        self.assertIsNone(catalog._degraded_source_note([{"data_source": "ssr"}]))
+
+    def test_a_mixed_parse_is_described_as_partial(self):
+        note = catalog._degraded_source_note(
+            [{"data_source": "ssr"}, {"data_source": "html"}])
+        self.assertIn("Some rows", note)
+
+    def test_the_note_reaches_the_rendered_output(self):
+        rows = [scrape._search_row(item_id="1", title="Cable", price=9.0,
+                                   currency="SEK", data_source="legacy")]
+        self.assertIn("fallback parser", catalog._format_product_lines(rows, "H:"))
+
+
+class TestLowStockSignal(unittest.TestCase):
+    """The only remaining-stock figure on a search card, on 14 of 300 live cards."""
+
+    @staticmethod
+    def _card(text):
+        return {"sellingPoints": [{"source": "earlyBird",
+                                   "tagContent": {"tagText": text}}]}
+
+    def test_reads_the_live_wordings(self):
+        for text, want in [("Early bird deal, only 1 left", 1),
+                           ("Early bird deal, only 2 left", 2),
+                           ("Early bird deal, only 15 left", 15)]:
+            with self.subTest(text=text):
+                self.assertEqual(scrape._search_signals(self._card(text))["stock_left"], want)
+
+    def test_other_badges_are_not_mistaken_for_stock(self):
+        card = {"sellingPoints": [{"source": "npieces",
+                                   "tagContent": {"tagText": "Offset duty: 3€ off"}}]}
+        sig = scrape._search_signals(card)
+        self.assertIsNone(sig["stock_left"])
+        self.assertEqual(sig["duty_offset"], "Offset duty: 3€ off")
+
+    def test_an_early_bird_badge_without_a_count_is_not_invented(self):
+        self.assertIsNone(scrape._search_signals(self._card("Early bird deal"))["stock_left"])
+
+    def test_no_badge_means_unknown_not_in_stock(self):
+        self.assertIsNone(scrape._search_signals({"sellingPoints": []})["stock_left"])
+
+    def test_it_is_rendered_as_a_warning(self):
+        rows = [scrape._search_row(item_id="1", title="Cable", price=9.0,
+                                   currency="SEK", stock_left=2, data_source="ssr")]
+        self.assertIn("⚠ only 2 left", catalog._format_product_lines(rows, "H:"))
+
+    def test_listing_age_is_rendered_as_the_listings_not_the_sellers(self):
+        rows = [scrape._search_row(item_id="1", title="Cable", price=9.0,
+                                   currency="SEK", listing_age="2.8y", data_source="ssr")]
+        out = catalog._format_product_lines(rows, "H:")
+        self.assertIn("listed 2.8y ago", out)
+        self.assertNotIn("2.8y old", out)
+
+
+class TestBrowserHeaderConsistency(unittest.TestCase):
+    """
+    Report #14: AliExpress's anti-bot risk engine (RGV587) is the worst
+    failure mode this server has, and only a real browser challenge clears
+    it — never waiting. The task specifically called out that a User-Agent
+    claiming one Chrome version alongside client hints claiming another is a
+    STRONGER bot signal than omitting the hints altogether, so the two must
+    never be able to drift apart. These pin that relationship at the level
+    the module docstring claims: derived from USER_AGENT, not hand-maintained
+    separately.
+    """
+
+    def test_sec_ch_ua_major_version_matches_the_user_agent(self):
+        m = re.search(r"Chrome/(\d+)\.", core.USER_AGENT)
+        self.assertIsNotNone(m, "USER_AGENT must carry a Chrome/<major>. token")
+        self.assertEqual(core.CHROME_MAJOR_VERSION, m.group(1))
+        self.assertIn(f'"Google Chrome";v="{m.group(1)}"', core.SEC_CH_UA)
+        self.assertIn(f'"Chromium";v="{m.group(1)}"', core.SEC_CH_UA)
+
+    def test_platform_hint_matches_the_user_agent_os(self):
+        """USER_AGENT declares "Macintosh" — sec-ch-ua-platform must agree."""
+        self.assertIn("Macintosh", core.USER_AGENT)
+        self.assertEqual(core.SEC_CH_UA_PLATFORM, '"macOS"')
+
+    def test_mobile_hint_is_desktop_not_mobile(self):
+        self.assertNotIn("Mobile", core.USER_AGENT)
+        self.assertEqual(core.SEC_CH_UA_MOBILE, "?0")
+
+    def test_accept_language_tracks_the_configured_country_not_a_fixed_default(self):
+        """
+        Was hardcoded "en-CA" regardless of ALIEXPRESS_COUNTRY — the same bug
+        class as report #7 (shipto-ignores-country), just in an HTTP header
+        instead of an MTOP param. Module setup above pins
+        ALIEXPRESS_COUNTRY=SE before import, so this must read en-SE.
+        """
+        self.assertEqual(core.ACCEPT_LANGUAGE, "en-SE,en;q=0.9")
+        self.assertNotIn("en-CA", core.ACCEPT_LANGUAGE)
+
+
+class TestGetClientHeaderOrder(unittest.TestCase):
+    """
+    Building a request never opens a socket — `httpx.Client.build_request`
+    only constructs the object `.send()` would later transmit, which is
+    exactly the boundary this needs: real headers, no network. Order was
+    reverse-engineered from httpx's own merge logic (see the "Browser header
+    profile" comment in core.py above USER_AGENT) and confirmed the same way
+    here — read `request.headers.raw`, the actual wire representation.
+
+    load_cookies() is mocked to a fixed value across this class rather than
+    left to read the real credential file: this dev machine has real saved
+    AliExpress cookies on disk, and without mocking, whether "Cookie" shows up
+    in the header list (and where the order assertion's last element is)
+    would depend on whichever machine happens to run the suite.
+    """
+
+    def setUp(self):
+        self._cookies_patch = mock.patch.object(
+            core, "load_cookies", return_value={"cna": "abc123"})
+        self._cookies_patch.start()
+
+    def tearDown(self):
+        self._cookies_patch.stop()
+
+    def test_header_order_matches_a_real_chrome_navigation(self):
+        client = core.get_client()
+        try:
+            req = client.build_request("GET", "/w/wholesale-usb-c-cable.html")
+        finally:
+            client.close()
+        order = [k.decode() for k, _v in req.headers.raw]
+        self.assertEqual(order, [
+            "Host", "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
+            "Upgrade-Insecure-Requests", "User-Agent", "Accept",
+            "Sec-Fetch-Site", "Sec-Fetch-Mode", "Sec-Fetch-User", "Sec-Fetch-Dest",
+            "Referer", "Priority", "Accept-Encoding", "Accept-Language",
+            "Connection", "Cookie",
+        ])
+
+    def test_navigation_is_same_origin_with_a_referrer(self):
+        """
+        Every current caller navigates same-origin with `referer` defaulting
+        to BASE_URL — "none" (no referrer at all) would be wrong here; that
+        value is for a freshly typed URL, never this client's case.
+        """
+        client = core.get_client()
+        try:
+            req = client.build_request("GET", "/item/123.html")
+        finally:
+            client.close()
+        self.assertEqual(req.headers["Sec-Fetch-Site"], "same-origin")
+        self.assertEqual(req.headers["Sec-Fetch-Mode"], "navigate")
+        self.assertEqual(req.headers["Sec-Fetch-Dest"], "document")
+
+    def test_no_cookie_header_when_no_cookies_are_saved(self):
+        """An empty Cookie header is itself a tell — omit the header, not send it blank."""
+        self._cookies_patch.stop()
+        self._cookies_patch = mock.patch.object(core, "load_cookies", return_value={})
+        self._cookies_patch.start()
+        client = core.get_client()
+        try:
+            req = client.build_request("GET", "/")
+        finally:
+            client.close()
+        self.assertNotIn("Cookie", req.headers)
+
+
+class TestMtopCallHeaderOrder(unittest.TestCase):
+    """
+    mtop_call() builds its own httpx.Client and calls .get()/.post() on it
+    directly, so getting at the real outgoing request without a live network
+    call means intercepting Client.send — the same extension point httpx's
+    own MockTransport uses internally, just applied at the method level since
+    mtop_call() doesn't expose a way to inject a transport. Nothing here ever
+    opens a socket: `fake_send` never calls the original.
+    """
+
+    def setUp(self):
+        self.captured: list[httpx.Request] = []
+        self._orig_send = httpx.Client.send
+
+        def fake_send(client_self, request, **kw):
+            self.captured.append(request)
+            return httpx.Response(
+                200, json={"ret": ["SUCCESS::调用成功"], "data": {}}, request=request)
+
+        httpx.Client.send = fake_send
+        # _pace() adds a real time.sleep() between calls on the same channel
+        # (by design, to stay under AliExpress's rate limit) — irrelevant to
+        # what this test class checks and would only slow the suite down.
+        self._orig_pace = core._pace
+        core._pace = lambda *a, **kw: None
+
+    def tearDown(self):
+        httpx.Client.send = self._orig_send
+        core._pace = self._orig_pace
+
+    def _last_order(self):
+        return [k.decode() for k, _v in self.captured[-1].headers.raw]
+
+    def test_get_header_order_and_cross_origin_fetch_metadata(self):
+        core.mtop_call(
+            "mtop.aliexpress.trade.cart.render", "1.0", {"a": 1},
+            cookies={"_m_h5_tk": "tok_123456789012345"},
+            referer="https://www.aliexpress.com/p/shoppingcart/index.html")
+        self.assertEqual(self._last_order(), [
+            "Host", "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
+            "User-Agent", "Accept", "Origin", "Sec-Fetch-Site", "Sec-Fetch-Mode",
+            "Sec-Fetch-Dest", "Referer", "Priority", "Accept-Encoding",
+            "Accept-Language", "Connection", "Cookie",
+        ])
+        req = self.captured[-1]
+        # acs.aliexpress.com from www.aliexpress.com: different host, same
+        # registrable site -> same-site, not same-origin and not cross-site.
+        self.assertEqual(req.headers["Sec-Fetch-Site"], "same-site")
+        self.assertEqual(req.headers["Sec-Fetch-Mode"], "cors")
+        self.assertEqual(req.headers["Sec-Fetch-Dest"], "empty")
+        # Both are navigation-only; an XHR/fetch call must never send them.
+        self.assertNotIn("Sec-Fetch-User", req.headers)
+        self.assertNotIn("Upgrade-Insecure-Requests", req.headers)
+
+    def test_post_inserts_content_type_right_after_accept(self):
+        """
+        A dict's `d["k"] = v` on an already-built headers dict would append
+        Content-Type at the very END (Python dicts only reorder on a NEW
+        key's first insertion) — wrong slot for a POST fetch. This pins that
+        the POST path builds its own copy instead, landing Content-Type where
+        Chrome puts it.
+        """
+        core.mtop_call(
+            "mtop.aliexpress.trade.cart.async", "1.0", {"a": 1},
+            cookies={"_m_h5_tk": "tok_123456789012345"}, method="POST")
+        order = self._last_order()
+        self.assertEqual(order.index("Content-Type"), order.index("Accept") + 1)
+
+    def test_get_has_no_content_type(self):
+        """No body on GET -> no Content-Type, matching what a real browser sends."""
+        core.mtop_call(
+            "mtop.aliexpress.trade.cart.render", "1.0", {"a": 1},
+            cookies={"_m_h5_tk": "tok_123456789012345"})
+        self.assertNotIn("Content-Type", self._last_order())
 
 
 if __name__ == "__main__":
