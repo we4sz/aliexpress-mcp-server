@@ -169,11 +169,25 @@ def search_products(
         # grid". Reporting the second as the first told callers a 92,000-result
         # query was empty, and they believed it.
         if total_results and not filters:
+            # This used to end "Retry the same query." A user followed that
+            # advice and the identical retry failed again, twice in a row —
+            # the same class of error as the anti-bot message that once said
+            # "wait a minute or two" when waiting never helped. Do not advise
+            # an action without evidence it works.
+            #
+            # Deliberately does NOT suggest changing sort_by: adding a SortType
+            # alongside shipFromCountry was measured returning total=0 with no
+            # grid at all, so that "fix" can empty the result set outright.
+            advice = ("Dropping ship_from is worth trying — a warehouse filter narrows "
+                      "the query and may be correlated." if ship_from else
+                      "Trying slightly different keywords is worth a go.")
             return (
                 f"AliExpress reports {total_results:,} results for '{query}' but did not "
-                f"return the results grid after {SEARCH_RENDER_ATTEMPTS} attempts — this is "
-                "an intermittent server-side render failure, not an empty catalogue. "
-                "Retry the same query."
+                f"return the results grid after {SEARCH_RENDER_ATTEMPTS} attempts. This is "
+                "an intermittent server-side render failure, not an empty catalogue — but "
+                "retrying the identical query is NOT reliably fixing it. "
+                f"{advice} If it keeps failing for this exact query, report it as-is "
+                "rather than retrying in a loop."
             )
         if total_results:
             return (f"No products matched {', '.join(filters)} for '{query}' "

@@ -801,6 +801,77 @@ class TestSearchByTitle(unittest.TestCase):
             self.assertGreaterEqual(len(rung.split()), 5)
 
 
+def _ssr_html(inner_data):
+    """
+    Minimal `window._dida_config_._init_data_ = { data: <json> };` page, shaped
+    the way `_search_init_data`'s brace-matcher expects: it finds "data:" after
+    the assignment, then brace-matches the first `{` that follows — which is
+    exactly where `json.dumps(inner_data)` starts.
+    """
+    return f"<script>window._dida_config_._init_data_ = {{ data: {json.dumps(inner_data)} }};</script>"
+
+
+_SSR_ITEM_LIST = {
+    "root": {"fields": {"mods": {"itemList": {"content": [
+        {"productId": 123, "title": {"displayTitle": "Widget"},
+         "prices": {"salePrice": {"minPrice": 9.99, "currencyCode": "SEK"}}},
+    ]}}}}
+}
+
+
+class TestSearchRenderClassification(unittest.TestCase):
+    """
+    report item #3: an empty `parse_search_results` collapsed three different
+    causes into one "no items" outcome, which is why the retry loop's blanket
+    "Retry the same query" advice was wrong — an identical resubmit only ever
+    addresses cause (1), and demonstrably not even reliably that. This class
+    pins that `classify_search_render` actually tells the three apart, since
+    that is the only piece of the report-item-#3 fix that lives in scrape.py
+    (the retry loop and its caller-facing message live in catalog.py / server.py
+    — see the message reported back to the team for what needs to change there).
+    """
+
+    def test_no_payload_at_all(self):
+        html = "<html><body>nothing relevant here</body></html>"
+        self.assertEqual(scrape.classify_search_render(html), scrape.SSR_NO_PAYLOAD)
+
+    def test_empty_and_none_html_are_no_payload_not_a_crash(self):
+        self.assertEqual(scrape.classify_search_render(""), scrape.SSR_NO_PAYLOAD)
+        self.assertEqual(scrape.classify_search_render(None), scrape.SSR_NO_PAYLOAD)
+
+    def test_payload_present_but_json_does_not_parse(self):
+        # Brace-balanced (so the matcher finds a complete `{...}` span) but a
+        # trailing comma makes it invalid JSON — the "escaping we don't expect"
+        # case, which is at least as likely to be our own parser's fault as
+        # AliExpress's, and is why it gets its own label rather than folding
+        # into SSR_NO_PAYLOAD.
+        html = "<script>window._dida_config_._init_data_ = { data: {\"a\": 1,} };</script>"
+        self.assertEqual(scrape.classify_search_render(html), scrape.SSR_UNPARSEABLE)
+
+    def test_payload_parses_but_has_no_item_list(self):
+        html = _ssr_html({"root": {"fields": {"mods": {"itemList": {"content": []}}}}})
+        self.assertEqual(scrape.classify_search_render(html), scrape.SSR_NO_ITEM_LIST)
+
+    def test_a_real_item_list_is_ok(self):
+        html = _ssr_html(_SSR_ITEM_LIST)
+        self.assertEqual(scrape.classify_search_render(html), scrape.SSR_OK)
+
+    def test_classification_agrees_with_what_extract_search_items_finds(self):
+        """`_walk_for_items` backs both `_extract_search_items` and this — same view."""
+        html = _ssr_html(_SSR_ITEM_LIST)
+        self.assertEqual(len(scrape._extract_search_items(html)), 1)
+        self.assertEqual(scrape.classify_search_render(html), scrape.SSR_OK)
+
+    def test_the_refactor_did_not_change_end_to_end_parsing(self):
+        """`_extract_search_items` split into `_walk_for_items` — behavior must be identical."""
+        html = _ssr_html(_SSR_ITEM_LIST)
+        rows = scrape.parse_search_results(html)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["item_id"], "123")
+        self.assertEqual(rows[0]["title"], "Widget")
+        self.assertEqual(rows[0]["data_source"], "ssr")
+
+
 class TestVariantCountSignal(unittest.TestCase):
     """
     The cross-tool "price disagreement": search quotes ONE SKU, the PDP quotes the

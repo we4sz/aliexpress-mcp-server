@@ -290,14 +290,17 @@ def _search_init_data(html: str) -> Optional[dict]:
     return None
 
 
-def _extract_search_items(html: str) -> list[dict]:
+def _walk_for_items(data: Optional[dict]) -> list[dict]:
     """
-    Pull the product grid out of the SSR payload. Items live at
+    Find the product grid inside an already-parsed SSR payload. Items live at
     data.root.fields.mods.itemList.content (reverse-engineered live Jul 2026); we
     locate them structurally (the longest list of dicts carrying productId+prices)
     so a layout-key rename doesn't silently break us.
+
+    Split out of `_extract_search_items` so `classify_search_render` can reuse it
+    against a `data` dict it already parsed, instead of re-running
+    `_search_init_data`'s brace-matching scan over the same HTML a second time.
     """
-    data = _search_init_data(html)
     if not data:
         return []
     found: list[list] = []
@@ -315,6 +318,59 @@ def _extract_search_items(html: str) -> list[dict]:
 
     walk(data)
     return max(found, key=len) if found else []
+
+
+def _extract_search_items(html: str) -> list[dict]:
+    """Pull the product grid out of the SSR payload. See `_walk_for_items`."""
+    return _walk_for_items(_search_init_data(html))
+
+
+# report item #3: catalog.py's SEARCH_RENDER_ATTEMPTS retry loop treats "no
+# items parsed, total_results > 0" as one fact — "AliExpress rendered the page
+# without its grid" — and retries against that single diagnosis. That is why
+# the retry advice it produced ("Retry the same query") was wrong often enough
+# to get reported: an empty parse has at least three different real causes and
+# only one of them is "AliExpress dropped the grid this time":
+#
+#   1. the `_dida_config_._init_data_` assignment is missing from the HTML
+#      outright (AliExpress served the page with no SSR payload at all);
+#   2. the assignment is present but the JSON after it didn't parse — brace
+#      match failed or the text between `start` and the matching `}` isn't
+#      valid JSON (truncated response, escaping we don't expect, etc.) — this
+#      is at least as likely to be OUR parser choking as it is AliExpress's
+#      fault, and unlike (1) it is NOT necessarily fixed by an identical
+#      resubmit;
+#   3. the payload parsed cleanly and genuinely contains no productId+prices
+#      list (the page rendered, the grid module just wasn't populated).
+#
+# `parse_search_results` had no way to tell these apart because it only ever
+# returns a list, so a caller retrying on "items == []" was retrying blind
+# regardless of which of the three happened. This function exposes which one
+# it was; it does not itself decide what to do about it — that judgment call
+# (retry vs. not, what to tell the caller) belongs to whichever module owns
+# the HTTP retry loop.
+SSR_NO_PAYLOAD = "no_ssr_payload"
+SSR_UNPARSEABLE = "unparseable_ssr_payload"
+SSR_NO_ITEM_LIST = "no_item_list"
+SSR_OK = "ok"
+
+
+def classify_search_render(html: str) -> str:
+    """
+    Diagnose an empty `parse_search_results` result: SSR_NO_PAYLOAD,
+    SSR_UNPARSEABLE, SSR_NO_ITEM_LIST, or SSR_OK (a non-empty grid was found).
+
+    Cheapest check first: a bare regex search for the assignment before paying
+    for `_search_init_data`'s brace-matching scan, which only runs once here —
+    see `_walk_for_items` for why this doesn't duplicate `_extract_search_items`'s
+    own parse.
+    """
+    if not re.search(r"window\._dida_config_\._init_data_\s*=", html or ""):
+        return SSR_NO_PAYLOAD
+    data = _search_init_data(html)
+    if data is None:
+        return SSR_UNPARSEABLE
+    return SSR_OK if _walk_for_items(data) else SSR_NO_ITEM_LIST
 
 
 # Every field a parsed search row can carry, with "not known" as the default.
