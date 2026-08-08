@@ -19,7 +19,9 @@ Auth: Session cookies from MCP Auth Bridge extension at
 """
 
 import json
+import os
 import re
+import time
 from typing import Any, Optional
 
 from mcp.server.fastmcp import FastMCP
@@ -1349,6 +1351,28 @@ def add_many_to_cart(items: list[dict]) -> str:
 # saying so beats looping.
 SELECTION_MAX_ROUNDS = 4
 
+# Wall-clock this tool will spend before returning whatever it has achieved.
+#
+# Callers run behind transports with per-call deadlines — the Claude desktop
+# remote-devices bridge cuts at 60s — and a tool that blows the deadline returns
+# NOTHING: the client sees a timeout, not the bounded report it was promised,
+# while the server keeps working invisibly. Worse here, the server processes one
+# call at a time, so an over-running selection loop also stalls every other tool
+# call behind it; a follow-up view_cart timed out too.
+#
+# The arithmetic makes this unavoidable rather than unlucky. Cart writes are
+# paced CART_WRITE_MIN_INTERVAL apart to stay under the anti-bot threshold, so
+# 35 lines needing a change costs >= 175s of pacing alone. No amount of rounds
+# fits that in 60s. So: do what fits, report precisely what is left, and let a
+# re-run resume — the operation is idempotent, and a second call only touches
+# what is still wrong.
+SELECTION_TIME_BUDGET = float(os.environ.get("ALIEXPRESS_SELECTION_BUDGET", "45"))
+
+# Headroom kept back for the closing verification read, which walks every cart
+# page and is not free on a large cart. Without it the loop spends the budget on
+# writes and then overruns while confirming them.
+SELECTION_CLOSING_READ = 10.0
+
 
 @mcp.tool(
     title="Set Cart Selection",
@@ -1401,6 +1425,7 @@ def set_cart_selection(selected: bool, item_id: str = "", url: str = "",
         cart_ids: Several cart LINE ids to set to the same state in one call.
         all_lines: Set EVERY line in the cart, in a single request.
     """
+    call_started = time.monotonic()
     cookies = load_cookies()
     if not cookies:
         return AUTH_EXPIRED_MSG
@@ -1432,8 +1457,24 @@ def set_cart_selection(selected: bool, item_id: str = "", url: str = "",
             state = "ticked" if selected else "un-ticked"
             return (f"All {len(everything)} cart line(s) are already {state} — "
                     "nothing to change, no writes made.")
+        wrong_now = sum(1 for i in everything
+                        if i.get("cart_id") and bool(i.get("selected")) != bool(selected))
+        if wrong_now * CART_WRITE_MIN_INTERVAL > SELECTION_TIME_BUDGET:
+            # Warn BEFORE spending the budget, not after. A caller behind a 60s
+            # transport deadline deserves to know the job needs several calls
+            # while it can still choose the site instead.
+            calls = max(2, -(-wrong_now * CART_WRITE_MIN_INTERVAL // SELECTION_TIME_BUDGET))
+            logger.info("selection: %d lines need changing, ~%d calls at this pacing",
+                        wrong_now, calls)
 
     if cart_ids:
+        try:
+            _m0, _ = _cart_fetch_all_pages(cookies, _cart_droplet_render(cookies))
+            ticked_at_entry = sum(1 for i in _extract_cart_droplet(_m0)["items"]
+                                  if i.get("selected"))
+        except Exception:
+            ticked_at_entry = None
+
         # CONVERGE, don't fire-and-hope.
         #
         # Setting one line's checkbox reliably flips OTHER lines off — reported
@@ -1452,6 +1493,16 @@ def set_cart_selection(selected: bool, item_id: str = "", url: str = "",
         targets = {str(c) for c in cart_ids}
         done, failed, rounds = set(), [], 0
         prev_wrong = None
+        ran_out_of_time = False
+
+        # Measured from TOOL ENTRY, not from the first write. The paginated
+        # read that resolves the cart, and the verification read at the end,
+        # are part of the caller's deadline too — budgeting only the writes
+        # produced a 58.2s call against a 60s transport limit, which is a
+        # timeout waiting for a slower day.
+        def _budget_left():
+            return SELECTION_TIME_BUDGET - (time.monotonic() - call_started)
+
         for rounds in range(1, SELECTION_MAX_ROUNDS + 1):
             try:
                 merged, _ = _cart_fetch_all_pages(cookies, _cart_droplet_render(cookies))
@@ -1471,6 +1522,13 @@ def set_cart_selection(selected: bool, item_id: str = "", url: str = "",
                 break
             prev_wrong = len(wrong)
             for cid in wrong:
+                # One write costs at least CART_WRITE_MIN_INTERVAL of pacing.
+                # Stop while there is still time to RETURN, rather than being
+                # killed mid-loop with nothing to show for the writes already
+                # made.
+                if _budget_left() < CART_WRITE_MIN_INTERVAL + SELECTION_CLOSING_READ:
+                    ran_out_of_time = True
+                    break
                 try:
                     line, err, _coll = _cart_set_selected(cookies, "", cid, "", want)
                 except Exception as e:
@@ -1480,6 +1538,8 @@ def set_cart_selection(selected: bool, item_id: str = "", url: str = "",
                     failed.append(f"  {cid}: {err}")
                 else:
                     done.add(cid)
+            if ran_out_of_time:
+                break
 
         try:
             merged, _ = _cart_fetch_all_pages(cookies, _cart_droplet_render(cookies))
@@ -1490,9 +1550,42 @@ def set_cart_selection(selected: bool, item_id: str = "", url: str = "",
         stuck = [c for c in targets if c in final and bool(final[c].get("selected")) != want]
         gone = sorted(targets - set(final))
 
+        total_ticked = sum(1 for i in final.values() if i.get("selected"))
         verb = "Ticked" if want else "Un-ticked"
         out = [f"{verb} {len(landed)} of {len(targets)} line(s), verified against a fresh "
                f"read after {rounds} round(s)."]
+        # Did the call move the total AT ALL? Ticking N lines while N others
+        # get knocked off nets zero, and telling someone to re-run that is the
+        # same useless advice this codebase has already deleted twice. Observed
+        # on five cart sizes — 22, 25, 26, 28 and 35 lines — every one settling
+        # at exactly 20 ticked, with repeat calls making no progress. The site's
+        # own "Select all" is NOT subject to it, so it is the answer here, not
+        # another call.
+        net_stalled = (want and ticked_at_entry is not None
+                       and total_ticked <= ticked_at_entry and stuck)
+        if net_stalled:
+            out += ["",
+                    f"⛔ This call ticked {len(landed)} line(s) and the cart's total ticked "
+                    f"count did not rise ({ticked_at_entry} → {total_ticked}). Ticking a "
+                    "line is knocking another one off, so re-running will NOT get further "
+                    "— five different cart sizes have all settled at exactly 20 ticked "
+                    "lines through this API path.",
+                    "   Use the AliExpress site or app's own \"Select all\" instead; that "
+                    "control is not subject to this and sets the whole cart in one action."]
+        elif ran_out_of_time and stuck:
+            # Say how much more work is left in CALLS, not seconds — the caller
+            # can act on "run this twice more", not on a duration.
+            more = max(1, -(-len(stuck) * CART_WRITE_MIN_INTERVAL // SELECTION_TIME_BUDGET))
+            out += ["",
+                    f"⏱ Stopped at the {SELECTION_TIME_BUDGET:.0f}s time budget with "
+                    f"{len(stuck)} line(s) still to go — not because they failed, but so "
+                    "this returns a report instead of being killed mid-loop with nothing "
+                    "to show. Writes are paced to stay under the anti-bot threshold, so "
+                    f"they cost ~{CART_WRITE_MIN_INTERVAL:.0f}s each.",
+                    f"   Re-run the identical call to resume — it only touches what is "
+                    f"still wrong, so roughly {int(more)} more call(s). For a whole large "
+                    "cart, the site's own \"Select all\" is faster than any number of "
+                    "calls here."]
         if stuck:
             out += ["", f"⚠ NOT {verb.lower()} — these did not hold:"]
             out += [f"    {str(final[c].get('title') or c)[:70]}" for c in stuck]
@@ -1500,7 +1593,6 @@ def set_cart_selection(selected: bool, item_id: str = "", url: str = "",
             out += ["", "Not in the cart at all:"] + [f"    {c}" for c in gone]
         if failed:
             out += ["", "Problems:"] + failed
-        total_ticked = sum(1 for i in final.values() if i.get("selected"))
         if final:
             out += ["", f"Cart now: {total_ticked} of {len(final)} line(s) ticked for checkout."]
         return "\n".join(out)
