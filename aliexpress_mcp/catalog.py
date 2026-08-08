@@ -112,6 +112,26 @@ def _short_title(title: str, limit: int = TITLE_MAX) -> str:
     return cut.rstrip(" ,·-") + "…"
 
 
+def apply_sort(products: list[dict], sort_by: str) -> list[dict]:
+    """
+    Enforce the requested ordering over the rows we actually return.
+
+    AliExpress honours `SortType` on a plain search but silently drops it when
+    `shipFromCountry` is also set — verified live: price_asc alone returns
+    3.23, 3.48, 3.51…; the same call with ship_from=ES returns 149.91, 195.18,
+    121.36 while the header still claimed price_asc. Rather than assert an
+    ordering the server did not apply, sort the parsed rows ourselves. Unpriced
+    rows sink to the end instead of being dropped or sorting as zero.
+    """
+    if sort_by == "price_asc":
+        key, rev = lambda p: (p.get("price") is None, p.get("price") or 0), False
+    elif sort_by == "price_desc":
+        key, rev = lambda p: (p.get("price") is None, p.get("price") or 0), True
+    else:
+        return products
+    return sorted(products, key=key, reverse=rev)
+
+
 def _format_product_lines(products: list[dict], header: str, limit: int = 25) -> str:
     """Render parsed product dicts into the compact text shared by search + deals."""
     lines = [header]

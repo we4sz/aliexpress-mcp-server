@@ -37,10 +37,15 @@ ROOT = Path(__file__).resolve().parent
 ITEM_MULTI = "1005007235591794"   # multi-variant (the "grab bag" case)
 ITEM_SIMPLE = "1005008819293735"  # simple listing with a real shipping quote
 
+# `best_match` ranking is server-side non-deterministic — running the ORIGINAL
+# implementation against itself produced a larger diff than a refactor did — so
+# the search cases pin an explicit sort. Otherwise every run reports structural
+# noise and the harness trains you to ignore it, which is worse than no harness.
 CASES = [
-    ("search_products", dict(query="usb c cable")),
-    ("search_products_shipfrom", dict(query="usb c cable", ship_from="ES"), "search_products"),
-    ("find_deals", dict(query="usb c cable")),
+    ("search_products", dict(query="usb c cable", sort_by="price_asc")),
+    ("search_products_shipfrom", dict(query="usb c cable", ship_from="ES",
+                                      sort_by="price_asc"), "search_products"),
+    ("find_deals", dict(query="usb c cable", sort_by="price_asc")),
     ("get_product_details", dict(item_id=ITEM_SIMPLE)),
     ("get_variants", dict(item_id=ITEM_MULTI)),
     ("get_shipping_estimate", dict(item_id=ITEM_SIMPLE)),

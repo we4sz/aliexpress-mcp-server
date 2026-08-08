@@ -38,6 +38,7 @@ from aliexpress_mcp.core import (
 )
 from aliexpress_mcp.scrape import parse_product_detail
 from aliexpress_mcp.catalog import (
+    apply_sort,
     SEARCH_RENDER_ATTEMPTS, _search_fetch_parse, _format_product_lines,
     _fetch_pdp_mtop, _informative_tax_note, _lot_note,
     _pdp_error_code, _pdp_unavailable_msg, _extract_pdp_fields, _delivery_days,
@@ -109,6 +110,7 @@ def search_products(
     """
     try:
         products, total_results = _search_fetch_parse(query, sort_by, ship_from)
+        products = apply_sort(products, sort_by)
     except RuntimeError as e:
         return str(e)
 
@@ -188,6 +190,7 @@ def find_deals(
     """
     try:
         products, total_results = _search_fetch_parse(query, sort_by, ship_from)
+        products = apply_sort(products, sort_by)
     except RuntimeError as e:
         return str(e)
 
@@ -204,9 +207,15 @@ def find_deals(
         return f"No discounted listings{floor} found for '{query}'."
 
     deals.sort(key=lambda p: p["discount_pct"], reverse=True)
-    return _format_product_lines(
-        deals, f"Found {len(deals)} deal(s) for '{query}' (biggest discount first):"
-    )
+    # Say what is actually printed. The header claimed "Found 58 deal(s)" while the
+    # body carried 25 — the same header-disagrees-with-body bug already fixed in
+    # search_products, still living in its sibling.
+    shown = min(len(deals), 25)
+    head = (f"Showing {shown} of {len(deals)} deal(s) for '{query}'"
+            if shown < len(deals) else f"Found {len(deals)} deal(s) for '{query}'")
+    if ship_from:
+        head += f", ships from {ship_from.upper()}"
+    return _format_product_lines(deals, head + " (biggest discount first):")
 
 
 @mcp.tool(
@@ -1364,7 +1373,9 @@ def view_cart() -> str:
         # carry no price) were silently dropped from the sum while the label still
         # claimed "all items shown" — a total narrower than its own description.
         unpriced = len(items) - len(priced)
-        if truncated:
+        if truncated and unpriced:
+            scope = f"{len(priced)} of {n} shown items; {unpriced} unpriced"
+        elif truncated:
             scope = f"{n} shown items"
         elif unpriced:
             scope = f"{len(priced)} of {len(items)} items; {unpriced} unpriced"
