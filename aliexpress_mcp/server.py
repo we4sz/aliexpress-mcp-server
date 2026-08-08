@@ -1360,7 +1360,16 @@ def view_cart() -> str:
     priced = [(it["price"], int(it.get("quantity") or 1)) for it in items if it.get("price") is not None]
     if priced:
         shown_subtotal = round(sum(p * q for p, q in priced), 2)
-        scope = f"{n} shown items" if truncated else "all items shown"
+        # Say what the number actually covers. Unpriced lines (unavailable items
+        # carry no price) were silently dropped from the sum while the label still
+        # claimed "all items shown" — a total narrower than its own description.
+        unpriced = len(items) - len(priced)
+        if truncated:
+            scope = f"{n} shown items"
+        elif unpriced:
+            scope = f"{len(priced)} of {len(items)} items; {unpriced} unpriced"
+        else:
+            scope = "all items shown"
         lines.append(f"Subtotal ({scope}): {_fmt_money(shown_subtotal, currency)}")
     # AliExpress's own totals. On the droplet path they come from that response's
     # summary component, already formatted in its pay currency, and are printed

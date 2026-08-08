@@ -52,15 +52,21 @@ CASES = [
     ("list_wishlists", {}),
 ]
 
-# Patterns whose change is expected on a live marketplace. Used only to CLASSIFY
-# a diff, never to suppress one.
-VOLATILE = [
-    re.compile(r"\d+[.,]\d{2}\s*(SEK|USD|EUR|CAD|kr)"),   # prices
-    re.compile(r"[A-Z][a-z]{2}\.?\s+\d{1,2}"),            # delivery dates
-    re.compile(r"\d+\s+in stock"),
-    re.compile(r"\d[\d,]*\s+total"),
-    re.compile(r"\d+\s*(sold|item\(s\))"),
-]
+# A line is "volatile" only when its NUMBERS moved and its WORDS did not.
+#
+# The first version of this asked "does the line contain a price?" and called any
+# such change volatile. That dismissed a real regression: a subtotal whose label
+# changed from "all items shown" to "23 of 24 items; 1 unpriced" while the number
+# stayed identical was reported as price drift, because the line happened to
+# contain a price. Masking the digits and comparing what's left catches that —
+# same skeleton means only values moved; different skeleton is structural.
+_NUM = re.compile(r"\d[\d\s.,]*")
+_DATE = re.compile(r"[A-Z][a-z]{2}\.?\s+#")   # applied after digit masking
+
+
+def skeleton(line):
+    """The line with every numeric run replaced, so only its wording remains."""
+    return _DATE.sub("<date>", _NUM.sub("#", line))
 
 
 def unwrap(name):
@@ -91,8 +97,9 @@ def capture(label):
     print(f"\nwrote {out}")
 
 
-def looks_volatile(line):
-    return any(p.search(line) for p in VOLATILE)
+def only_numbers_moved(old, new):
+    """True when the two files differ only in numeric values, not in wording."""
+    return [skeleton(l) for l in old] == [skeleton(l) for l in new]
 
 
 def diff(label):
@@ -112,9 +119,9 @@ def diff(label):
             continue
         changed = [l for l in difflib.unified_diff(old, new, lineterm="", n=0)
                    if l.startswith(("+", "-")) and not l.startswith(("+++", "---"))]
-        if changed and all(looks_volatile(l) for l in changed):
+        if only_numbers_moved(old, new):
             volatile += 1
-            print(f"~ {f.name}: {len(changed)} line(s), all look like live price/date drift")
+            print(f"~ {f.name}: {len(changed)} line(s), values moved but wording identical")
             continue
         structural += 1
         print(f"\n✗ {f.name}: STRUCTURAL DIFF")

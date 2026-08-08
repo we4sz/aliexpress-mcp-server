@@ -207,17 +207,20 @@ def _cart_operate(cookies: dict, resp: dict, component_id: str, operation: str,
     full quantityView back is accepted with SUCCESS but silently does nothing.
     """
     tree = resp.get("data") or {}
-    blocks = tree.get("data") or {}
+    # Named `components`, not `blocks`: a local `blocks` here shadows the imported
+    # blocks() helper for the rest of this function, which would break any later
+    # call to it silently.
+    components = tree.get("data") or {}
     root = (tree.get("page") or {}).get("root")
 
-    comp = json.loads(json.dumps(blocks[component_id]))
+    comp = json.loads(json.dumps(components[component_id]))
     comp.setdefault("fields", {})["operationType"] = operation
     if quantity is not None:
         comp["fields"]["quantityView"] = {"current": int(quantity)}
     comp["needSubmit"] = True
     data = {component_id: comp}
-    if root and root in blocks:
-        root_comp = json.loads(json.dumps(blocks[root]))
+    if root and root in components:
+        root_comp = json.loads(json.dumps(components[root]))
         root_comp["needSubmit"] = True
         data[root] = root_comp
 
