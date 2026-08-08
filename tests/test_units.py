@@ -1638,6 +1638,27 @@ class TestMtopCallHeaderOrder(unittest.TestCase):
             cookies={"_m_h5_tk": "tok_123456789012345"})
         self.assertNotIn("Content-Type", self._last_order())
 
+    def test_accept_is_bare_application_json(self):
+        """
+        Was `application/json, text/plain, */*` — a jQuery/axios default that
+        looked like a reasonable guess and was wrong. The real capture shows
+        bare `application/json`, no fallback types — a VALUE, not an ordering
+        claim, so unaffected by the DevTools-alphabetizing caveat above.
+        """
+        core.mtop_call(
+            "mtop.aliexpress.trade.cart.render", "1.0", {"a": 1},
+            cookies={"_m_h5_tk": "tok_123456789012345"})
+        self.assertEqual(self.captured[-1].headers["Accept"], "application/json")
+
+    def test_sec_ch_ua_matches_the_captured_brand_list(self):
+        """Pins the exact captured string, not just SEC_CH_UA's presence."""
+        core.mtop_call(
+            "mtop.aliexpress.trade.cart.render", "1.0", {"a": 1},
+            cookies={"_m_h5_tk": "tok_123456789012345"})
+        self.assertEqual(
+            self.captured[-1].headers["sec-ch-ua"],
+            '"Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151"')
+
 
 class TestSponsoredPlacements(unittest.TestCase):
     """

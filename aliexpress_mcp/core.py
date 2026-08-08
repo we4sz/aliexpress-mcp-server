@@ -85,16 +85,21 @@ logger = logging.getLogger("aliexpress-mcp")
 # live session tokens, an account id and an email address, and was redacted;
 # never reconstruct or re-commit it). It's a POST to
 # `mtop.aliexpress.trade.cart.async`, captured via DevTools' JS ("fetch()
-# view") export, which the file itself notes does not surface HTTP/2's
-# pseudo-headers (:method, :authority, …). Below, mtop_call()'s values and
-# relative order for accept / accept-language / content-type / priority /
-# sec-ch-ua* / sec-fetch-* / cookie / referer are taken directly from that
-# capture. get_client()'s page-navigation shape has NOT been captured — its
-# values remain built from Chrome's publicly documented Client Hints / Fetch
-# Metadata behavior, unverified, the same confidence split the
-# CART_SELECT_FIELD/CART_OP_SELECT constants in cart.py got before *their*
-# live verification landed (and got corrected — twice — by that verification;
-# treat "unverified" here exactly as skeptically).
+# view") export. That export lists headers ALPHABETICALLY (accept,
+# accept-language, content-type, priority, sec-ch-ua, … is a-to-z), which is
+# DevTools' display convention, not the byte order Chrome put on the wire —
+# so mtop_call()'s VALUES for accept / accept-language / content-type /
+# priority / sec-ch-ua* / sec-fetch-* / cookie / referer are taken directly
+# from that capture and are solid; its header ORDER below is this module's
+# own reasonable-looking placement (loosely following what the capture
+# happened to display), not proof of Chrome's actual sequence — see
+# tests/test_units.py's TestMtopCallHeaderOrder for exactly what is and isn't
+# pinned as a result. get_client()'s page-navigation shape has NOT been
+# captured at all — its values remain built from Chrome's publicly documented
+# Client Hints / Fetch Metadata behavior, unverified, the same confidence
+# split the CART_SELECT_FIELD/CART_OP_SELECT constants in cart.py got before
+# *their* live verification landed (and got corrected — twice — by that
+# verification; treat "unverified" here exactly as skeptically).
 #
 # Two things the capture corrected that general Chrome knowledge got WRONG,
 # worth recording so nobody "fixes" them back:
@@ -443,22 +448,27 @@ def mtop_call(
     # Insecure-Requests` — both are navigation-only, confirmed ABSENT on this
     # capture (see below), not merely assumed.
     #
-    # Values and relative order for accept / accept-language / content-type /
-    # priority / sec-ch-ua* / sec-fetch-* / cookie / referer are copied from a
-    # real POST to this exact endpoint's family (`cart.async`), captured Aug
-    # 2026 — see fixtures/chrome_headers_xhr.txt and the module-level "Browser
-    # header profile" comment above USER_AGENT for the full story, including
-    # what that capture corrected (Accept-Language, Accept's value) versus
-    # what an earlier, plausible-looking guess had. `Accept` is bare
+    # VALUES for accept / accept-language / content-type / priority /
+    # sec-ch-ua* / sec-fetch-* / cookie / referer are copied from a real POST
+    # to this exact endpoint's family (`cart.async`), captured Aug 2026 — see
+    # fixtures/chrome_headers_xhr.txt and the module-level "Browser header
+    # profile" comment above USER_AGENT for the full story, including what
+    # that capture corrected (Accept-Language, Accept's value) versus what an
+    # earlier, plausible-looking guess had. `Accept` is bare
     # `application/json` — NOT `application/json, text/plain, */*` (a
-    # jQuery/axios default that looked right but wasn't). User-Agent, Origin,
-    # Accept-Encoding, and Connection are NOT in that capture (DevTools' JS
-    # export doesn't surface headers JS can't set/read, and Connection
-    # specifically doesn't exist at all over the real HTTP/2 connection Chrome
-    # used — see the transport-layer limits in the module comment) but are
-    # still sent here since a real request always carries them; their
-    # position below is this module's own best-effort placement, not
-    # confirmed by the capture the way the other ten headers are.
+    # jQuery/axios default that looked right but wasn't).
+    #
+    # ORDER below is NOT proven by that capture — DevTools' JS export lists
+    # headers alphabetically, which is a display convention, not the wire
+    # order (see the module comment). The sequence here loosely follows what
+    # the capture happened to display, which is as defensible a default as
+    # any other, but treat it as this module's own placement, not evidence.
+    # User-Agent, Origin, Accept-Encoding, and Connection aren't in the
+    # capture at all (DevTools' JS export doesn't surface headers JS can't
+    # set/read, and Connection specifically doesn't exist at all over the
+    # real HTTP/2 connection Chrome used — see the transport-layer limits in
+    # the module comment) but are still sent here since a real request always
+    # carries them; their slot is this module's own placement too.
     headers = {
         "User-Agent": USER_AGENT,
         "Accept": "application/json",

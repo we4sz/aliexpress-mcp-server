@@ -37,7 +37,7 @@ from aliexpress_mcp.core import (
 from aliexpress_mcp.scrape import parse_product_detail
 from aliexpress_mcp.catalog import (
     apply_sort,
-    SEARCH_RENDER_ATTEMPTS, _search_fetch_parse, search_with_notes, search_by_title,
+    SEARCH_RENDER_ATTEMPTS, search_with_notes, search_by_title,
     normalize_ship_from, _format_product_lines,
     _fetch_pdp_mtop, _informative_tax_note, _lot_note,
     _pdp_error_code, _pdp_unavailable_msg, _extract_pdp_fields, _delivery_days,
