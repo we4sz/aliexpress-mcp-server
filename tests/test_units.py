@@ -767,7 +767,7 @@ class TestSearchByTitle(unittest.TestCase):
             return (answers.get(len(tried) - 1, []), None, [])
 
         with mock.patch.object(catalog, "search_with_notes", side_effect=fake), \
-                mock.patch.object(catalog, "_pace"):
+                mock.patch.object(catalog, "_search_backoff", return_value=0):
             products, used, notes = catalog.search_by_title("A B C D E F G H I J K L")
         return products, used, notes, tried
 
@@ -1890,6 +1890,562 @@ class TestSelectionCollateralDetection(unittest.TestCase):
                                return_value={"items": [{"cart_id": 123, "title": "x",
                                                         "selected": True}]}):
             self.assertEqual(list(cart._selection_map({})), ["123"])
+
+
+#: The live "Explanation of the Supplier" content, verbatim from
+#: mtop.aliexpress.pdp.pc.query for item 1005007791813945 (Aug 2026), with the
+#: store id and name parametrised. Kept whole rather than reduced to the anchor
+#: because the surrounding boilerplate is what a prose-matching parser would trip
+#: on, and these tests exist to pin that we do not prose-match.
+SUPPLIER_HTML = (
+    "<strong>Important Notes</strong><br>This special page helps aggregate consumer "
+    "reviews and sales volume of similar items offered by multiple overseas merchants "
+    "for your easy reference. <br><strong>Information of the Seller</strong><br>"
+    'The seller of this item is <span style="color: #3598db;">'
+    '<a style="color: #3598db;" href="https://shoprenderview.aliexpress.com/credential/'
+    'showcredential.htm?storeNum={sid}&_lang=en_US&_currency=SEK" target="_blank" '
+    'rel="noopener">{name}</a></span>'
+)
+
+
+def _shop_card(name="Stone's Store", store_id=1103573332, rate="100.0",
+               total=10, opened="Mar 1, 2024", years=2):
+    """A SHOP_CARD_PC block in the live shape."""
+    return {
+        "storeName": name,
+        "sellerPositiveRate": rate,
+        "sellerPositiveNum": total,
+        "sellerTotalNum": total,
+        "sellerScore": 10,
+        "sellerLevel": "12-s",
+        "storeHomePage": f"https://m.aliexpress.com/store/storeHome.htm?sellerAdminSeq={store_id}",
+        "sellerInfo": {
+            "storeNum": store_id,
+            "storeURL": f"//www.aliexpress.com/store/{store_id}",
+            "formatOpenTime": opened,
+            "openedYear": years,
+            "countryCompleteName": "China",
+            "topRatedSeller": False,
+            "localSeller": False,
+        },
+    }
+
+
+def _pdp_result(shop=None, supplier=None, extra_compliance=True):
+    """A PDP `data.result` carrying a shop card and optionally a supplier disclosure."""
+    compliance = [{"title": "Additional regulatory information",
+                   "content": "For items delivered from outside the European Union…"}]
+    if supplier is not None:
+        compliance.append({"title": "Explanation of the Supplier", "content": supplier})
+    if extra_compliance:
+        # The contradictory second sentence AliExpress ships alongside the
+        # disclosure on every aggregation page seen live. It names the SHELL.
+        compliance.append({"title": "", "content": "Sold by Stone's Store. "
+                                                   "Logistics by AliExpress. "})
+    return {
+        "SHOP_CARD_PC": shop if shop is not None else _shop_card(),
+        "COMPLIANCE_PC": {"complianceList": compliance},
+        "GLOBAL_DATA": {"globalData": {"currencyCode": "SEK"}},
+    }
+
+
+class TestAggregationListingSeller(unittest.TestCase):
+    """
+    SHOP_CARD_PC is not always the seller, and reading it as one cost real money.
+
+    Six cart lines showed six different merchants while `get_seller` on the same
+    six item_ids all answered "Stone's Store — 100.0% positive (10 feedbacks),
+    opened Mar 1, 2024". The cart was right: these are AliExpress aggregation
+    listings, one item_id pooling reviews across several overseas merchants, and
+    the shop card names the pooling shell. The true merchant is in the EU trader
+    disclosure inside COMPLIANCE_PC. Confirmed against four live PDPs (Aug 2026),
+    every one of which carried the identical shell card — see `catalog.py`.
+    """
+
+    #: item_id → (real merchant, its storeNum), read live from the disclosure and
+    #: matched against what view_cart independently reported for the same items.
+    LIVE = {
+        "1005007791813945": ("Luyanmaoyi Store", 1102764714),
+        "1005006784660115": ("DeFeng Tools Store", 1102575030),
+        "1005008406340177": ("Electrical Hardware Tools Store", 1105626261),
+        "1005010037316351": ("Wenzhou Xiangheng Electric Technology Store", 1104022056),
+    }
+
+    def test_the_four_live_items_resolve_to_their_real_merchants(self):
+        for item_id, (name, sid) in self.LIVE.items():
+            with self.subTest(item=item_id):
+                result = _pdp_result(supplier=SUPPLIER_HTML.format(sid=sid, name=name))
+                d = catalog._extract_seller(result)
+                self.assertTrue(d["aggregated"])
+                self.assertEqual(d["store_name"], name)
+                self.assertEqual(d["store_id"], sid)
+                self.assertEqual(d["listed_store_name"], "Stone's Store")
+                self.assertEqual(d["store_url"],
+                                 f"https://www.aliexpress.com/store/{sid}")
+
+    def test_the_shells_glowing_profile_is_dropped_entirely(self):
+        """100.0% / 10 feedbacks / Mar 1 2024 describes nobody the buyer deals with."""
+        result = _pdp_result(supplier=SUPPLIER_HTML.format(sid=1102764714,
+                                                           name="Luyanmaoyi Store"))
+        d = catalog._extract_seller(result)
+        self.assertFalse(d["stats_describe_seller"])
+        for field in ("positive_rate", "positive_num", "total_reviews", "score",
+                      "level", "opened", "opened_years", "country", "top_rated",
+                      "local_seller"):
+            with self.subTest(field=field):
+                self.assertIsNone(d[field])
+
+    def test_an_ordinary_listing_is_untouched(self):
+        """8 of the 12 live PDPs had no credential link in COMPLIANCE_PC at all."""
+        shop = _shop_card(name="Shop1104394283 Store", store_id=1104394283,
+                          rate="94.6", total=16002, opened="Dec 8, 2024", years=1)
+        d = catalog._extract_seller(_pdp_result(shop=shop, extra_compliance=False))
+        self.assertFalse(d["aggregated"])
+        self.assertTrue(d["stats_describe_seller"])
+        self.assertEqual(d["store_name"], "Shop1104394283 Store")
+        self.assertEqual(d["positive_rate"], 94.6)
+        self.assertEqual(d["total_reviews"], 16002)
+        self.assertEqual(d["opened"], "Dec 8, 2024")
+
+    def test_a_disclosure_naming_the_same_store_is_not_an_aggregation(self):
+        """Extra disclosure ≠ pooled listing. Only a DIFFERENT store id counts."""
+        shop = _shop_card(name="qingmai Store", store_id=3668053, rate="96.4",
+                          total=156461)
+        result = _pdp_result(shop=shop, extra_compliance=False,
+                             supplier=SUPPLIER_HTML.format(sid=3668053,
+                                                           name="qingmai Store"))
+        d = catalog._extract_seller(result)
+        self.assertFalse(d["aggregated"])
+        self.assertEqual(d["positive_rate"], 96.4)
+
+    def test_a_credential_link_outside_compliance_is_ignored(self):
+        """
+        Scoping to COMPLIANCE_PC is load-bearing: the same showcredential URL
+        appears elsewhere on ORDINARY pages carrying the shop card's own id, so a
+        whole-document search would call every listing an aggregation.
+        """
+        shop = _shop_card(name="qingmai Store", store_id=3668053)
+        shop["credentialUrl"] = ("https://shoprenderview.aliexpress.com/credential/"
+                                 "showcredential.htm?storeNum=999999&_lang=en_US")
+        d = catalog._extract_seller(_pdp_result(shop=shop, extra_compliance=False))
+        self.assertFalse(d["aggregated"])
+        self.assertEqual(d["store_id"], 3668053)
+
+    def test_the_contradictory_sold_by_sentence_does_not_win(self):
+        """
+        Every affected page also says "Sold by Stone's Store. Logistics by
+        AliExpress." — naming the shell. We key on the credential anchor, which
+        carries an id rather than a name and does not move with `_lang`.
+        """
+        result = _pdp_result(supplier=SUPPLIER_HTML.format(sid=1102575030,
+                                                           name="DeFeng Tools Store"))
+        d = catalog._extract_seller(result)
+        self.assertEqual(d["store_name"], "DeFeng Tools Store")
+
+    def test_an_anchorless_disclosure_still_reports_the_aggregation(self):
+        """A store we can only number beats a store name we know to be wrong."""
+        result = _pdp_result(supplier="The seller is https://shoprenderview.aliexpress"
+                                      ".com/credential/showcredential.htm?storeNum=1102764714")
+        d = catalog._extract_seller(result)
+        self.assertTrue(d["aggregated"])
+        self.assertIsNone(d["store_name"])
+        self.assertEqual(d["store_id"], 1102764714)
+
+    def test_a_bare_shop_card_admits_it_could_not_check(self):
+        """
+        The legacy call shape. It cannot see COMPLIANCE_PC, so it must not claim
+        the listing is fine — `aggregated` stays None, never False.
+        """
+        d = catalog._extract_seller(_shop_card())
+        self.assertFalse(d["disclosure_checked"])
+        self.assertIsNone(d["aggregated"])
+        self.assertIn("may not be the seller", catalog.seller_report(d, "1005007791813945"))
+
+    def test_malformed_shapes_do_not_raise(self):
+        for arg in (None, {}, "SHOP_CARD_PC", [],
+                    {"SHOP_CARD_PC": None, "COMPLIANCE_PC": None},
+                    {"SHOP_CARD_PC": {}, "COMPLIANCE_PC": {"complianceList": "x"}},
+                    {"SHOP_CARD_PC": {}, "COMPLIANCE_PC": {"complianceList": [None, 7]}}):
+            with self.subTest(arg=arg):
+                self.assertIsNone(catalog._extract_seller(arg)["store_name"])
+
+
+class TestSellerReport(unittest.TestCase):
+    """The rendered answer must fail loudly, not merely go quiet."""
+
+    def _aggregated(self):
+        return catalog._extract_seller(
+            _pdp_result(supplier=SUPPLIER_HTML.format(sid=1102764714,
+                                                      name="Luyanmaoyi Store")))
+
+    def test_the_wrong_stores_numbers_never_reach_the_caller(self):
+        out = catalog.seller_report(self._aggregated(), "1005007791813945")
+        for leaked in ("100.0", "10 seller feedbacks", "Mar 1, 2024"):
+            with self.subTest(leaked=leaked):
+                self.assertNotIn(leaked, out)
+
+    def test_it_says_which_store_the_page_advertises_and_which_one_sells(self):
+        out = catalog.seller_report(self._aggregated(), "1005007791813945")
+        self.assertIn("Store: Luyanmaoyi Store", out)
+        self.assertIn("AGGREGATION", out)
+        self.assertIn("Stone's Store", out)          # named as the non-seller
+        self.assertIn("is not the seller", out)
+        self.assertIn("https://www.aliexpress.com/store/1102764714", out)
+
+    def test_an_ordinary_seller_reads_as_before(self):
+        shop = _shop_card(name="Shop1104394283 Store", store_id=1104394283,
+                          rate="94.6", total=16002, opened="Dec 8, 2024", years=1)
+        out = catalog.seller_report(
+            catalog._extract_seller(_pdp_result(shop=shop, extra_compliance=False)),
+            "1005008819293735")
+        self.assertEqual(out.splitlines()[:4], [
+            "Seller for item 1005008819293735:",
+            "Store: Shop1104394283 Store",
+            "Positive feedback: 94.6% (across 16002 seller feedbacks)",
+            "Opened: Dec 8, 2024 (1 yr)",
+        ])
+        self.assertNotIn("⚠", out)
+
+    def test_seller_level_and_score_stay_dropped(self):
+        """Unpublished scales. Pinned because the shop card offers them freely."""
+        shop = _shop_card(name="qingmai Store", store_id=3668053)
+        out = catalog.seller_report(
+            catalog._extract_seller(_pdp_result(shop=shop, extra_compliance=False)),
+            "32956487704")
+        self.assertNotIn("12-s", out)
+        self.assertNotIn("Score", out)
+
+
+class TestSellerDetailLines(unittest.TestCase):
+    """`get_product_details`' seller block: same identity answer, plus store age."""
+
+    def _fields(self, **kw):
+        return catalog._extract_pdp_fields({"data": {"result": _pdp_result(**kw)}}, "x")
+
+    def test_get_product_details_agrees_with_get_seller(self):
+        """The two disagreeing on who sells an item is the whole defect."""
+        result = _pdp_result(supplier=SUPPLIER_HTML.format(sid=1105626261,
+                                                           name="Electrical Hardware Tools Store"))
+        d = catalog._extract_pdp_fields({"data": {"result": result}}, "1005008406340177")
+        s = catalog._extract_seller(result)
+        self.assertEqual(d["seller_name"], s["store_name"])
+        self.assertEqual(d["seller_name"], "Electrical Hardware Tools Store")
+        self.assertTrue(d["seller_aggregated"])
+        self.assertIsNone(d["seller_positive_rate"])
+        self.assertIsNone(d["seller_total_reviews"])
+
+    def test_the_opened_date_is_now_here_too(self):
+        """It used to cost a second live call per item; research sessions ran two."""
+        shop = _shop_card(name="qingmai Store", store_id=3668053, rate="96.4",
+                          total=156461, opened="Mar 3, 2018", years=8)
+        lines = catalog.seller_detail_lines(self._fields(shop=shop, extra_compliance=False))
+        self.assertEqual(lines, ["Seller: qingmai Store — 96.4% positive feedback "
+                                 "(156461 seller feedbacks), opened Mar 3, 2018, 8 yr"])
+
+    def test_an_undated_store_omits_the_clause_rather_than_guessing(self):
+        shop = _shop_card(name="CY1122 Store", store_id=1105129465, rate="95.2",
+                          total=27804, opened=None, years=None)
+        lines = catalog.seller_detail_lines(self._fields(shop=shop, extra_compliance=False))
+        self.assertNotIn("opened", lines[0])
+
+    def test_the_aggregation_warning_carries_into_details(self):
+        d = self._fields(supplier=SUPPLIER_HTML.format(sid=1102764714,
+                                                       name="Luyanmaoyi Store"))
+        lines = catalog.seller_detail_lines(d)
+        self.assertEqual(lines[0], "Seller: Luyanmaoyi Store")
+        self.assertIn("Aggregation listing", lines[1])
+        self.assertIn("Stone's Store", lines[1])
+        self.assertNotIn("100.0", " ".join(lines))
+
+    def test_no_seller_yields_no_lines(self):
+        self.assertEqual(catalog.seller_detail_lines({}), [])
+
+
+class TestPriceGlitchCutoff(unittest.TestCase):
+    """
+    Placeholder prices must not set a listing's range, and real spans must survive.
+
+    Item 1005007791813945 rendered as "Price: 11.44 SEK–1809373.19 SEK" because
+    three out-of-stock configs carry a converted six-figure placeholder. The
+    threshold below was calibrated against live listings rather than guessed —
+    the widest GENUINE span found was 124x, so the obvious 100x rule would have
+    truncated a real product. See `catalog._price_glitch_cutoff`.
+    """
+
+    #: The 35 config prices of item 1005007791813945 (KF301 terminal blocks), live
+    #: Aug 2026. Three placeholders at the top; the real spread is 11.44–257.51.
+    KF301 = [11.44, 11.44, 14.74, 14.74, 20.22, 21.7, 21.7, 26.04, 26.04, 29.39,
+             29.59, 29.59, 31.83, 39.91, 42.34, 42.34, 42.86, 42.86, 43.4, 43.4,
+             44.62, 50.23, 56.54, 56.54, 59.17, 59.17, 78.89, 78.89, 123.66,
+             152.71, 155.82, 257.51, 1809373.19, 1809373.19, 1809373.19]
+
+    #: The 98 distinct prices among the 240 configs of item 1005002565791543 (LED
+    #: strip, 5m–100m), live Aug 2026. Genuinely spans 597x end to end — the
+    #: hardest legitimate case found, and the reason the threshold is not 100x.
+    LED_STRIP = [37.7, 45.22, 47.07, 54.01, 54.8, 56.65, 75.02, 84.88, 87.91, 90.54,
+                 94.35, 108.03, 109.59, 111.74, 112.51, 113.2, 135.76, 138.4, 141.42,
+                 149.54, 162.23, 163.31, 164.48, 169.75, 175.81, 181.18, 185.28,
+                 188.61, 194.96, 216.35, 219.27, 221.13, 225.14, 226.31, 263.72,
+                 270.26, 271.63, 274.07, 282.96, 314.31, 324.47, 328.95, 337.65,
+                 351.62, 364.52, 377.21, 439.52, 440.21, 450.17, 471.56, 518.74,
+                 527.43, 540.72, 562.69, 565.92, 675.31, 754.51, 867.71, 905.42,
+                 924.27, 941.27, 1080.84, 1094.02, 1125.47, 1509.03, 1758.0, 1810.84,
+                 1882.53, 1886.24, 2161.68, 2188.05, 2250.36, 2263.54, 2716.26,
+                 2823.79, 3242.51, 3282.17, 3516.0, 3772.58, 4500.73, 4527.1,
+                 4706.23, 5274.09, 5404.19, 5470.22, 5658.82, 6750.99, 7545.17,
+                 8790.09, 9054.2, 9412.65, 9431.4, 10808.48, 10940.43, 11251.72,
+                 17580.18, 18862.9, 22503.43]
+
+    def test_the_reported_listing_suppresses_exactly_its_three_placeholders(self):
+        cut = catalog._price_glitch_cutoff(self.KF301)
+        self.assertEqual(cut, 26040.0)
+        kept = [p for p in self.KF301 if p <= cut]
+        self.assertEqual(len(self.KF301) - len(kept), 3)
+        self.assertEqual((min(kept), max(kept)), (11.44, 257.51))
+
+    def test_a_597x_legitimate_span_survives_intact(self):
+        cut = catalog._price_glitch_cutoff(self.LED_STRIP)
+        self.assertEqual([p for p in self.LED_STRIP if p > cut], [])
+        # 22,503.43 is a real 100m reel. It sits 8x under the cutoff — the margin
+        # a 100x rule would not have had.
+        self.assertGreater(cut, max(self.LED_STRIP) * 7)
+
+    def test_the_other_live_listings_are_untouched(self):
+        """min/max of the six ordinary listings dumped Aug 2026."""
+        for label, prices in [
+            ("lever connectors", [21.15, 22.8, 28.08, 45.6, 111.81]),
+            ("waterproof boxes", [33.12, 35.89, 46.44, 78.2, 105.09]),
+            ("USB-C cable", [16.77, 16.77, 27.95, 33.55, 37.28]),
+            ("screw assortment", [63.66, 129.7, 168.36, 300.0, 516.27]),
+            ("LED strip + controller", [134.3, 134.3, 336.87, 900.0, 4590.1]),
+            ("dupont wire", [21.04, 25.04, 27.61]),
+        ]:
+            with self.subTest(listing=label):
+                cut = catalog._price_glitch_cutoff(prices)
+                self.assertEqual([p for p in prices if p > cut], [])
+
+    def test_a_contaminated_median_still_catches_the_glitch(self):
+        """
+        Why the anchor is the median of the CHEAPER HALF, not the plain median.
+        On [11.44, 1809373.19] the plain median is 904,692 and the placeholder
+        measures 2.0x it — invisible. Anchored low, it measures 158,162x.
+        """
+        prices = [11.44, 1809373.19]
+        cut = catalog._price_glitch_cutoff(prices)
+        self.assertEqual(cut, 11440.0)
+        self.assertEqual([p for p in prices if p > cut], [1809373.19])
+
+    def test_placeholders_outnumbering_real_configs_are_still_caught(self):
+        prices = [11.44, 14.74, 1809373.19, 1809373.19, 1809373.19]
+        cut = catalog._price_glitch_cutoff(prices)
+        self.assertEqual([p for p in prices if p > cut], [1809373.19] * 3)
+
+    def test_undecidable_inputs_return_none(self):
+        for prices in ([], [42.0], [None], [0.0], [0.0, -3], ["x", None]):
+            with self.subTest(prices=prices):
+                self.assertIsNone(catalog._price_glitch_cutoff(prices))
+
+    def test_a_uniform_listing_suppresses_nothing(self):
+        prices = [19.9] * 12
+        cut = catalog._price_glitch_cutoff(prices)
+        self.assertEqual([p for p in prices if p > cut], [])
+
+
+class TestPriceRangeExcludesPlaceholders(unittest.TestCase):
+    """The range must not be poisoned; the config must not disappear."""
+
+    def _result(self, prices):
+        """A PDP result whose SKU table and price map carry `prices` in order."""
+        sku_ids = [f"120000{i:05d}" for i in range(len(prices))]
+        return {
+            "GLOBAL_DATA": {"globalData": {"currencyCode": "SEK"}},
+            "PRICE": {"skuPriceInfoMap": {
+                s: {"salePriceString": f"{p:.2f} SEK"} for s, p in zip(sku_ids, prices)}},
+            "SKU": {"skuPaths": [{"skuIdStr": s, "skuAttr": f"14:1#cfg{i}", "salable": True,
+                                  "skuStock": 0}
+                                 for i, s in enumerate(sku_ids)]},
+        }
+
+    def test_the_reported_range_loses_its_absurd_top_end(self):
+        d = catalog._extract_pdp_fields(
+            {"data": {"result": self._result(TestPriceGlitchCutoff.KF301)}},
+            "1005007791813945")
+        self.assertEqual(d["price_range"], (11.44, 257.51))
+        self.assertEqual(d["price_suspect_count"], 3)
+        self.assertEqual(d["price_suspect_max"], 1809373.19)
+
+    def test_the_from_price_is_unaffected(self):
+        """Only the top is filtered; the cheap end is a real, if stripped, SKU."""
+        d = catalog._extract_pdp_fields(
+            {"data": {"result": self._result(TestPriceGlitchCutoff.KF301)}}, "x")
+        self.assertEqual(d["price"], 11.44)
+
+    def test_the_dearest_config_named_is_a_real_one(self):
+        """The 'Dearest:' label must describe the kept top, not the placeholder."""
+        d = catalog._extract_pdp_fields(
+            {"data": {"result": self._result([11.44, 257.51, 1809373.19])}}, "x")
+        self.assertEqual(d["price_range"], (11.44, 257.51))
+        self.assertNotIn("cfg2", d["price_high_spec"] or "")
+
+    def test_a_clean_listing_reports_no_suppression(self):
+        d = catalog._extract_pdp_fields(
+            {"data": {"result": self._result([16.77, 27.95, 37.28])}}, "x")
+        self.assertEqual(d["price_range"], (16.77, 37.28))
+        self.assertIsNone(d["price_suspect_count"])
+
+    def test_the_variants_table_keeps_the_row_and_flags_it(self):
+        """Deleting data would hide a discrepancy against the site; flagging shows it."""
+        rows = catalog._extract_variants(self._result(TestPriceGlitchCutoff.KF301))
+        flagged = [r for r in rows if r["price_suspect"]]
+        self.assertEqual(len(rows), 35)
+        self.assertEqual(len(flagged), 3)
+        self.assertTrue(all(r["price"] == 1809373.19 for r in flagged))
+
+    def test_no_variant_is_flagged_on_the_wide_but_genuine_listing(self):
+        rows = catalog._extract_variants(self._result(TestPriceGlitchCutoff.LED_STRIP))
+        self.assertEqual([r for r in rows if r["price_suspect"]], [])
+
+
+class _FakeResponse:
+    def __init__(self, text):
+        self.text = text
+
+    def raise_for_status(self):
+        pass
+
+
+class _FakeClient:
+    """Records every request and hands back the next canned page."""
+
+    def __init__(self, pages, log):
+        self._pages = pages
+        self._log = log
+
+    def get(self, url_path, params=None):
+        self._log.append((url_path, dict(params or {})))
+        i = min(len(self._log) - 1, len(self._pages) - 1)
+        return _FakeResponse(self._pages[i])
+
+    def close(self):
+        pass
+
+
+class TestSearchRetryBackoff(unittest.TestCase):
+    """
+    The retry loop's wait used to be `_pace("search_retry", 1.0)`, which does not
+    sleep at all the first time a channel is used in a process — correct for rate
+    limiting, wrong for backoff. Measured on a cold channel: call 0 slept 0.000s,
+    call 1 slept 1.441s. So of the two transitions the loop has, only the second
+    ever waited, and the reported symptom was an immediate identical resubmit that
+    failed again. These pin that the FIRST retry now waits.
+    """
+
+    def _drive(self, pages, classify, items_per_attempt=None):
+        """Run the render-retry loop with canned pages; return (result, sleeps, requests)."""
+        requests: list = []
+        sleeps: list[float] = []
+        answers = items_per_attempt if items_per_attempt is not None else [[]] * 6
+
+        def fake_parse(html):
+            return answers[min(len(requests) - 1, len(answers) - 1)]
+
+        with mock.patch.object(catalog, "get_client",
+                               side_effect=lambda: _FakeClient(pages, requests)), \
+                mock.patch.object(catalog, "check_auth_redirect", return_value=False), \
+                mock.patch.object(catalog, "parse_search_results", side_effect=fake_parse), \
+                mock.patch.object(catalog, "_search_total_results", return_value=1849), \
+                mock.patch.object(catalog, "classify_search_render", return_value=classify), \
+                mock.patch.object(catalog.logger, "info"), \
+                mock.patch.object(catalog.time, "sleep", side_effect=sleeps.append):
+            out = catalog.search_with_notes("ds18b20")
+        return out, sleeps, requests
+
+    def test_the_first_retry_actually_waits(self):
+        """The regression: transition 0→1 used to sleep 0.000s."""
+        _out, sleeps, requests = self._drive(["<html/>"], scrape.SSR_NO_PAYLOAD)
+        self.assertEqual(len(requests), catalog.SEARCH_RENDER_ATTEMPTS)
+        self.assertEqual(len(sleeps), catalog.SEARCH_RENDER_ATTEMPTS - 1)
+        self.assertGreaterEqual(sleeps[0], 1.5)
+
+    def test_the_backoff_increases(self):
+        _out, sleeps, _requests = self._drive(["<html/>"], scrape.SSR_NO_ITEM_LIST)
+        self.assertGreater(sleeps[1], sleeps[0])
+        self.assertGreaterEqual(sleeps[1], 3.0)
+
+    def test_it_does_not_sleep_after_the_last_attempt(self):
+        """A wait nobody uses is dead time on a path that is already slow."""
+        _out, sleeps, requests = self._drive(["<html/>"], scrape.SSR_NO_PAYLOAD)
+        self.assertEqual(len(sleeps), len(requests) - 1)
+
+    def test_a_successful_first_attempt_never_sleeps(self):
+        out, sleeps, requests = self._drive(["<html/>"], scrape.SSR_OK,
+                                            items_per_attempt=[[{"item_id": "1"}]])
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(sleeps, [])
+        self.assertEqual(len(out[0]), 1)
+
+    def test_the_schedule_clamps_rather_than_indexing_off_the_end(self):
+        for transition in range(6):
+            with self.subTest(transition=transition):
+                self.assertGreaterEqual(catalog._search_backoff(transition), 1.5)
+        self.assertGreaterEqual(catalog._search_backoff(99),
+                                catalog.SEARCH_RETRY_BACKOFF[-1])
+
+    def test_the_wait_is_jittered(self):
+        """A fixed cadence is a fingerprint, on a path that only runs when
+        AliExpress is already unhappy with us."""
+        self.assertGreater(len({round(catalog._search_backoff(0), 4)
+                                for _ in range(40)}), 1)
+
+
+class TestUnparseablePayloadIsNotRetried(unittest.TestCase):
+    """
+    An empty parse against a non-zero total has more than one cause. When the SSR
+    payload was present and WE failed to read it, an identical resubmit gets an
+    identical failure — so the loop stops and says so, instead of spending two more
+    requests of anti-bot budget and then advising a retry that cannot work.
+    """
+
+    def _drive(self, classify):
+        return TestSearchRetryBackoff._drive(self, ["<html/>"], classify)
+
+    def test_our_own_parse_failure_stops_the_loop(self):
+        (items, total, notes), sleeps, requests = self._drive(scrape.SSR_UNPARSEABLE)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(sleeps, [])
+        self.assertEqual(items, [])
+        self.assertEqual(total, 1849)
+
+    def test_it_says_the_listings_exist_and_a_retry_will_not_help(self):
+        (_items, _total, notes), _s, _r = self._drive(scrape.SSR_UNPARSEABLE)
+        self.assertEqual(len(notes), 1)
+        self.assertIn("1,849", notes[0])
+        self.assertIn("parsing failure on our side", notes[0])
+        self.assertIn("will not fix it", notes[0])
+
+    def test_a_dropped_grid_is_still_retried(self):
+        """AliExpress omitting the grid IS the case a resubmit fixes."""
+        for why in (scrape.SSR_NO_PAYLOAD, scrape.SSR_NO_ITEM_LIST):
+            with self.subTest(why=why):
+                (_i, _t, notes), _s, requests = self._drive(why)
+                self.assertEqual(len(requests), catalog.SEARCH_RENDER_ATTEMPTS)
+                self.assertEqual(notes, [])
+
+    def test_the_reason_survives_a_title_ladder_that_finds_nothing(self):
+        """
+        Otherwise the ladder swallows it and the caller is told "no listings
+        found" for a query whose listings demonstrably exist. Safe to forward
+        because an empty rung can only carry a failure note — `_finish_search`
+        emits its warehouse/relevance sentences only when there are rows.
+        """
+        note = "⚠ parse blew up"
+        with mock.patch.object(catalog, "search_with_notes",
+                               return_value=([], 1849, [note])), \
+                mock.patch.object(catalog, "_search_backoff", return_value=0):
+            products, used, notes = catalog.search_by_title("A B C D E F G H I J K L")
+        self.assertEqual(products, [])
+        self.assertEqual(used, "A B C D E F G H I J K L")
+        self.assertEqual(notes, [note])   # once, not once per rung
 
 
 if __name__ == "__main__":

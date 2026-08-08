@@ -8,7 +8,9 @@ docstring for the server-level overview.
 
 import json
 import os
+import random
 import re
+import time
 from typing import Any, Optional
 from urllib.parse import quote_plus
 
@@ -17,11 +19,14 @@ import httpx
 from aliexpress_mcp.core import (
     BASE_URL, COUNTRY, CURRENCY, LANG, USER_AGENT, ACCEPT_LANGUAGE, HTTP2, logger,
     load_cookies, get_client, check_auth_redirect,
-    AUTH_EXPIRED_MSG, _pace, mtop_call, ret_problem,
+    AUTH_EXPIRED_MSG, mtop_call, ret_problem,
     _msrp_flag, _fmt_money, parse_price, _normalize_price, _strip_html,
     _parse_sold_count,
 )
-from aliexpress_mcp.scrape import parse_search_results, SEARCH_SOURCE_GAPS
+from aliexpress_mcp.scrape import (
+    parse_search_results, SEARCH_SOURCE_GAPS,
+    classify_search_render, SSR_UNPARSEABLE,
+)
 
 
 SORT_MAP = {
@@ -33,6 +38,37 @@ SORT_MAP = {
 
 
 SEARCH_RENDER_ATTEMPTS = 3
+
+# Seconds to wait before each search retry, one entry per transition (3 attempts
+# = 2 transitions). Longer than the value they replace because the thing being
+# waited out is AliExpress deciding to render the grid, not our own politeness.
+#
+# These used to go through `_pace("search_retry", 1.0)`, which did not sleep at
+# all before the first retry. `_pace` computes
+# `wait = _last_call_at.get(channel, 0.0) + interval - time.monotonic()`, so on a
+# channel never used in this process `last` defaults to 0.0 against a monotonic
+# clock measured in days-since-boot and `wait` is hugely negative. Measured:
+#
+#     call 0 on a cold channel slept 0.000s
+#     call 1                   slept 1.441s
+#     call 2                   slept 1.169s
+#
+# That default is RIGHT for rate limiting — the first request in a process has
+# nothing to be spaced from — and wrong for backoff, where the whole point is to
+# wait before repeating something that just failed. The observable symptom was
+# the reported one: attempt 0→1 was an immediate identical resubmit, which failed
+# again, and only 1→2 ever backed off. `_pace` is left alone; core.py's cold-start
+# behaviour is correct for its actual job.
+#
+# Jittered on use for the same reason `_pace` jitters: a fixed cadence is a
+# fingerprint, and this path only runs when AliExpress is already unhappy with us.
+SEARCH_RETRY_BACKOFF = (1.5, 3.0)
+
+
+def _search_backoff(transition: int) -> float:
+    """Seconds to sleep before the next search attempt, jittered."""
+    base = SEARCH_RETRY_BACKOFF[min(transition, len(SEARCH_RETRY_BACKOFF) - 1)]
+    return base + random.uniform(0, 0.4)
 
 
 def _search_total_results(html: str) -> Optional[int]:
@@ -191,6 +227,7 @@ def search_with_notes(query: str, sort_by: str = "best_match",
 
     total = None
     items: list[dict] = []
+    render_notes: list[str] = []
     for attempt in range(SEARCH_RENDER_ATTEMPTS):
         client = get_client()
         try:
@@ -200,16 +237,39 @@ def search_with_notes(query: str, sort_by: str = "best_match",
             resp.raise_for_status()
             items = parse_search_results(resp.text)
             total = _search_total_results(resp.text)
+            html = resp.text
         finally:
             client.close()
 
         if items or not total:
             break
-        logger.info("search grid missing for %r (total=%s), retry %d/%d",
-                    query, total, attempt + 1, SEARCH_RENDER_ATTEMPTS - 1)
-        _pace("search_retry", 1.0)
 
-    return _finish_search(items, total, query, wanted)
+        # An empty parse against a non-zero total has more than one cause, and
+        # only some of them are worth repeating the request over. SSR_UNPARSEABLE
+        # means the payload WAS there and we failed to read it — our bug, not a
+        # dropped render — so an identical resubmit gets an identical failure and
+        # burns anti-bot budget for nothing. Stop, and say which it was, because
+        # "retry the same query" is actively wrong advice in that case.
+        why = classify_search_render(html)
+        if why == SSR_UNPARSEABLE:
+            logger.info("search payload present but unparseable for %r (total=%s)",
+                        query, total)
+            render_notes.append(
+                f"⚠ AliExpress returned {total:,} results for this query but the page "
+                "payload could not be read here, so no listings are shown. This is a "
+                "parsing failure on our side, not an empty result set — retrying the "
+                "same query will not fix it. The listings do exist on the site."
+            )
+            break
+
+        if attempt + 1 >= SEARCH_RENDER_ATTEMPTS:
+            break
+        logger.info("search grid missing for %r (total=%s, %s), retry %d/%d",
+                    query, total, why, attempt + 1, SEARCH_RENDER_ATTEMPTS - 1)
+        time.sleep(_search_backoff(attempt))
+
+    items, total, notes = _finish_search(items, total, query, wanted)
+    return items, total, render_notes + notes
 
 
 def _finish_search(items: list[dict], total: Optional[int], query: str,
@@ -303,19 +363,31 @@ def search_by_title(title: str, sort_by: str = "best_match",
     product from a query that was merely too long.
     """
     notes: list[str] = []
+    # Notes from rungs that returned nothing. `_finish_search` produces its
+    # warehouse and relevance sentences only when there ARE rows, so on an empty
+    # rung the only thing that can come back is an explanation of WHY it was empty
+    # — which is precisely what a caller about to be told "no listings found"
+    # needs. Kept as the last one seen rather than accumulated, because the same
+    # sentence otherwise repeats once per rung.
+    failure_note: list[str] = []
     rungs = _title_query_ladder(title)
     for i, rung in enumerate(rungs):
-        products, _total, ship_notes = search_with_notes(rung, sort_by, ship_from)
+        products, _total, rung_notes = search_with_notes(rung, sort_by, ship_from)
         if products:
             if i:
                 notes.append(
                     f'Searched the first {len(rung.split())} words — "{rung}" — because '
                     "the full title returned nothing. Confirm each hit is the same product."
                 )
-            return products, rung, notes + ship_notes
+            return products, rung, notes + rung_notes
+        if rung_notes:
+            failure_note = rung_notes[-1:]
         if i + 1 < len(rungs):
-            _pace("search_retry", 1.0)
-    return [], (rungs[0] if rungs else ""), notes
+            # Same explicit wait as the render retry above, and for the same
+            # reason: `_pace` on a cold channel would not have paused before the
+            # second rung, so the ladder fired two searches back to back.
+            time.sleep(_search_backoff(i))
+    return [], (rungs[0] if rungs else ""), notes + failure_note
 
 
 TITLE_MAX = 80
@@ -348,12 +420,24 @@ def apply_sort(products: list[dict], sort_by: str) -> list[dict]:
     """
     Enforce the requested ordering over the rows we actually return.
 
-    AliExpress honours `SortType` on a plain search but silently drops it when
-    `shipFromCountry` is also set — verified live: price_asc alone returns
-    3.23, 3.48, 3.51…; the same call with ship_from=ES returns 149.91, 195.18,
-    121.36 while the header still claimed price_asc. Rather than assert an
-    ordering the server did not apply, sort the parsed rows ourselves. Unpriced
-    rows sink to the end instead of being dropped or sorting as zero.
+    AliExpress honours `SortType` on a plain search but not when
+    `shipFromCountry` is also set. Two different failures were measured live, and
+    the second is worse than the first:
+
+      · the sort is ignored and rows still come back — "usb c cable" price_asc
+        alone returns 3.23, 3.48, 3.51…; the same call with ship_from=ES returns
+        149.91, 195.18, 121.36 while the header still claims price_asc;
+      · the result set is ZEROED — "DS18B20" with `shipFromCountry=PL` plus
+        `SortType=price_asc` returned total=0 and no grid at all, where the same
+        request without SortType returns results.
+
+    So the pair is not merely unreliable, it can be empty-making. That rules out
+    "vary the sort and try again" as a retry mitigation: on the second failure it
+    manufactures the very "no listings found" it was meant to work around.
+
+    Rather than assert an ordering the server did not apply, sort the parsed rows
+    ourselves. Unpriced rows sink to the end instead of being dropped or sorting
+    as zero.
 
     Note the descending case negates the price rather than passing reverse=True:
     reversing would flip the "unpriced" flag too and float those rows to the very
@@ -767,6 +851,66 @@ def shipping_line(d: dict) -> str:
             f"that the item cannot ship to {COUNTRY}.")
 
 
+# ─── Placeholder prices ───────────────────────────────────────────────────────
+#
+# Sellers mark a config unbuyable by pricing it absurdly rather than by removing
+# it, and a single such row poisons the whole listing's price range. Item
+# 1005007791813945 (KF301 terminal blocks, 35 configs) carries three out-of-stock
+# rows at 1,809,373.19 SEK — the converted form of a round six-figure placeholder
+# — and rendered as "Price: 11.44 SEK–1809373.19 SEK". The real spread is
+# 11.44–257.51.
+#
+# The hard part is that wide spreads are often REAL: one item_id routinely covers
+# a single component and a bulk reel. So the threshold was calibrated against live
+# listings (Aug 2026) rather than guessed, measuring each listing's dearest config
+# as a multiple of the median of its CHEAPER HALF. That anchor is used instead of
+# the plain median because the plain median is itself contaminated once placeholder
+# rows are numerous — on a two-config listing [11.44, 1809373.19] the median sits
+# at 904,692 and the glitch measures 2.0x its own average, invisible.
+#
+#   LEGITIMATE, widest first
+#     1005002565791543  LED strip 5m–100m, 240 configs   37.70–22,503.43 SEK   124x
+#     1005001677403255  LED strip + controller, 75        134.30–4,590.10        34x
+#     1005006989290299  LED strip 1m–100m, 40             142.02–3,772.48         8x
+#     1005008406340177  lever connectors 10–75pc, 5        21.15–111.81           5x
+#     1005007301884080  screw assortment 50–1000pc, 224    63.66–516.27           4x
+#     1005003766577753  screw assortment 500–1000pc, 58   276.70–880.32           3x
+#     1005010037316351  waterproof boxes, 19               33.12–105.09           3x
+#     1005008819293735  USB-C cable 1m–3m, 6               16.77–37.28            2x
+#
+#   GLITCH
+#     1005007791813945  terminal blocks, 35            11.44–1,809,373.19     69,484x
+#
+# 1000x sits 8x above the widest genuine span found and 69x below the glitch — two
+# orders of magnitude of clearance on the side that matters. A 100x rule, the
+# obvious first guess, would have thrown away the LED strip listing's real top end.
+#
+# Suppression applies ONLY to the range. The row stays in the variants table,
+# flagged: the price is what AliExpress reports, and a caller comparing against the
+# site should see the same number we did.
+
+PRICE_GLITCH_RATIO = 1000
+
+
+def _price_glitch_cutoff(prices: list) -> Optional[float]:
+    """
+    Price above which a config is treated as a placeholder, or None if undecidable.
+
+    Anchored on the median of the cheaper half so the measure survives a listing
+    whose placeholders outnumber its real configs.
+    """
+    usable = sorted(p for p in prices if isinstance(p, (int, float)) and p > 0)
+    if len(usable) < 2:
+        # One price is a point, not a range, and nothing to compare it against.
+        return None
+    lower = usable[:max(1, len(usable) // 2)]
+    mid = len(lower) // 2
+    anchor = lower[mid] if len(lower) % 2 else (lower[mid - 1] + lower[mid]) / 2
+    if anchor <= 0:
+        return None
+    return anchor * PRICE_GLITCH_RATIO
+
+
 def _extract_pdp_fields(mtop_resp: dict, item_id: str) -> dict:
     """
     Pull fields we care about from an MTOP PDP response.
@@ -787,6 +931,8 @@ def _extract_pdp_fields(mtop_resp: dict, item_id: str) -> dict:
         "seller_discount_pct": None,
         "price_low_spec": None,
         "price_high_spec": None,
+        "price_suspect_count": None,
+        "price_suspect_max": None,
         "lot_note": None,
         "rating": None,
         "review_count": None,
@@ -796,6 +942,10 @@ def _extract_pdp_fields(mtop_resp: dict, item_id: str) -> dict:
         "store_url": None,
         "seller_positive_rate": None,
         "seller_total_reviews": None,
+        "seller_opened": None,
+        "seller_opened_years": None,
+        "seller_aggregated": None,
+        "seller_listed_name": None,
         "shipping_cost": None,
         "shipping_free": None,
         "free_shipping_over": None,
@@ -883,14 +1033,25 @@ def _extract_pdp_fields(mtop_resp: dict, item_id: str) -> dict:
                             prices.append(p)
                             by_price.append((p, str(sku_id)))
             if prices:
+                # Placeholder configs are excluded from the range but counted, so
+                # the caller learns the listing has unbuyable rows rather than
+                # seeing them vanish. See `_price_glitch_cutoff`.
+                cutoff = _price_glitch_cutoff(prices)
+                if cutoff is not None:
+                    suspect = [p for p in prices if p > cutoff]
+                    if suspect:
+                        d["price_suspect_count"] = len(suspect)
+                        d["price_suspect_max"] = max(suspect)
+                        prices = [p for p in prices if p <= cutoff]
+                        by_price = [t for t in by_price if t[0] <= cutoff]
                 lo, hi = min(prices), max(prices)
                 if lo != hi:
                     d["price_range"] = (lo, hi)
                     # Name the configuration at each end. The headline "from"
                     # price is routinely a stripped or non-functional SKU ("No Ram
-                    # No Storage"), and the top end is often a placeholder the
-                    # seller uses to mark a variant unavailable — a bare
-                    # "747.41–1221432.03 SEK" tells the caller neither.
+                    # No Storage"), and the top end is the dearest config that
+                    # survived the placeholder filter — a bare "747.41–1221432.03
+                    # SEK" told the caller neither.
                     d["price_low_spec"] = _sku_spec_for_id(result, min(by_price)[1])
                     d["price_high_spec"] = _sku_spec_for_id(result, max(by_price)[1])
                 if d["price"] is None:
@@ -935,27 +1096,30 @@ def _extract_pdp_fields(mtop_resp: dict, item_id: str) -> dict:
             d["sold_count_num"] = sold_n
 
     # ── Seller / store ─────────────────────────────────────────────────
-    shop = result.get("SHOP_CARD_PC")
-    if isinstance(shop, dict):
-        d["seller_name"] = shop.get("storeName")
-        si = shop.get("sellerInfo") or {}
-        store_url = si.get("storeURL") or shop.get("storeHomePage")
-        if isinstance(store_url, str):
-            if store_url.startswith("//"):
-                store_url = "https:" + store_url
-            d["store_url"] = store_url
-        pr = shop.get("sellerPositiveRate")
-        if pr:
-            try:
-                d["seller_positive_rate"] = float(pr)
-            except (TypeError, ValueError):
-                pass
-        tn = shop.get("sellerTotalNum")
-        if tn is not None:
-            try:
-                d["seller_total_reviews"] = int(tn)
-            except (TypeError, ValueError):
-                pass
+    # Routed through `_extract_seller` on the FULL result rather than reading
+    # SHOP_CARD_PC directly, so this shares the aggregation check documented at
+    # that function — the two tools disagreeing about who sells an item is the
+    # bug that made this one call instead of two parses.
+    # Unconditional: a page can carry the supplier disclosure without a usable shop
+    # card, and that is exactly the case where the disclosure is the only thing that
+    # knows who the seller is.
+    s = _extract_seller(result)
+    d["seller_name"] = s["store_name"]
+    d["store_url"] = s["store_url"]
+    d["seller_aggregated"] = s["aggregated"]
+    d["seller_listed_name"] = s["listed_store_name"]
+    d["seller_opened"] = s["opened"]
+    d["seller_opened_years"] = s["opened_years"]
+    if s["positive_rate"]:
+        try:
+            d["seller_positive_rate"] = float(s["positive_rate"])
+        except (TypeError, ValueError):
+            pass
+    if s["total_reviews"] is not None:
+        try:
+            d["seller_total_reviews"] = int(s["total_reviews"])
+        except (TypeError, ValueError):
+            pass
 
     # ── Shipping ──────────────────────────────────────────────────────
     # AliExpress computes the duty position per item for the configured
@@ -1271,17 +1435,126 @@ def _common_sku_affixes(skus: list[str]) -> tuple[str, str]:
 
 
 # ─── Seller / store ───────────────────────────────────────────────────────────
+#
+# SHOP_CARD_PC IS NOT ALWAYS THE SELLER. AliExpress runs "aggregation" listings —
+# one item_id whose reviews and sales volume are pooled across several overseas
+# merchants — and on those the shop card names a shell store that never sees the
+# order. Reading it as the seller is how this tool told a user six unrelated
+# products all came from "Stone's Store — 100.0% positive (10 feedbacks), opened
+# Mar 1, 2024" while their own cart listed six different merchants. The cart was
+# right. Money was spent on the strength of the wrong answer.
+#
+# The page carries the truth in its EU trader-identification block. Live Aug 2026,
+# four affected items, every one with SHOP_CARD_PC = Stone's Store / storeNum
+# 1103573332 / sellerId 2678280160 — the same shell on terminal blocks, lever
+# connectors, drill bits and waterproof boxes:
+#
+#   item 1005007791813945 → Luyanmaoyi Store                       (1102764714)
+#   item 1005006784660115 → DeFeng Tools Store                     (1102575030)
+#   item 1005008406340177 → Electrical Hardware Tools Store        (1105626261)
+#   item 1005010037316351 → Wenzhou Xiangheng Electric Technology  (1104022056)
+#
+# each named in COMPLIANCE_PC.complianceList under the title "Explanation of the
+# Supplier": "This special page helps aggregate consumer reviews and sales volume
+# of similar items offered by multiple overseas merchants… The seller of this item
+# is <a href=…showcredential.htm?storeNum=1102764714…>Luyanmaoyi Store</a>". All
+# four names matched what view_cart reported for the same item_ids.
+#
+# Note the same block ALSO carries a second, contradictory sentence — "Sold by
+# Stone's Store. Logistics by AliExpress." — so the boilerplate cannot be trusted
+# by prose matching. The credential ANCHOR is what we key on: it is the regulated
+# trader disclosure, it carries a store id rather than a name, and it does not
+# move with `_lang`.
+#
+# Detector: a `showcredential.htm?...storeNum=N` link INSIDE COMPLIANCE_PC whose N
+# differs from the shop card's. Scoping to COMPLIANCE_PC is load-bearing — the same
+# URL appears elsewhere on ordinary pages carrying the shop card's own id. Across
+# the 12 live PDPs dumped Aug 2026 it separated the two populations cleanly: 8
+# ordinary listings had no credential link in COMPLIANCE_PC at all, and the 4
+# aggregation pages had exactly one, always a different store.
+
+_CREDENTIAL_STORE_RE = re.compile(r"showcredential\.htm\?[^\"'<>\s]*?storeNum=(\d+)")
+_CREDENTIAL_ANCHOR_RE = re.compile(
+    r"<a\b[^>]*showcredential\.htm\?[^\"'<>\s]*?storeNum=(\d+)[^>]*>(.*?)</a>",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _supplier_disclosure(result: dict) -> Optional[dict]:
+    """
+    Read the EU trader-identification block: {"store_name", "store_id"} or None.
+
+    Returns the merchant AliExpress legally names as the seller of this item,
+    which on an aggregation listing is NOT the store in SHOP_CARD_PC.
+    """
+    if not isinstance(result, dict):
+        return None
+    block = result.get("COMPLIANCE_PC")
+    if not isinstance(block, dict):
+        return None
+    entries = block.get("complianceList")
+    if not isinstance(entries, list):
+        return None
+    for e in entries:
+        if not isinstance(e, dict):
+            continue
+        content = e.get("content")
+        if not isinstance(content, str) or "showcredential.htm" not in content:
+            continue
+        m = _CREDENTIAL_ANCHOR_RE.search(content)
+        if m:
+            name = _strip_html(m.group(2))
+            if name:
+                return {"store_name": name, "store_id": int(m.group(1))}
+        # The id alone is still worth having: it proves the page is aggregated,
+        # which is the part that must not be swallowed. Better a store we can
+        # only number than a store name we know to be wrong.
+        m = _CREDENTIAL_STORE_RE.search(content)
+        if m:
+            return {"store_name": None, "store_id": int(m.group(1))}
+    return None
+
 
 def _extract_seller(shop: dict) -> dict:
-    """Pull store/seller info from a PDP `SHOP_CARD_PC` block (live Jul 2026)."""
+    """
+    Pull store/seller info from a PDP response (live Aug 2026).
+
+    Accepts EITHER the full `data.result` dict or a bare `SHOP_CARD_PC` block. Pass
+    the full result: it is the only form that can consult the supplier disclosure
+    above, and a bare shop card silently loses the aggregation check — the exact
+    failure this function exists to prevent. Handed one anyway, the result carries
+    `disclosure_checked: False` and NO claim that the store is the seller.
+    """
     d: dict[str, Any] = {
         "store_name": None, "positive_rate": None, "positive_num": None,
         "total_reviews": None, "score": None, "level": None, "opened": None,
         "opened_years": None, "country": None, "top_rated": None,
         "local_seller": None, "store_url": None, "store_id": None,
+        # Aggregation state. `aggregated` is True only when AliExpress itself
+        # disclosed a different merchant; None means we were never in a position
+        # to look, which is not the same as "no".
+        "aggregated": None,
+        "disclosure_checked": False,
+        "listed_store_name": None,
+        "listed_store_id": None,
+        # False whenever the feedback figures below describe some store other than
+        # the one named in `store_name`. Renderers must not print stats when this
+        # is False — see the numbers in the block comment above: a shell store's
+        # "100.0% positive (10 feedbacks)" reads as a glowing seller.
+        "stats_describe_seller": True,
     }
     if not isinstance(shop, dict):
         return d
+
+    # Sniff which of the two shapes we were handed. The key sets are disjoint: a
+    # PDP result is keyed by uppercase component names, a shop card by camelCase
+    # fields. Checking for the component rather than for `storeName` means an
+    # aggregation page with a malformed shop card is still recognised as a result.
+    result: dict = {}
+    if "SHOP_CARD_PC" in shop or "GLOBAL_DATA" in shop or "COMPLIANCE_PC" in shop:
+        result = shop
+        shop = result.get("SHOP_CARD_PC") if isinstance(result.get("SHOP_CARD_PC"), dict) else {}
+
     d["store_name"] = shop.get("storeName")
     pr = shop.get("sellerPositiveRate")
     if pr not in (None, ""):
@@ -1307,7 +1580,134 @@ def _extract_seller(shop: dict) -> dict:
             if su.startswith("//"):
                 su = "https:" + su
             d["store_url"] = su
+
+    if not result:
+        # A bare shop card. We cannot rule out an aggregation page, so we do not
+        # get to say it is not one.
+        return d
+
+    d["disclosure_checked"] = True
+    d["listed_store_name"] = d["store_name"]
+    d["listed_store_id"] = d["store_id"]
+    disc = _supplier_disclosure(result)
+    d["aggregated"] = bool(
+        disc and (
+            (disc["store_id"] is not None and d["store_id"] is not None
+             and int(disc["store_id"]) != int(d["store_id"]))
+            or (disc["store_id"] is not None and d["store_id"] is None)
+        )
+    )
+    if not d["aggregated"]:
+        return d
+
+    # From here the shop card described the aggregation shell, so every figure it
+    # supplied is about the wrong store. Drop them all rather than re-attributing
+    # them: the shell's 100.0% / 10 feedbacks / "Mar 1, 2024" is a profile a
+    # shopper would read as "new but flawless", and it belongs to nobody they are
+    # buying from. We know the merchant's NAME and ID and nothing else about them,
+    # so that is all we say. Fetching the real store's feedback would need a second
+    # endpoint; until that exists, silence is the honest answer.
+    d["store_name"] = disc["store_name"]
+    d["store_id"] = disc["store_id"]
+    d["store_url"] = f"{BASE_URL}/store/{disc['store_id']}" if disc["store_id"] else None
+    d["stats_describe_seller"] = False
+    for k in ("positive_rate", "positive_num", "total_reviews", "score", "level",
+              "opened", "opened_years", "country", "top_rated", "local_seller"):
+        d[k] = None
     return d
+
+
+def seller_detail_lines(d: dict) -> list[str]:
+    """
+    Render the `Seller:` block of `get_product_details` from `_extract_pdp_fields`.
+
+    Carries the opening date, which used to be reachable only via `get_seller` —
+    a second live call per item, on the tool a research session runs most. The
+    date is the one figure here that does not move: a store opened last month with
+    a 100% rate has ten reviews behind it, and that is worth a line.
+    """
+    if d.get("seller_aggregated"):
+        listed = d.get("seller_listed_name") or "another store"
+        return [
+            f"Seller: {d.get('seller_name') or 'not disclosed'}",
+            f"  ⚠ Aggregation listing — the product page advertises {listed}, which "
+            "is not the seller. No feedback rate or store age is available for the "
+            "actual merchant.",
+        ]
+    if not d.get("seller_name"):
+        return []
+    line = f"Seller: {d['seller_name']}"
+    if d.get("seller_positive_rate"):
+        line += f" — {d['seller_positive_rate']}% positive feedback"
+    if d.get("seller_total_reviews"):
+        line += f" ({d['seller_total_reviews']} seller feedbacks)"
+    if d.get("seller_opened"):
+        age = f", {d['seller_opened_years']} yr" if d.get("seller_opened_years") else ""
+        line += f", opened {d['seller_opened']}{age}"
+    return [line]
+
+
+def seller_report(d: dict, item_id: str) -> str:
+    """
+    Render `_extract_seller` output as the `get_seller` body.
+
+    Lives here rather than in the tool so the aggregation warning cannot be
+    rendered without the parse that produces it, and so both are testable offline.
+    """
+    if d.get("aggregated"):
+        # Loud on purpose. The quiet version of this — a bare store name with no
+        # numbers — reads as a thin profile rather than as a different store from
+        # the one the page advertises, and that ambiguity is what cost money.
+        named = d.get("store_name") or (
+            f"store {d['store_id']}" if d.get("store_id") else None
+        )
+        lines = [
+            f"Seller for item {item_id}:",
+            f"Store: {named or 'not disclosed'}",
+            "",
+            "⚠ This is an AGGREGATION listing: one item_id pooling reviews and sales "
+            "volume across several merchants. The store on the product page "
+            f"({d.get('listed_store_name') or 'unnamed'}) is not the seller — "
+            f"AliExpress's own supplier disclosure names {named or 'a different store'}.",
+            "No feedback rate, feedback volume or opening date is reported: the "
+            "figures on the page belong to the pooling store, not to this merchant, "
+            "and there is no second source for the merchant's own.",
+        ]
+        if d.get("store_url"):
+            lines.append(f"Store page: {d['store_url']}")
+        return "\n".join(lines)
+    if not d.get("store_name"):
+        return f"No seller info found for item {item_id}."
+
+    lines = [f"Seller for item {item_id}:", f"Store: {d['store_name']}"]
+    if d.get("positive_rate") is not None:
+        pr = f"Positive feedback: {d['positive_rate']}%"
+        if d.get("total_reviews") is not None:
+            pr += f" (across {d['total_reviews']} seller feedbacks)"
+        lines.append(pr)
+    elif d.get("total_reviews") is not None:
+        lines.append(f"Seller feedbacks: {d['total_reviews']}")
+    # `sellerLevel` and `sellerScore` are dropped, not merely hidden: AliExpress
+    # publishes no scale for either, and the live values make that plain — level
+    # came back as the string "23-s" on one store and "0" on another, score as
+    # 4271 with no stated maximum. A number nobody can place on a scale is not a
+    # number a shopper can reason with. Positive-feedback %, feedback volume and
+    # store age below are all self-describing, and they stay.
+    if d.get("opened"):
+        age = f" ({d['opened_years']} yr)" if d.get("opened_years") else ""
+        lines.append(f"Opened: {d['opened']}{age}")
+    if d.get("country"):
+        lines.append(f"Ships from: {d['country']}")
+    flags = []
+    if d.get("top_rated"):
+        flags.append("Top-rated seller")
+    if d.get("local_seller"):
+        flags.append("Local seller")
+    if flags:
+        lines.append(" · ".join(flags))
+    if not d.get("disclosure_checked"):
+        lines.append("⚠ Aggregation not checked — this store may not be the seller.")
+    return "\n".join(lines)
 
 
 # ─── Variants / SKU table ─────────────────────────────────────────────────────
@@ -1466,7 +1866,18 @@ def _extract_variants(result: dict) -> list[dict]:
             "stock": p.get("skuStock"),
             "is_default": False,
             "default_sku_id": None,
+            # Set below, once every config's price is known.
+            "price_suspect": False,
         })
+
+    # Flag placeholder prices without removing them — the row is real data and the
+    # number is what AliExpress served; it just must not set the listing's range.
+    # See `_price_glitch_cutoff` for the threshold and the live spans behind it.
+    cutoff = _price_glitch_cutoff([v["price"] for v in variants])
+    if cutoff is not None:
+        for v in variants:
+            if v["price"] is not None and v["price"] > cutoff:
+                v["price_suspect"] = True
 
     # Collapse indistinguishable rows: some listings carry an extra unnamed
     # dimension (e.g. plug/region) that duplicates the same visible spec + price.

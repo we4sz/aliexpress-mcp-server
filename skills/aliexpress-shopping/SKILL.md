@@ -42,8 +42,8 @@ the exact table.
 
 | The user wants… | Use |
 | --- | --- |
-| To find products by keyword | `search_products(query, min_rating, max_price, sort_by, ship_from)` |
-| Specifically *discounted* items, sorted by how deep the discount is | `find_deals(query, min_discount, max_price, min_rating, sort_by, ship_from)` |
+| To find products by keyword | `search_products(query, min_rating, max_price, sort_by, ship_from, max_results)` |
+| Specifically *discounted* items, sorted by how deep the discount is | `find_deals(query, min_discount, max_price, min_rating, sort_by, ship_from, max_results)` |
 | The full picture of one item (price, rating, sold count, seller, shipping) | `get_product_details(item_id \| url)` |
 | Which exact config a price buys — RAM / storage / CPU / bundle / size → price | `get_variants(item_id \| url)` |
 | Just the shipping cost and ETA to the configured country | `get_shipping_estimate(item_id \| url)` |
@@ -56,7 +56,7 @@ the exact table.
 | Their named wishlists / collections, with ids and counts | `list_wishlists()` |
 | To put something in their cart — **write** | `add_to_cart(item_id \| url, sku_id, quantity)` |
 | To add SEVERAL items — **write, use instead of looping** | `add_many_to_cart(items)` |
-| To make sure a cart line will actually be included at checkout, or to leave it in the cart without ordering it — **write** | `set_cart_selection(selected, item_id \| url \| cart_id, sku_id)` |
+| To make sure cart line(s) will actually be included at checkout, or to leave them in the cart without ordering — **write** | `set_cart_selection(selected, item_id \| url \| cart_id \| cart_ids \| all_lines, sku_id)` |
 | To change how many of a cart line — **write** | `set_cart_quantity(quantity, item_id \| url \| cart_id, sku_id)` |
 | To take a line out of the cart — **destructive** | `remove_from_cart(item_id \| url \| cart_id, sku_id)` |
 | To save an item into one of their lists — **write** | `add_to_wishlist(wishlist, item_id \| url)` |
@@ -94,6 +94,13 @@ comma-separated string or list of codes, or the alias `"EU"`/`"EEA"` for the who
 union instead of naming every member country by hand. Shipping from inside the user's own
 customs union usually arrives in days rather than weeks and avoids import charges.
 
+**A short result set from `search_products`/`find_deals` can mean AliExpress swapped the
+query, not that stock is thin.** When a keyword/warehouse combination has little stock,
+AliExpress sometimes silently substitutes a different, unrelated product category instead
+of returning few results. The tools detect this and collapse to 3 rows regardless of
+`max_results`, with a note explaining why — read that note before presenting the rows as
+real matches for what the user asked for.
+
 **The cart usually comes back in full.** AliExpress paginates it behind an opaque cursor,
 but `view_cart` walks that automatically (up to 10 pages), so most carts are complete. Only
 when a page fetch fails or a cart exceeds the cap is it labelled "showing N of M items" —
@@ -109,9 +116,22 @@ and stops the moment a challenge lands, telling you exactly which items went in.
 the cart and simply never arrives, and that is not recoverable after checkout — so it is
 worth checking before the user orders, not after. `view_cart` flags un-ticked lines
 individually and in a summary, and reconciles that against AliExpress's own count of
-selected lines; when the two disagree it says so instead of guessing. `set_cart_selection`
-ticks or un-ticks a line. The subtotal `view_cart` prints covers the shown items; the
-server's own "checkout estimate" covers only the ticked ones and is labelled that way.
+selected lines; when the two disagree it says so instead of guessing. The subtotal
+`view_cart` prints covers the shown items; the server's own "checkout estimate" covers only
+the ticked ones and is labelled that way.
+
+**A single `set_cart_selection` call does not reliably set state — do not report "done" off
+one response.** Ticking or un-ticking one line has been observed flipping OTHER lines'
+checkboxes off, server-side (reproduced against byte-identical browser payloads, so it is
+not a request-shape bug). Prefer `cart_ids=[...]` or `all_lines=True` over calling it once
+per line: those forms re-read the cart and re-write only what's still wrong, for a bounded
+number of rounds, then report what actually held against a fresh read. Read that report —
+lines it says are stuck are genuinely still wrong — rather than assuming the request you
+sent is the state the cart ended up in.
+
+**`list_orders` walks back through real history when asked, it doesn't just cap at recent
+orders.** AliExpress returns 10 orders per page; requesting `max_orders` above that fetches
+additional pages rather than truncating at the most recent 10.
 
 **Orders and the wishlist need a full login session.** `list_orders`, `get_order`, and
 `get_wishlist` require the HttpOnly login cookies. If they return a "full login session"

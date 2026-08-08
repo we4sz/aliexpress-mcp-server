@@ -660,12 +660,26 @@ def get_seller(item_id: str = "", url: str = "") -> str:
     if err:
         return _pdp_unavailable_msg(item_id, err)
 
-    shop = resp.get("data", {}).get("result", {}).get("SHOP_CARD_PC", {})
-    d = _extract_seller(shop)
+    # The WHOLE result, not just SHOP_CARD_PC. On an "aggregation" listing the
+    # shop card names a shell store that never sees the order, and the real
+    # merchant is only in the EU trader-identification block — so a parser handed
+    # the shop card alone cannot possibly get this right. Passing the narrower
+    # object is exactly how this tool reported six unrelated products as all
+    # coming from one 10-feedback store while the user's cart named six different
+    # merchants; the cart was right, and money was spent on the wrong answer.
+    d = _extract_seller(resp.get("data", {}).get("result", {}))
     if not d["store_name"]:
         return f"No seller info found for item {item_id}."
 
     lines = [f"Seller for item {item_id}:", f"Store: {d['store_name']}"]
+    if d.get("aggregated"):
+        lines.append(
+            f"  ⚠ Aggregation listing: the product page's shop card names "
+            f"{d.get('listed_store_name') or 'another store'}, but the seller of "
+            "record — per the page's own EU trader disclosure — is the store above. "
+            "The rating and feedback figures on such a page describe the pooled "
+            "listing, not this merchant, so they are omitted rather than "
+            "misattributed. Use compare_sellers if you need a store to judge.")
     if d.get("positive_rate") is not None:
         pr = f"Positive feedback: {d['positive_rate']}%"
         if d.get("total_reviews") is not None:
@@ -767,7 +781,7 @@ def compare_sellers(title: str = "", item_id: str = "", url: str = "", max_candi
         if not resp:
             continue
         inspected += 1
-        s = _extract_seller(resp.get("data", {}).get("result", {}).get("SHOP_CARD_PC", {}))
+        s = _extract_seller(resp.get("data", {}).get("result", {}))
         if not s.get("store_name"):
             continue
         key = str(s.get("store_id") or s["store_name"])

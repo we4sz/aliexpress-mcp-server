@@ -6,21 +6,21 @@ Mostly read-only — it searches, fetches product details, checks shipping, and 
 
 ## Tools
 
-- `search_products(query, min_rating, max_price, sort_by, ship_from)` — searches the public wholesale search URL and parses the embedded JSON. `ship_from` restricts results to a warehouse: a two-letter country code, a comma-separated string or list of codes, or `"EU"`/`"EEA"` for the whole customs union (expanded to its highest-stock members, probed via the first one). Empty = any warehouse.
-- `find_deals(query, min_discount, max_price, min_rating, sort_by, ship_from)` — same search, filtered to discounted listings and sorted by discount depth. `ship_from` behaves exactly as in `search_products`.
+- `search_products(query, min_rating, max_price, sort_by, ship_from, max_results)` — searches the public wholesale search URL and parses the embedded JSON. `max_price` is compared against the prices printed on the rows below — same number, same currency (your AliExpress site currency), no conversion. `ship_from` restricts results to a warehouse: a two-letter country code, a comma-separated string or list of codes, or `"EU"`/`"EEA"` for the whole customs union (expanded to its highest-stock members, probed via the first one). Empty = any warehouse. `max_results` caps how many rows print (default 25, capped at 60) — but when a thin keyword/warehouse combination makes AliExpress silently replace the query instead of returning few results, the row count collapses to 3 regardless of `max_results`, with a note saying so.
+- `find_deals(query, min_discount, max_price, min_rating, sort_by, ship_from, max_results)` — same search, filtered to discounted listings and sorted by discount depth. `ship_from` and `max_results` behave exactly as in `search_products`.
 - `get_product_details(item_id | url)` — title, price (a range for multi-config listings), discount, rating, sold count, seller, shipping cost & ETA.
 - `get_variants(item_id | url)` — the full per-configuration (SKU) price table, e.g. "DDR4 32GB 1TB SSD · R7 5825U" → 916.63; the price→spec map a bare range can't give. Out-of-stock configs flagged.
-- `get_shipping_estimate(item_id | url)` — shipping cost + ETA to the configured country (freight is computed against your saved delivery address; may report "unreachable" without one).
+- `get_shipping_estimate(item_id | url)` — shipping cost + ETA to the configured country, plus any paid express alternatives AliExpress offers alongside the default option (freight is computed against your saved delivery address; may report "unreachable" without one).
 - `get_reviews(item_id | url, max_reviews, filter_by)` — rating breakdown (positive / neutral / negative) + individual reviews via the unsigned `feedback.aliexpress.com/pc/searchEvaluation.do` endpoint.
 - `get_seller(item_id | url)` — positive-feedback rate, feedback volume, how long the store has been open, and where it ships from (read from the PDP `SHOP_CARD_PC` block). Deliberately omits AliExpress's own "seller level" and "seller score": it publishes no scale for either, so neither can be compared across stores.
 - `compare_sellers(title | item_id | url, max_candidates)` — when several storefronts sell the same item (originals, relisters, dropshippers), searches the title, inspects the top hits' sellers, and ranks them **most-established first** (store age → feedback volume → positive rate) so you can prefer the long-running seller over a brand-new relister. Costs one search + one lookup per candidate.
 - `add_to_cart(item_id | url, sku_id, quantity)` — **write.** Adds an item to your real cart via the signed `mtop.aliexpress.trade.cart.add` endpoint (which is signed with a *different* appKey than the read APIs — see `MTOP_CART_APP_KEY`). Buys nothing; the item waits in the cart until you check out on the site. `sku_id` defaults to the item's preselected variant, so pass one from `get_variants` when size/colour matters. To take something back out, use `remove_from_cart`.
 - `add_many_to_cart(items)` — **write.** Adds a list of items in one call, paced between writes. Prefer it over looping `add_to_cart`: twenty-plus rapid single adds is precisely the pattern that trips the anti-bot check, and that block does not clear by waiting. If a challenge does land it **stops immediately** rather than spending the remaining items on a wall it cannot pass, and reports which items were added, which failed, and which were never attempted — so a retry neither duplicates nor drops anything. Each entry is `{"item_id" | "url", "sku_id"?, "quantity"?}`, or a bare item-id string.
-- `set_cart_selection(selected, item_id | url | cart_id, sku_id)` — **write.** Ticks or un-ticks one cart line for checkout — AliExpress orders ONLY the ticked lines. Un-ticking doesn't remove the line: it stays fully visible in `view_cart`, just excluded from what ships, and that is not recoverable after checkout. Same ambiguous-`item_id` refusal as the other cart-line tools; `view_cart` flags un-ticked lines so this doesn't have to be run blind.
+- `set_cart_selection(selected, item_id | url | cart_id, sku_id, cart_ids, all_lines)` — **write.** Ticks or un-ticks cart lines for checkout — AliExpress orders ONLY the ticked lines. Un-ticking doesn't remove the line: it stays fully visible in `view_cart`, just excluded from what ships, and that is not recoverable after checkout. Targets one line (`item_id`/`url`/`cart_id`), several at once (`cart_ids=[...]`), or the whole cart (`all_lines=True`). **A single write is not reliable**: setting one line's checkbox has been observed flipping OTHER lines' checkboxes off server-side (reproduced against byte-identical browser payloads, so it isn't our request shape). The `cart_ids`/`all_lines` forms converge instead of firing once: they re-read the cart, re-write only what's still wrong, for a bounded number of rounds, then report what actually held against a fresh read rather than trusting AliExpress's ack. Prefer them over calling this once per line. Same ambiguous-`item_id` refusal as the other cart-line tools; `view_cart` flags un-ticked lines so this doesn't have to be run blind.
 - `set_cart_quantity(quantity, item_id | url | cart_id, sku_id)` — **write.** Sets an *absolute* quantity on one cart line via the same droplet endpoint, using `operationType = "update_quantity"` and replacing `fields.quantityView` with a bare `{"current": N}` — sending the full rendered `quantityView` back returns `SUCCESS` and silently does nothing, so the result is always re-read to confirm. Use `remove_from_cart` to delete a line; quantity 0 is rejected.
 - `remove_from_cart(item_id | url | cart_id, sku_id)` — **destructive write.** Removes one cart line via the Ultron/droplet endpoint `mtop.aliexpress.trade.cart.async`: POST the operated component with `fields.operationType = "delete"` plus the page root (sending the whole component tree is rejected with `AE-CART-PARSE-PARAM-ERROR`). One product can occupy several cart lines (one per variant), so an ambiguous `item_id` lists the candidate `cart_id`s and removes nothing. Re-reads the cart afterwards to confirm.
 - `view_cart()` — current cart contents via the signed `mtop.aliexpress.trade.cart.render` endpoint, grouped by seller, with a computed subtotal over the shown items. Read-only. AliExpress paginates the cart behind an opaque cursor, but `view_cart` walks it automatically (up to 10 pages), so most carts come back in full; only if paging fails partway or a cart exceeds that cap is it shown as "N of M items" (see Known limitations).
-- `list_orders(max_orders)` / `get_order(order_id)` — your recent orders and per-order status + line items via `mtop.aliexpress.trade.buyer.order.list`. Prices are normalized to `<amount> <ISO code>` (each order keeps the currency it was paid in). Read-only (never pays/cancels). **Needs a full login session** — see the note under Known limitations.
+- `list_orders(max_orders)` / `get_order(order_id)` — your recent orders and per-order status + line items via `mtop.aliexpress.trade.buyer.order.list`. AliExpress returns 10 orders per page; asking for `max_orders` above that walks back through additional pages of real history rather than capping at the most recent 10. Prices are normalized to `<amount> <ISO code>` (each order keeps the currency it was paid in). Read-only (never pays/cancels). **Needs a full login session** — see the note under Known limitations.
 - `get_wishlist(max_items)` — your saved / liked items via `mtop.ae.wishlist.allItems.render`, flagging items that **dropped in price** since you saved them (normalized to `<amount> <CUR> off`) and sold-out ones, with each item's saved-on date. Read-only. **Needs a full login session** (same as orders). Unlike the cart, the wishlist endpoint has no working pagination and locks its page size at ~16, so a larger wishlist is shown as "N of M".
 - `list_wishlists()` — the named lists ("collections") on the account, with ids and item counts, from `mtop.ae.wishlist.myList.render`. A *different* endpoint from the one above: `allItems.render` returns saved products and never names the lists; this returns the lists and never their products. Read-only.
 - `add_to_wishlist(wishlist, item_id | url)` — **write.** Files a product under one of your lists. Two steps when the item isn't saved yet, because AliExpress models them separately: `wishitem.save` performs the ♡ (saving it ungrouped), then `myList.saveItem` moves it into the chosen list. Refuses to guess an ambiguous list name rather than filing the item somewhere you won't look.
@@ -50,24 +50,33 @@ Token refresh is handled automatically: a stale `_m_h5_tk` makes MTOP return `FA
 
 ## Setup
 
-1. Install dependencies:
+1. Install the [MCP Auth Bridge](https://github.com/justinritchie/mcp-auth-bridge) Chrome extension. The `aliexpress` entry is already in its `sites.json`.
+
+2. Open `https://www.aliexpress.com`, log in, then click **Save AliExpress** in the extension popup. This writes cookies to `~/.mcp-credentials/aliexpress.json`.
+
+3. Install the server itself — pick one:
+
+   **As a Claude Code plugin (recommended).** The repo ships `.claude-plugin/marketplace.json` and `.mcp.json`, which together register the MCP server and the `aliexpress-shopping` skill in one step, launched via `uv run` (no separate `pip install` — `uv` resolves `mcp<2`, `httpx[http2]` and `beautifulsoup4` itself from `.mcp.json`):
+
+   ```
+   /plugin marketplace add AlexSabaka/aliexpress-mcp-server
+   /plugin install aliexpress@aliexpress
+   ```
+
+   **Manual Claude Desktop config**, for setups that don't go through a Claude Code plugin marketplace:
 
    ```bash
    pip install -r requirements.txt
    ```
 
-2. Install the [MCP Auth Bridge](https://github.com/justinritchie/mcp-auth-bridge) Chrome extension. The `aliexpress` entry is already in its `sites.json`.
-
-3. Open `https://www.aliexpress.com`, log in, then click **Save AliExpress** in the extension popup. This writes cookies to `~/.mcp-credentials/aliexpress.json`.
-
-4. Add to your Claude Desktop config (`~/Library/Application Support/Claude/claude_desktop_config.json`):
+   Then add to `~/Library/Application Support/Claude/claude_desktop_config.json` (path is wherever you cloned this repo):
 
    ```json
    {
      "mcpServers": {
        "aliexpress": {
          "command": "python3",
-         "args": ["/Users/YOUR_USER/justinritchie-mcp-servers/aliexpress-mcp-server/aliexpress_mcp_server.py"],
+         "args": ["/path/to/aliexpress-mcp-server/aliexpress_mcp_server.py"],
          "env": {
            "ALIEXPRESS_CREDENTIALS": "~/.mcp-credentials/aliexpress.json",
            "ALIEXPRESS_COUNTRY": "CA",
@@ -78,7 +87,7 @@ Token refresh is handled automatically: a stale `_m_h5_tk` makes MTOP return `FA
    }
    ```
 
-5. Restart Claude Desktop.
+   Restart Claude Desktop afterward.
 
 ### Auth without the extension (manual cookie paste)
 
@@ -104,6 +113,7 @@ Re-run the snippet whenever tools start returning "session expired" — the toke
 ## Known limitations
 
 - **Low-volume / brand-new listings** sometimes return empty MTOP responses (endpoint returns `SUCCESS` but an empty data block). Likely a region/visibility gate. Search results still show the listing fine.
+- **Search sometimes renders without its product grid.** Same URL, same second — AliExpress occasionally serves the results page with a non-zero result count but no `itemList` grid inside it. `search_products`/`find_deals` retry internally; if it still fails they say so and suggest dropping `ship_from` or trying different keywords, rather than an identical retry — an identical resubmit was observed failing twice in a row for the same query, so the tools no longer imply retrying alone fixes it.
 - **Cookies expire / lag the cart.** When tool calls start returning "session expired" — or `view_cart` reports an empty cart despite having items — re-open aliexpress.com in Chrome and click **Save AliExpress** again to capture fresh session cookies. The `_m_h5_tk` token and cart state rotate together; stale cookies show an empty server-side cart.
 - **Rate limiting.** The server sends realistic Chrome headers and paces its own calls — a minimum gap between MTOP requests (`ALIEXPRESS_MIN_INTERVAL`, default 0.7s) and a much wider one between account writes (`ALIEXPRESS_CART_INTERVAL`, default 5s) — and it reuses the `_m_h5_tk` session token instead of re-fetching one per call, which roughly halves request volume. That is enough for ordinary use, not for bulk crawling: sustained hammering still trips AliExpress's anti-bot (`RGV587_ERROR` / `FAIL_SYS_USER_VALIDATE`). **That block does not clear on its own** — 45s and 90s waits were both tested and both failed; it lifted only once the challenge was completed in a logged-in browser tab. The tools now say so rather than inviting a retry, because retrying spends rate-limit budget prolonging a block that waiting cannot lift.
 - **Orders and the wishlist need a full login session.** `list_orders` / `get_order` / `get_wishlist` call APIs that require the HttpOnly login cookies the quick `document.cookie` snippet can't capture — otherwise they return a "full login session" message. Add the HttpOnly rows (DevTools → **Application → Cookies → aliexpress.com**, the ✓ HttpOnly ones) to `~/.mcp-credentials/aliexpress.json`.
@@ -113,7 +123,7 @@ Re-run the snippet whenever tools start returning "session expired" — the toke
 
 ## Architecture
 
-FastMCP + httpx + BeautifulSoup. Session cookies come from the shared credential file written by the [MCP Auth Bridge](https://github.com/justinritchie/mcp-auth-bridge) Chrome extension.
+FastMCP + httpx (negotiates HTTP/2 automatically when the `h2` package is present — `httpx[http2]` in requirements.txt) + BeautifulSoup. Session cookies come from the shared credential file written by the [MCP Auth Bridge](https://github.com/justinritchie/mcp-auth-bridge) Chrome extension.
 
 The code is a package, split by domain rather than by layer — `aliexpress_mcp_server.py` at the root is only a shim that imports and runs it, kept because `.mcp.json` invokes it by path:
 
@@ -124,7 +134,7 @@ The code is a package, split by domain rather than by layer — `aliexpress_mcp_
 | `catalog.py` | Public catalogue — search, PDP, variants, seller, reviews, shipping, duty logic. |
 | `cart.py` | Cart reads and writes, including its two response shapes and pagination. |
 | `account.py` | Orders and wishlists. |
-| `server.py` | The FastMCP singleton and all 21 tool definitions. The only module that imports `mcp`, and nothing imports it. |
+| `server.py` | The FastMCP singleton and all 22 tool definitions. The only module that imports `mcp`, and no other module in the package imports it back (avoids an import cycle) — the root `aliexpress_mcp_server.py` shim above does. |
 
 The three account domains all speak Alibaba's Ultron/droplet protocol but encode it differently, which is the single most confusing thing in the codebase: the cart nests **gzip+base64** objects, orders nest plain-JSON **strings**, and the wishlist nests plain-JSON **objects**.
 
