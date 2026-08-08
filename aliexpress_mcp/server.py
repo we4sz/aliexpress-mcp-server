@@ -38,6 +38,7 @@ from aliexpress_mcp.scrape import parse_product_detail
 from aliexpress_mcp.catalog import (
     apply_sort,
     SEARCH_RENDER_ATTEMPTS, search_with_notes, search_by_title,
+    _relevant_fraction, RELEVANCE_FLOOR,
     normalize_ship_from, _format_product_lines,
     _fetch_pdp_mtop, _informative_tax_note, _lot_note,
     _pdp_error_code, _pdp_unavailable_msg, _extract_pdp_fields, _delivery_days,
@@ -81,6 +82,27 @@ mcp = FastMCP(
 )
 
 
+
+# When AliExpress replaces the query rather than filtering it (see
+# catalog._relevant_fraction), the rows are not near-misses — they are a
+# different product category entirely: e-bike motors returned for a heat-shrink
+# query. Printing 25 of those costs the caller a screenful of context to learn
+# one fact the warning already stated. Show enough to prove the point and stop.
+BROADENED_ROW_LIMIT = 3
+
+
+def _row_limit(products: list, query: str, requested: int) -> tuple[int, Optional[str]]:
+    """(rows to print, note) — collapses the listing when the query was replaced."""
+    share = _relevant_fraction(products, query)
+    if share is not None and share < RELEVANCE_FLOOR and len(products) > BROADENED_ROW_LIMIT:
+        return BROADENED_ROW_LIMIT, (
+            f"Showing only {BROADENED_ROW_LIMIT} of {len(products)} rows: at "
+            f"{share:.0%} keyword match these are a different product category, "
+            "not near misses. Re-run without ship_from, or with different "
+            "keywords, to get real results.")
+    return requested, None
+
+
 @mcp.tool(
     title="Search Products",
     annotations=ToolAnnotations(
@@ -93,7 +115,8 @@ def search_products(
     min_rating: float = 0,
     max_price: float = 0,
     sort_by: str = "best_match",
-    ship_from: str = "",
+    ship_from: Any = "",
+    max_results: int = 25,
 ) -> str:
     """
     Search AliExpress for products.
@@ -106,13 +129,20 @@ def search_products(
     Args:
         query: Search term (e.g., "groudon plush", "usb c cable")
         min_rating: Minimum rating (0-5, e.g., 4.5). 0 disables filter.
-        max_price: Maximum price, in the search's local currency (your AliExpress
-            site currency, e.g. UAH — not necessarily ALIEXPRESS_CURRENCY). 0 disables.
+        max_price: Maximum price, compared against the prices printed on the rows
+            below — the same number, same currency, no conversion. That is your
+            AliExpress site currency, which is stated in the output next to every
+            price, so read it off a first unfiltered search if unsure. 0 disables.
         sort_by: One of "best_match", "orders", "price_asc", "price_desc"
-        ship_from: Two-letter warehouse country to restrict results to, e.g. "ES",
-            "PL", "FR", "CZ", "IT", "UK" for EU stock or "CN" for mainland China.
-            Shipping from inside your own customs union arrives in days rather than
-            weeks and avoids import charges. Empty = any warehouse.
+        ship_from: Warehouse country to restrict results to — a two-letter code
+            ("ES", "PL", "CZ"), a list or comma-separated string of them, or
+            "EU"/"EEA" for the whole customs union. Shipping from inside your own
+            customs union arrives in days rather than weeks and avoids import
+            charges. Empty = any warehouse.
+        max_results: How many rows to print (default 25, capped at 60). Lowered
+            automatically when AliExpress has replaced your query rather than
+            filtered it, since those rows are a different product category and
+            printing 25 of them just costs context.
     """
     try:
         products, total_results, notes = search_with_notes(query, sort_by, ship_from)
@@ -150,7 +180,10 @@ def search_products(
                     f"(AliExpress reports {total_results:,} results before filtering).")
         return f"No products found for '{query}'{suffix}."
 
-    shown = min(len(products), 25)
+    limit, broad_note = _row_limit(products, query, max(1, min(int(max_results or 25), 60)))
+    if broad_note:
+        notes = list(notes) + [broad_note]
+    shown = min(len(products), limit)
     header = f"Showing {shown} of {len(products)} parsed"
     if total_results:
         header += f" ({total_results:,} total)"
@@ -160,7 +193,7 @@ def search_products(
     where = "/".join(normalize_ship_from(ship_from))
     header += f", ships from {where}" if where else ""
     header += "):"
-    body = _format_product_lines(products, header)
+    body = _format_product_lines(products, header, limit=limit)
     # Notes describe ways the rows differ from what was literally asked for — a
     # warehouse filter that quietly replaced the keywords, for instance. They are
     # the difference between a caller seeing 25 speed bumps under a header that
@@ -182,7 +215,8 @@ def find_deals(
     max_price: float = 0,
     min_rating: float = 0,
     sort_by: str = "orders",
-    ship_from: str = "",
+    ship_from: Any = "",
+    max_results: int = 25,
 ) -> str:
     """
     Search AliExpress and surface the most-discounted listings for a query.
@@ -225,13 +259,16 @@ def find_deals(
     # Say what is actually printed. The header claimed "Found 58 deal(s)" while the
     # body carried 25 — the same header-disagrees-with-body bug already fixed in
     # search_products, still living in its sibling.
-    shown = min(len(deals), 25)
+    limit, broad_note = _row_limit(deals, query, max(1, min(int(max_results or 25), 60)))
+    if broad_note:
+        notes = list(notes) + [broad_note]
+    shown = min(len(deals), limit)
     head = (f"Showing {shown} of {len(deals)} deal(s) for '{query}'"
             if shown < len(deals) else f"Found {len(deals)} deal(s) for '{query}'")
     where = "/".join(normalize_ship_from(ship_from))
     if where:
         head += f", ships from {where}"
-    body = _format_product_lines(deals, head + " (biggest discount first):")
+    body = _format_product_lines(deals, head + " (biggest discount first):", limit=limit)
     return "\n".join(notes + [""] + [body]) if notes else body
 
 
@@ -1122,6 +1159,13 @@ def add_many_to_cart(items: list[dict]) -> str:
 
     Buys nothing. Each line is confirmed by variant name and price, not just an
     id, so a wrong variant is visible straight away.
+
+    No batch size limit is imposed here, and none has been confirmed on
+    AliExpress's side — but a user reported large lists appearing to stop around
+    20. Nothing is silent either way: the reply names every item that was added,
+    every one that failed, and every one never attempted, so a short result is
+    visible rather than assumed. If you do hit a wall, re-run with only the
+    items listed as not added.
 
     Args:
         items: List of items to add. Each entry is an object with:
