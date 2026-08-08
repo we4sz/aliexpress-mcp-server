@@ -1232,18 +1232,31 @@ def set_cart_selection(selected: bool, item_id: str = "", url: str = "",
         item_id = _resolve_item_id(item_id, url) or ""
 
     try:
-        line, err = _cart_set_selected(cookies, item_id, cart_id, sku_id, bool(selected))
+        line, err, collateral = _cart_set_selected(
+            cookies, item_id, cart_id, sku_id, bool(selected))
     except Exception as e:
         return f"Cart selection change failed: {e}"
+
+    # Never swallow a collateral change, even on the error path. An un-ticked
+    # line stays visible in the cart and simply never arrives, so this is the
+    # one failure the caller cannot discover for themselves until the parcel is
+    # short one item.
+    warn = ""
+    if collateral:
+        warn = ("\n\n⚠ OTHER cart lines changed selection during this call, which should "
+                "not happen — re-check view_cart before ordering:\n" + "\n".join(
+                    f"    {t or cid}: {'ticked' if b else 'un-ticked'} → "
+                    f"{'ticked' if a else 'un-ticked'}"
+                    for cid, t, b, a in collateral))
     if err:
-        return err
+        return err + warn
 
     where = line.get("title") or f"line {line.get('cart_id')}"
     if selected:
         return (f"Ticked for checkout: {where}\n"
-                f"  cart_id: {line.get('cart_id')} — it will be included when you order.")
+                f"  cart_id: {line.get('cart_id')} — it will be included when you order." + warn)
     return (f"Un-ticked: {where}\n"
-            f"  cart_id: {line.get('cart_id')} — it stays in your cart but will NOT be ordered.")
+            f"  cart_id: {line.get('cart_id')} — it stays in your cart but will NOT be ordered." + warn)
 
 
 @mcp.tool(

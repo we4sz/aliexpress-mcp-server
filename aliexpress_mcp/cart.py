@@ -747,54 +747,70 @@ def _resolve_cart_target(cookies: dict, item_id: str, cart_id: str, sku_id: str)
     return resp, matches[0], None
 
 
+def _selection_map(resp: dict) -> dict:
+    """{cart_id: (selected, title)} for every line in a rendered cart."""
+    return {str(i.get("cart_id")): (i.get("selected"), i.get("title"))
+            for i in _extract_cart_droplet(resp).get("items", [])}
+
+
 def _cart_set_selected(cookies: dict, item_id: str, cart_id: str, sku_id: str,
-                       selected: bool) -> tuple[Optional[dict], Optional[str]]:
+                       selected: bool) -> tuple[Optional[dict], Optional[str], list]:
     """
     Tick or untick one cart line's checkout checkbox — the write side of the
-    `selected` field on cart items (see the CART_SELECT_FIELD / CART_OP_SELECT
-    comments above _extract_cart_droplet for what's confirmed vs. guessed).
+    `selected` field on cart items (see CART_SELECT_FIELD / CART_OP_SELECT).
 
-    Mirrors set_cart_quantity/remove_from_cart's own shape exactly: resolve the
-    target line via _resolve_cart_target, fire the operation via _cart_operate,
-    then re-read and check the ACTUAL state rather than trusting `ret` — this
-    API returns SUCCESS for no-ops as readily as for real changes, and that is
-    doubly true here since the operationType itself is an educated guess.
+    Mirrors set_cart_quantity/remove_from_cart's shape: resolve the target via
+    _resolve_cart_target, fire the operation, then re-read and check the ACTUAL
+    state rather than trusting `ret`, because this API returns SUCCESS for
+    no-ops as readily as for real changes — which is exactly how the original
+    wrong operationType was caught.
 
-    Deliberately does NOT special-case "already in that state, nothing to do"
-    the way set_cart_quantity does — until this is verified live, every call
-    should hit the network and get a real confirmation rather than trusting a
-    read that might itself be using the wrong field name.
+    It also diffs the WHOLE selection set, not just the target. A user report
+    described ticking lines and watching untouched ones silently lose their
+    tick; that could not be reproduced here (single ticks, consecutive ticks,
+    quantity changes and add/remove were all clean, and the server's
+    selectItemNum agreed with the parse exactly), but the failure it describes
+    is the worst kind this tool can have: an un-ticked line stays visible in
+    the cart and simply never arrives, so nobody finds out until the parcel is
+    short. If it ever does happen, it should be loud rather than discovered
+    after the order. Hence the third return value.
 
-    Returns (line, error):
-      - (None, msg)  — resolution or the write itself failed outright.
-      - (line, msg)  — AliExpress returned ret=SUCCESS but the re-read shows
-        the line's selected flag didn't actually change (or couldn't be read
-        at all) — the operationType/field-name guess is probably wrong.
-      - (line, None) — confirmed: the re-read line's `selected` now matches
-        the requested value.
-    `line` is the matching entry from _extract_cart_droplet's `items` list.
+    Returns (line, error, collateral):
+      - (None, msg, [])   — resolution or the write failed outright.
+      - (line, msg, ...)  — SUCCESS returned but the target's flag did not move.
+      - (line, None, ...) — confirmed; the target now matches the request.
+    `collateral` is [(cart_id, title, before, after)] for every OTHER line whose
+    selection changed during the call — normally empty.
     """
     resp, target, err = _resolve_cart_target(cookies, item_id, cart_id, sku_id)
     if err:
-        return None, err
+        return None, err, []
+    before = _selection_map(resp)
 
     try:
         ret = _cart_operate(cookies, resp, target["component_id"], CART_OP_SELECT,
                             selected=selected)
     except Exception as e:
-        return None, f"Selection change failed: {e}"
+        return None, f"Selection change failed: {e}", []
     if ret_problem({"ret": [ret]}) is not None:
-        return None, f"Could not update cart line {target['cart_id']} — AliExpress said: {ret}"
+        return None, f"Could not update cart line {target['cart_id']} — AliExpress said: {ret}", []
 
     try:
         fresh, _ = _cart_fetch_all_pages(cookies, _cart_droplet_render(cookies))
     except Exception as e:
-        return None, f"Selection request sent (ret={ret}), but re-reading the cart failed: {e}"
+        return None, f"Selection request sent (ret={ret}), but re-reading the cart failed: {e}", []
 
     cart = _extract_cart_droplet(fresh)
+    # Every line EXCEPT the target that changed selection state during the call.
+    after = _selection_map(fresh)
+    collateral = [
+        (cid, before[cid][1], before[cid][0], after[cid][0])
+        for cid in before
+        if cid != target["cart_id"] and cid in after and before[cid][0] != after[cid][0]
+    ]
     line = next((i for i in cart["items"] if str(i.get("cart_id")) == target["cart_id"]), None)
     if line is None:
-        return None, f"Cart line {target['cart_id']} disappeared after the change — check view_cart."
+        return None, f"Cart line {target['cart_id']} disappeared after the change — check view_cart.", collateral
 
     now = line.get("selected")
     if now is None:
@@ -802,12 +818,12 @@ def _cart_set_selected(cookies: dict, item_id: str, cart_id: str, sku_id: str,
             f"AliExpress accepted the request (ret={ret}) but the re-read cart carries no "
             f"selection field to confirm against — CART_SELECT_FIELD ({CART_SELECT_FIELD!r}) is "
             "probably the wrong guess for this shape. Needs a live capture to fix."
-        )
+        ), collateral
     if now != selected:
         return line, (
             f"AliExpress accepted the request (ret={ret}) but cart line {target['cart_id']} is "
             f"still {'selected' if now else 'unselected'}, not "
             f"{'selected' if selected else 'unselected'} as requested — CART_OP_SELECT "
             f"({CART_OP_SELECT!r}) is probably the wrong guess."
-        )
-    return line, None
+        ), collateral
+    return line, None, collateral

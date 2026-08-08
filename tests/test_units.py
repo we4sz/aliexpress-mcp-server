@@ -1775,5 +1775,51 @@ class TestSponsoredPlacements(unittest.TestCase):
                 self.assertIsNone(scrape._search_row(data_source=source)["sponsored"])
 
 
+class TestSelectionCollateralDetection(unittest.TestCase):
+    """
+    A user reported ticking one cart line and watching untouched lines lose
+    their tick. It could not be reproduced — single ticks, consecutive ticks,
+    quantity changes and add/remove were all clean against the live account,
+    and the server's own selectItemNum matched the parse exactly. But the
+    failure described is the worst kind this tool can have: an un-ticked line
+    stays visible in the cart and simply never arrives, so it is only
+    discoverable after the parcel is short.
+
+    So the write path now diffs the WHOLE selection set, not just its target.
+    These pin that the diff actually reports, since by construction it should
+    normally return nothing and a silently-broken detector would look identical.
+    """
+
+    def _cart(self, sel_by_id):
+        return {"items": [{"cart_id": cid, "title": f"item {cid}", "selected": v}
+                          for cid, v in sel_by_id.items()]}
+
+    def test_collateral_is_empty_when_only_the_target_moves(self):
+        before = self._cart({"A": False, "B": True, "C": True})
+        after = self._cart({"A": True, "B": True, "C": True})
+        with mock.patch.object(cart, "_extract_cart_droplet",
+                               side_effect=[before, after]):
+            b = cart._selection_map({}); a = cart._selection_map({})
+        coll = [cid for cid in b if cid != "A" and b[cid][0] != a[cid][0]]
+        self.assertEqual(coll, [])
+
+    def test_collateral_is_reported_when_another_line_flips(self):
+        """The reported symptom: ticking A silently un-ticks B."""
+        before = self._cart({"A": False, "B": True, "C": True})
+        after = self._cart({"A": True, "B": False, "C": True})
+        with mock.patch.object(cart, "_extract_cart_droplet",
+                               side_effect=[before, after]):
+            b = cart._selection_map({}); a = cart._selection_map({})
+        coll = [cid for cid in b if cid != "A" and b[cid][0] != a[cid][0]]
+        self.assertEqual(coll, ["B"])
+
+    def test_selection_map_keys_are_strings(self):
+        """cart_ids arrive as ints from some shapes; the diff compares by key."""
+        with mock.patch.object(cart, "_extract_cart_droplet",
+                               return_value={"items": [{"cart_id": 123, "title": "x",
+                                                        "selected": True}]}):
+            self.assertEqual(list(cart._selection_map({})), ["123"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
