@@ -1600,14 +1600,17 @@ def set_cart_selection(selected: bool, item_id: str = "", url: str = "",
                     f"⛔ This call ticked {len(landed)} line(s) and the cart's total ticked "
                     f"count did not rise ({ticked_at_entry} → {total_ticked}). Re-running "
                     "will NOT get further.",
-                    f"   This looks like an AliExpress limit on how many lines ONE order "
-                    "may contain, not a fault here. Six cart sizes have now settled at "
-                    "exactly 20 ticked. The site's own \"Select all\" does not beat it "
-                    "either: it optimistically shows every line ticked and then persists "
-                    "only ~20 — reload the cart page and the rest have quietly dropped "
-                    "off. Nothing announces this; reachLimitNotice stays false.",
-                    "   So a cart bigger than that cannot be ordered in one go. Order in "
-                    "batches: tick a set, check out, then tick the next."]
+                    f"   What is established: the SAVED selection tops out around 20. Six "
+                    "cart sizes (22-44 lines) have all settled there, and the site's own "
+                    "\"Select all\" does not persist past it either — it shows every line "
+                    "ticked, but reload the cart and only ~20 survive. Nothing announces "
+                    "this; reachLimitNotice stays false.",
+                    "   What is NOT established is that this limits an ORDER. Checking out "
+                    "everything from the site in one session reportedly works, so the "
+                    "checkout flow evidently does not rely on the saved selection the way "
+                    "this tool must.",
+                    "   Practically: this tool cannot hold more than ~20 lines ticked. For "
+                    "a bigger cart, select and check out on the site in one sitting."]
         elif ran_out_of_time and stuck:
             # Say how much more work is left in CALLS, not seconds — the caller
             # can act on "run this twice more", not on a duration.
