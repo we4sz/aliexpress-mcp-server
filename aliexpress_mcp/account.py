@@ -418,9 +418,9 @@ def _wishlist_favourite(cookies: dict, item_id: str) -> str:
     return ret
 
 
-def _wishlist_delete_item(cookies: dict, item_id: str) -> str:
+def _wishlist_delete_item(cookies: dict, item_id: str, group_id: str = "0") -> str:
     """
-    Permanently delete a saved item from the wishlist.
+    Remove a saved item — `DELETE_PRODUCT` on the render endpoint.
 
     Different mechanism from `saveItem`: this is an Ultron/droplet operation on
     the *render* endpoint — echo the item's component back with
@@ -428,21 +428,28 @@ def _wishlist_delete_item(cookies: dict, item_id: str) -> str:
     and hierarchy. `params` is a plain JSON string of nested OBJECTS here, unlike
     the orders pager which nests JSON *strings*.
 
-    AliExpress distinguishes this from un-grouping: removing from a collection
-    keeps the item in the wishlist, deleting removes it everywhere. This is the
-    destructive one.
+    The verb is the same for both of AliExpress's two removals; only the SCOPE
+    differs, and the scope is `wishGroupId` on the render AND on the operation:
+
+      group_id "0"  -> the whole wishlist: deletes the item everywhere. Permanent.
+      group_id <id> -> that one list only: un-groups it, the item stays saved.
+
+    The UI names them separately ("Delete from my wishlist products" vs "Remove
+    from collection"), which is the only hint that one call does both.
     """
+    scope = str(group_id or "0")
     render = mtop_call(
         WISHLIST_API, "1.0",
         {"pageIndex": 1, "shipToCountry": COUNTRY, "locale": "en_US", "deviceType": "PC",
-         "_lang": LANG, "_currency": CURRENCY, "wishGroupId": 0},
+         "_lang": LANG, "_currency": CURRENCY, "wishGroupId": scope},
         cookies=cookies, referer=f"{BASE_URL}/p/wish-manage/index.html",
     )
     tree = (render.get("data") or {}).get("data") or {}
     comp_id = f"wln_page_product_I_{item_id}"
     component = (tree.get("data") or {}).get(comp_id)
     if not component:
-        return "NOTFOUND::item is not in your wishlist"
+        return ("NOTFOUND::item is not in your wishlist" if scope == "0"
+                else "NOTFOUND::item is not in that list")
 
     operated = json.loads(json.dumps(component))
     operated.setdefault("fields", {})["operationType"] = "DELETE_PRODUCT"
@@ -457,10 +464,67 @@ def _wishlist_delete_item(cookies: dict, item_id: str) -> str:
     payload = {
         "params": json.dumps(inner, separators=(",", ":"), ensure_ascii=False),
         "pageIndex": 1, "locale": "en_US", "shipToCountry": COUNTRY,
-        "deviceType": "PC", "_lang": LANG, "_currency": CURRENCY, "wishGroupId": 0,
+        "deviceType": "PC", "_lang": LANG, "_currency": CURRENCY, "wishGroupId": scope,
     }
     _pace("cart_write", CART_WRITE_MIN_INTERVAL)
     resp = mtop_call(WISHLIST_API, "1.0", payload, cookies=cookies,
+                     referer=f"{BASE_URL}/p/wish-manage/index.html",
+                     extra_query={"needLogin": "true"})
+    ret = (resp.get("ret") or ["?"])[0]
+    if ret.startswith("SUCCESS") and not (resp.get("data") or {}).get("succeed", True):
+        return f"FAILED::{((resp.get('data') or {}).get('message')) or 'server reported no success'}"
+    return ret
+
+
+def _wishlist_delete_group(cookies: dict, group_id: str) -> str:
+    """
+    Delete a wishlist (group) — the inverse of `create_wishlist`.
+
+    Note this does NOT use the v2.0 `group.update` API that creates lists, which
+    has no delete opType. It is a droplet operation like the item delete, but on
+    the *groups* render (`myList.render`): echo the group's own container
+    component back with `fields.operationType = "DELETE_GROUP"`.
+
+    Deletes the container only — items filed under it stay in the wishlist and
+    become ungrouped. The caller verifies that rather than trusting the ack.
+    """
+    comp_id = f"wln_group_container_GH_{group_id}"
+    tree = component = None
+    for page in range(1, WISHLIST_GROUPS_MAX_PAGES + 1):
+        render = mtop_call(
+            WISHLIST_GROUPS_API, "1.0",
+            {"pageIndex": page, "locale": "en_US", "shipToCountry": COUNTRY,
+             "deviceType": "PC", "_lang": LANG, "_currency": CURRENCY},
+            cookies=cookies, referer=f"{BASE_URL}/p/wish-manage/index.html",
+        )
+        tree = (render.get("data") or {}).get("data") or {}
+        component = (tree.get("data") or {}).get(comp_id)
+        if component:
+            break
+        paging = next((v.get("fields") for k, v in (tree.get("data") or {}).items()
+                       if k.startswith("wln_paging")), {}) or {}
+        if not paging.get("hasMore"):
+            break
+    if not component:
+        return "NOTFOUND::no such wishlist"
+
+    operated = json.loads(json.dumps(component))
+    operated.setdefault("fields", {})["operationType"] = "DELETE_GROUP"
+
+    inner = {
+        "endpoint": tree.get("endpoint") or {},
+        "operator": comp_id,
+        "linkage": tree.get("linkage") or {},
+        "data": {comp_id: operated},
+        "hierarchy": tree.get("hierarchy") or {},
+    }
+    payload = {
+        "params": json.dumps(inner, separators=(",", ":"), ensure_ascii=False),
+        "pageIndex": 1, "locale": "en_US", "shipToCountry": COUNTRY,
+        "deviceType": "PC", "_lang": LANG, "_currency": CURRENCY,
+    }
+    _pace("cart_write", CART_WRITE_MIN_INTERVAL)
+    resp = mtop_call(WISHLIST_GROUPS_API, "1.0", payload, cookies=cookies,
                      referer=f"{BASE_URL}/p/wish-manage/index.html",
                      extra_query={"needLogin": "true"})
     ret = (resp.get("ret") or ["?"])[0]

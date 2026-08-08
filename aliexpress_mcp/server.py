@@ -56,7 +56,7 @@ from aliexpress_mcp.account import (
     WISHLIST_API, WISHLIST_GROUP_API,
     _extract_wishlist, _fetch_wishlist_groups, _resolve_wishlist_group,
     _wishlist_saved_item_ids, _wishlist_favourite, _wishlist_delete_item,
-    _wishlist_save_item,
+    _wishlist_delete_group, _wishlist_save_item,
 )
 
 
@@ -68,9 +68,10 @@ mcp = FastMCP(
     instructions=(
         "Browse, search, and manage an AliExpress account: search products, compare "
         "sellers, check reviews/shipping/variants, and inspect your cart, orders, and "
-        "wishlist. Four tools write to the real, signed-in account (add_to_cart, "
-        "set_cart_quantity, remove_from_cart, create_wishlist) but none of them ever "
-        "checks out, places an order, or pays — checkout is not implemented."
+        "wishlist. Seven tools write to the real, signed-in account (add_to_cart, "
+        "set_cart_quantity, remove_from_cart, add_to_wishlist, remove_from_wishlist, "
+        "create_wishlist, delete_wishlist) but none of them ever checks out, places "
+        "an order, or pays — checkout is not implemented."
     ),
 )
 
@@ -1685,19 +1686,23 @@ def add_to_wishlist(wishlist: str, item_id: str = "", url: str = "") -> str:
     ),
     structured_output=False,
 )
-def remove_from_wishlist(item_id: str = "", url: str = "") -> str:
+def remove_from_wishlist(item_id: str = "", url: str = "", wishlist: str = "") -> str:
     """
-    Permanently DELETE a saved item from your wishlist. This WRITES and CANNOT
-    be undone — the item is removed from every list and from the wishlist itself.
+    Remove a saved item from your wishlist. This WRITES.
 
-    AliExpress separates two things this tool does NOT do: taking an item out of
-    one list while keeping it saved, and moving it between lists. Use
-    add_to_wishlist to file a saved item under a different list. This tool is the
-    permanent one, so it takes no list argument — it deletes the item outright.
+    `wishlist` decides how far the removal goes — the two are separate operations
+    on AliExpress, and the default is the permanent one:
+
+      wishlist omitted -> DELETES the item from your wishlist entirely, out of
+                          every list. Cannot be undone.
+      wishlist given   -> takes it out of THAT list only; the item stays saved
+                          (ungrouped) and can be re-filed with add_to_wishlist.
 
     Args:
-        item_id: AliExpress item ID to delete from the wishlist.
+        item_id: AliExpress item ID to remove.
         url: Full or short AliExpress product URL (alternative to item_id).
+        wishlist: Optional list to remove it from — name (case-insensitive) or id.
+            Pass this to keep the item saved; omit it to delete outright.
     """
     item_id = _resolve_item_id(item_id, url)
     if not item_id:
@@ -1709,19 +1714,35 @@ def remove_from_wishlist(item_id: str = "", url: str = "") -> str:
 
     saved = _wishlist_saved_item_ids(cookies)
     if saved and str(item_id) not in saved:
-        return f"Item {item_id} is not in your wishlist — nothing to delete."
+        return f"Item {item_id} is not in your wishlist — nothing to remove."
 
+    group = None
+    if (wishlist or "").strip():
+        group, err = _resolve_wishlist_group(cookies, wishlist)
+        if err:
+            return err
+        if str(item_id) not in _wishlist_saved_item_ids(cookies, group["group_id"]):
+            return (f"Item {item_id} is not in wishlist {group['name']!r} — nothing to "
+                    "remove. (Omit `wishlist` to delete it from your wishlist entirely.)")
+
+    scope = group["group_id"] if group else "0"
     try:
-        ret = _wishlist_delete_item(cookies, str(item_id))
+        ret = _wishlist_delete_item(cookies, str(item_id), group_id=scope)
     except Exception as e:
-        return f"Wishlist deletion failed: {e}"
+        return f"Wishlist removal failed: {e}"
     if ret.startswith("NOTFOUND"):
-        return f"Item {item_id} is not in your wishlist — nothing to delete."
+        return f"Item {item_id} is not in your wishlist — nothing to remove."
     if not ret.startswith("SUCCESS"):
-        return f"Could not delete item {item_id} — AliExpress said: {ret}"
+        return f"Could not remove item {item_id} — AliExpress said: {ret}"
 
-    # Destructive and this API family acks no-ops, so confirm against a fresh read.
+    # This API family acks no-ops, so confirm against a fresh read either way.
     after = _wishlist_saved_item_ids(cookies)
+    if group:
+        if str(item_id) in _wishlist_saved_item_ids(cookies, group["group_id"]):
+            return (f"AliExpress reported success but item {item_id} is still in "
+                    f"{group['name']!r} — nothing changed.")
+        kept = " It is still in your wishlist, just ungrouped." if str(item_id) in after else ""
+        return f"Removed item {item_id} from wishlist {group['name']!r}.{kept}"
     if str(item_id) in after:
         return (f"AliExpress reported success but item {item_id} is still in your "
                 "wishlist — nothing was deleted.")
@@ -1784,6 +1805,58 @@ def create_wishlist(name: str, public: bool = False) -> str:
     return (f"Created wishlist {made.get('name')!r} "
             f"({'public' if made.get('isPublic') == 'Y' else 'private'}).\n"
             f"  List ID: {made.get('id')}")
+
+
+@mcp.tool(
+    title="Delete Wishlist",
+    annotations=ToolAnnotations(
+        readOnlyHint=False, destructiveHint=True, idempotentHint=True,
+        openWorldHint=True
+    ),
+    structured_output=False,
+)
+def delete_wishlist(wishlist: str) -> str:
+    """
+    Delete one of your wishlists. This WRITES and CANNOT be undone.
+
+    Deletes the list itself, not the products in it: anything filed under it
+    stays in your wishlist and becomes ungrouped. To remove a single item from a
+    list instead, use remove_from_wishlist with its `wishlist` argument.
+
+    Args:
+        wishlist: Which list to delete — name (case-insensitive) or id. An
+            ambiguous name is refused rather than guessed.
+    """
+    if not (wishlist or "").strip():
+        return "Provide the wishlist to delete (name or id) — run list_wishlists to see them."
+
+    cookies = load_cookies()
+    if not cookies:
+        return AUTH_EXPIRED_MSG
+
+    group, err = _resolve_wishlist_group(cookies, wishlist)
+    if err:
+        return err
+
+    try:
+        ret = _wishlist_delete_group(cookies, group["group_id"])
+    except Exception as e:
+        return f"Wishlist deletion failed: {e}"
+    if ret.startswith("NOTFOUND"):
+        return f"No wishlist {wishlist!r} — nothing to delete."
+    if not ret.startswith("SUCCESS"):
+        return f"Could not delete wishlist {group['name']!r} — AliExpress said: {ret}"
+
+    # Acks are unreliable in this API family — confirm the list is actually gone.
+    after, _ = _fetch_wishlist_groups(cookies)
+    if any(g["group_id"] == group["group_id"] for g in after):
+        return (f"AliExpress reported success but wishlist {group['name']!r} is still "
+                "there — nothing was deleted.")
+    freed = group.get("item_count") or 0
+    kept = (f" Its {freed} item(s) are still in your wishlist, now ungrouped."
+            if freed else "")
+    return (f"Deleted wishlist {group['name']!r}.{kept} "
+            f"({len(after)} list(s) left.)")
 
 
 @mcp.tool(

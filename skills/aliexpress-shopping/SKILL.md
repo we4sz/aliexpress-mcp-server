@@ -2,7 +2,7 @@
 name: aliexpress-shopping
 description: >-
   AliExpress research and account access — mostly read-only, but can also add/update/remove
-  cart items and create a wishlist (never checks out or pays). Use this whenever the user wants to
+  cart items and manage wishlists (never checks out or pays). Use this whenever the user wants to
   search AliExpress, find deals, pull product details, compare per-configuration (SKU)
   prices, read buyer reviews, judge whether a seller is trustworthy, compare which store
   selling the same item is most established, estimate shipping, or reach their own
@@ -19,9 +19,17 @@ description: >-
 # AliExpress (read-only research + cart/wishlist writes)
 
 These tools wrap AliExpress's own signed mobile API (MTOP) plus its search page, giving
-clean structured data instead of scraped HTML. Everything here **only reads** — there is
-no path to add-to-cart, checkout, pay, or cancel. You can reassure a worried user of that
-plainly.
+clean structured data instead of scraped HTML.
+
+Most tools only read. Seven write to the user's real account — `add_to_cart`,
+`set_cart_quantity`, `remove_from_cart`, `add_to_wishlist`, `remove_from_wishlist`,
+`create_wishlist`, `delete_wishlist` — and three of those destroy something. **There is no
+path to checkout, pay, or cancel an order**, which is the reassurance a worried user
+actually wants; don't overstate it into "everything is read-only".
+
+Say what a write will do before doing it, and prefer the reversible form: taking an item
+out of one list (`remove_from_wishlist` *with* `wishlist`) keeps it saved, while omitting
+`wishlist` deletes it outright. Nothing here can be undone by the server.
 
 ## Pick the right tool
 
@@ -42,6 +50,15 @@ the exact table.
 | What's currently in *their* cart | `view_cart()` |
 | Their recent orders / to track one | `list_orders(max_orders)`, `get_order(order_id)` |
 | Their saved / liked items, and which got cheaper | `get_wishlist(max_items)` |
+| Their named wishlists / collections, with ids and counts | `list_wishlists()` |
+| To put something in their cart — **write** | `add_to_cart(item_id \| url, sku_id, quantity)` |
+| To change how many of a cart line — **write** | `set_cart_quantity(quantity, item_id \| url \| cart_id)` |
+| To take a line out of the cart — **destructive** | `remove_from_cart(item_id \| url \| cart_id)` |
+| To save an item into one of their lists — **write** | `add_to_wishlist(wishlist, item_id \| url)` |
+| To take an item out of one list, keeping it saved — **destructive** | `remove_from_wishlist(item_id \| url, wishlist)` |
+| To delete a saved item outright — **destructive, permanent** | `remove_from_wishlist(item_id \| url)` (no `wishlist`) |
+| A new list to organise saves into — **write** | `create_wishlist(name, public)` |
+| To get rid of a list (its items survive, ungrouped) — **destructive** | `delete_wishlist(wishlist)` |
 
 When an item shows a wide price range in `get_product_details`, follow up with
 `get_variants` — the range alone can't tell the user *which* configuration costs what,
