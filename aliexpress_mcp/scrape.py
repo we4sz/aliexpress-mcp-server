@@ -7,6 +7,8 @@ aliexpress_mcp_server.py — see that file's module docstring for the
 server-level overview.
 """
 
+import base64
+import gzip
 import json
 import re
 from datetime import datetime
@@ -54,6 +56,33 @@ def _listing_age(lunch_time: Any) -> Optional[str]:
     return f"{days / 365.0:.1f}y old"
 
 
+def _sku_count(it: dict) -> Optional[int]:
+    """
+    How many buyable configurations the listing has, from `extraParams.sku_images`.
+
+    That field is a gzip+base64 blob holding "<axisPropId>:<valueId>:<img>;<valueId>:<img>;…"
+    — one entry per SKU, images repeated where several SKUs share a picture. Counting
+    the entries matched `SKU.skuPaths` in the PDP response EXACTLY on all 15 items where
+    both were captured (Aug 2026), across 1, 3, 4, 8, 10, 16, 21, 24, 28, 64 and 100 SKUs.
+    The two remaining pairs carried no `sku_images` at all — both single-SKU legacy
+    listings (32811041093, 1005012630102114) — so an absent field reads as unknown, not 1.
+
+    This is the only thing on a search card that says the row's price is one
+    configuration out of many; see `_format_product_lines` for why that matters.
+    """
+    raw = (it.get("extraParams") or {}).get("sku_images") if isinstance(it.get("extraParams"), dict) else None
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        blob = gzip.decompress(base64.b64decode(raw)).decode("utf-8", "replace")
+    except Exception:
+        return None
+    # Drop the leading "<axisPropId>:" header before splitting on the row separator.
+    body = blob.split(":", 1)[1] if ":" in blob else blob
+    n = len([p for p in body.split(";") if p.strip()])
+    return n or None
+
+
 def _search_signals(it: dict) -> dict:
     """
     Pull the decision-relevant signals AliExpress hides in a search card's
@@ -75,12 +104,24 @@ def _search_signals(it: dict) -> dict:
                     a real landed-cost input, present on 6 of 60 hits.
       free_shipping whether any free-shipping badge is present (None if the card
                     carries no selling points at all, i.e. unknown rather than no).
+      variant_count how many SKUs the listing has — see `_sku_count`.
+      price_sku_id  `prices.skuId`, the SKU the card's price actually belongs to.
+                    Kept because it is the proof that the card quotes ONE
+                    configuration: `prices.salePrice.minPrice` is named like a
+                    listing minimum but is not one.
     """
     out: dict[str, Any] = {
         "ship_from": None, "is_choice": False, "sold_exact": None,
         "listing_age": None, "duty_offset": None, "free_shipping": None,
+        "variant_count": None, "price_sku_id": None,
     }
     trace = it.get("trace") if isinstance(it.get("trace"), dict) else {}
+
+    out["variant_count"] = _sku_count(it)
+    prices = it.get("prices") if isinstance(it.get("prices"), dict) else {}
+    sku_id = prices.get("skuId")
+    if sku_id is not None and str(sku_id).strip():
+        out["price_sku_id"] = str(sku_id).strip()
 
     pdp = trace.get("pdpParams") if isinstance(trace.get("pdpParams"), dict) else {}
     raw = pdp.get("pdp_cdi")
@@ -249,6 +290,13 @@ def parse_search_results(html: str) -> list[dict]:
         prices = it.get("prices") if isinstance(it.get("prices"), dict) else {}
         sp = prices.get("salePrice") if isinstance(prices.get("salePrice"), dict) else {}
         op = prices.get("originalPrice") if isinstance(prices.get("originalPrice"), dict) else {}
+        # `minPrice` is a misnomer: the card quotes the ONE SKU named in
+        # `prices.skuId`, not the listing's cheapest. Measured against the PDP
+        # price map on 15 items (Aug 2026), it equalled that SKU's price on 13
+        # (the other two were captured minutes apart and moved ≤1.2%), and it was
+        # NOT the listing minimum twice — item 1005007010293617 quoted 190.39
+        # against a 48.10–190.39 span (the DEAREST config) and 1005007129679040
+        # quoted 189.83 inside a 44.58–180,935.69 span, matching neither end.
         price = sp.get("minPrice")
         currency = sp.get("currencyCode") or op.get("currencyCode")
         original_price = op.get("minPrice")
@@ -303,6 +351,8 @@ def parse_search_results(html: str) -> list[dict]:
             "listing_age": sig["listing_age"],
             "duty_offset": sig["duty_offset"],
             "free_shipping": sig["free_shipping"],
+            "variant_count": sig["variant_count"],
+            "price_sku_id": sig["price_sku_id"],
             "url": f"{BASE_URL}/item/{pid}.html",
         })
 

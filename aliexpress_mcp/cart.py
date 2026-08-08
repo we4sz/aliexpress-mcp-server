@@ -19,7 +19,68 @@ from aliexpress_mcp.core import (
     parse_price, _strip_html, _cents_to_float,
     blocks, _iter_blocks, _block_by_prefix,
 )
-from aliexpress_mcp.catalog import _fetch_pdp_mtop
+from aliexpress_mcp.catalog import _fetch_pdp_mtop, _sku_spec_for_id, _extract_variants
+
+
+# --- Cart-line selection (checkbox) -----------------------------------------
+#
+# AliExpress only checks out lines whose checkbox is ticked. A line can be
+# fully valid, in stock, and sitting in the cart, and still silently NOT be
+# part of the next order because its checkbox got cleared — a bulk "deselect"
+# after browsing a promo, an accidental tap on "select shop" twice, etc. A
+# live cart was seen showing "Checkout (17)" against 18 rendered lines with no
+# way to tell which one wouldn't ship. `selected` below is the read side of
+# that; `_cart_set_selected` near the bottom of this file is the write side.
+#
+# Read side (CONFIRMED against a real render, Aug 2026 — see the
+# `cart_render.json` fixture / tests/test_units.py): the *legacy* shape
+# (`hierarchy`/`linkage`, tag "product_item_component", no itemView) carries
+# it at `fields.checkbox` = {"enable": bool, "selected": bool}. 10 of 24 real
+# cart lines had `selected: false`, and the count matched the render's own
+# `summary_component.fields.summary.selectItemNum` exactly (10) — cross-checked,
+# not just present.
+#
+# The *droplet* shape (itemView-nested, `quantityView`/`priceViews`/
+# `logisticsView`/`shopView` siblings — see `_extract_cart_droplet`) is what
+# `_cart_operate` actually writes against, but no droplet-shaped cart render
+# was available to confirm its checkbox field name. Droplet field names
+# consistently differ from their legacy counterparts by a "View" suffix or an
+# outright rename (quantity -> quantityView, prices -> priceViews, freightInfo
+# -> logisticsView), so CART_SELECT_FIELD guesses "checkboxView" by the same
+# pattern. `_cart_line_selected` below tries that guess first and falls back
+# to the legacy name verbatim, so a render that kept the legacy name unchanged
+# still works. If neither is right, callers see `selected: None` rather than
+# a wrong value.
+CART_SELECT_FIELD = "checkboxView"
+
+# Write side operationType, sent as `fields.operationType` through the same
+# `mtop.aliexpress.trade.cart.async` endpoint `_cart_operate` already drives
+# for "update_quantity" and "delete" (see that function). UNVERIFIED — no
+# checkbox-toggle request has been captured live. Reasoning: "update_quantity"
+# pairs an "update_" prefix with the (legacy) field name it's setting
+# ("quantity"); by the same pattern, toggling the field named "checkbox"
+# should be "update_checkbox". If AliExpress rejects that or silently no-ops
+# it, the next things to try, in order: "choose"/"unchoose" or
+# "select"/"unselect" (two bare-verb ops instead of one op + a value, which is
+# how wishlist's sibling endpoint models DELETE_PRODUCT/DELETE_GROUP — see
+# account.py). `_cart_set_selected` always re-reads and compares the actual
+# flag after writing (never trusts `ret`), so a wrong guess here surfaces as
+# an honest "AliExpress accepted the request but nothing changed" instead of
+# a false confirmation.
+CART_OP_SELECT = "update_checkbox"
+
+
+def _cart_line_selected(fields: dict) -> Optional[bool]:
+    """
+    Pull a cart line's checkbox state out of its `fields` dict, trying the
+    droplet field name first and falling back to the legacy one. Shared by
+    both extractors so the guess (see CART_SELECT_FIELD above) only lives in
+    one place.
+    """
+    cb = fields.get(CART_SELECT_FIELD)
+    if not isinstance(cb, dict):
+        cb = fields.get("checkbox")
+    return cb.get("selected") if isinstance(cb, dict) else None
 
 
 def _extract_cart_droplet(resp: dict) -> dict:
@@ -56,6 +117,7 @@ def _extract_cart_droplet(resp: dict) -> dict:
                 "cart_id": f.get("cartId"),
                 "quantity": (f.get("quantityView") or {}).get("current") or 1,
                 "unavailable_reason": _strip_html(f.get("invalidText")) or "no longer available",
+                "selected": _cart_line_selected(f),
             })
             continue
 
@@ -73,6 +135,7 @@ def _extract_cart_droplet(resp: dict) -> dict:
             "status": iv.get("status"),
             "cart_id": iv.get("cartId"),
             "quantity": (f.get("quantityView") or {}).get("current") or 1,
+            "selected": _cart_line_selected(f),
         }
 
         for pv in (f.get("priceViews") or []):
@@ -194,7 +257,7 @@ def _cart_droplet_render(cookies: dict) -> dict:
 
 
 def _cart_operate(cookies: dict, resp: dict, component_id: str, operation: str,
-                  quantity: Optional[int] = None) -> str:
+                  quantity: Optional[int] = None, selected: Optional[bool] = None) -> str:
     """
     Run an Ultron/droplet operation against one cart line and return the MTOP `ret`.
 
@@ -205,6 +268,10 @@ def _cart_operate(cookies: dict, resp: dict, component_id: str, operation: str,
     For "update_quantity" it also *replaces* `fields.quantityView` with a bare
     `{"current": N}` rather than editing the rendered object in place. Sending the
     full quantityView back is accepted with SUCCESS but silently does nothing.
+
+    `selected` does the same replacement for the checkbox field (see the
+    CART_SELECT_FIELD / CART_OP_SELECT comments above _extract_cart_droplet) —
+    UNVERIFIED against a live checkbox toggle, unlike the quantity path above.
     """
     tree = resp.get("data") or {}
     # Named `components`, not `blocks`: a local `blocks` here shadows the imported
@@ -217,6 +284,8 @@ def _cart_operate(cookies: dict, resp: dict, component_id: str, operation: str,
     comp.setdefault("fields", {})["operationType"] = operation
     if quantity is not None:
         comp["fields"]["quantityView"] = {"current": int(quantity)}
+    if selected is not None:
+        comp["fields"][CART_SELECT_FIELD] = {"selected": bool(selected)}
     comp["needSubmit"] = True
     data = {component_id: comp}
     if root and root in components:
@@ -420,6 +489,10 @@ def _extract_cart(render_response: dict) -> dict:
                 "valid": fields.get("valid", True),
                 "status": fields.get("status"),
                 "cart_id": fields.get("cartId"),
+                # Whether this line's checkout checkbox is ticked — see the
+                # CART_SELECT_FIELD comment above _extract_cart_droplet. This is
+                # the shape it was actually confirmed against (fields.checkbox).
+                "selected": _cart_line_selected(fields),
             }
 
             # Quantity
@@ -532,7 +605,39 @@ def _extract_cart(render_response: dict) -> dict:
     return result
 
 
-def _resolve_sku_for_cart(item_id: str, sku_id: str = "") -> tuple[Optional[str], Optional[str], Optional[str]]:
+def _cart_variant_label(result: dict, sku_id: str) -> tuple[Optional[str], Optional[float], Optional[str]]:
+    """
+    Human-readable (spec, price, currency) for one sku_id, given an
+    already-fetched PDP `result` dict — pure, no I/O, so a caller that already
+    has a PDP response in hand (like _resolve_sku_for_cart, below) doesn't pay
+    for a second MTOP round-trip just to label a variant.
+
+    "Added item 1005007805734021 (variant 12000042262236139) x1" gives no way
+    to catch a wrong-variant add — the wrong length, the wrong colour, the
+    wrong plug — until the mistake shows up later. This is the data for
+    something checkable instead: 'Silicone hookup wire - "28 AWG 60m" -
+    106.58 SEK'.
+
+    Reuses catalog._sku_spec_for_id (a direct per-id lookup against
+    SKU.skuPaths — always finds the id if it's a real variant of this item)
+    for the spec, and catalog._extract_variants for price/currency rather than
+    re-deriving either. _extract_variants collapses variants that share an
+    identical (spec, price) into one row and files the rest under
+    `covered_skus` (see its docstring) — this sku_id may only appear there,
+    not as the row's own top-level sku_id, so both are checked.
+    """
+    spec = _sku_spec_for_id(result, sku_id)
+    price = currency = None
+    for v in _extract_variants(result):
+        ids = {v.get("sku_id")} | {str(cs[0]) for cs in (v.get("covered_skus") or [])}
+        if str(sku_id) in ids:
+            price, currency = v.get("price"), v.get("currency")
+            break
+    return spec, price, currency
+
+
+def _resolve_sku_for_cart(item_id: str, sku_id: str = "") -> tuple[
+        Optional[str], Optional[str], Optional[str], Optional[float], Optional[str], Optional[str]]:
     """
     Pull the fields `cart.add` needs but the caller shouldn't have to know.
 
@@ -541,14 +646,23 @@ def _resolve_sku_for_cart(item_id: str, sku_id: str = "") -> tuple[Optional[str]
     it is validated against the item's real SKU list instead of being trusted —
     a wrong id would otherwise be sent to AliExpress verbatim.
 
-    Returns (sku_id, fulfillment_service, error). On success `error` is None.
+    Also resolves the variant's human-readable spec and unit price/currency
+    (see _cart_variant_label) off the SAME PDP fetch this function already
+    makes, at zero extra MTOP cost — so a caller confirming a cart write can
+    print something a person can check against what they meant to add,
+    instead of only a sku_id.
+
+    Returns (sku_id, fulfillment_service, spec, price, currency, error). On
+    success `error` is None; `spec`/`price`/`currency` can still individually
+    be None (the label lookup is best-effort — a listing with unparsable SKU
+    data shouldn't fail the add itself) without that meaning failure.
     """
     try:
         resp = _fetch_pdp_mtop(item_id)
     except Exception as e:
-        return None, None, f"MTOP call failed: {e}"
+        return None, None, None, None, None, f"MTOP call failed: {e}"
     if not resp:
-        return None, None, f"Could not fetch item {item_id} — MTOP returned no usable response."
+        return None, None, None, None, None, f"Could not fetch item {item_id} — MTOP returned no usable response."
 
     result = (resp.get("data") or {}).get("result") or resp.get("result") or {}
     sku = result.get("SKU") or {}
@@ -563,21 +677,25 @@ def _resolve_sku_for_cart(item_id: str, sku_id: str = "") -> tuple[Optional[str]
             for p in paths if isinstance(p, dict) and (p.get("skuIdStr") or p.get("skuId")) is not None
         }
         if known and str(sku_id) not in known:
-            return None, None, (
+            return None, None, None, None, None, (
                 f"sku_id {sku_id} is not a variant of item {item_id}. "
                 "Run get_variants on this item and use one of the listed sku_id values."
             )
-        return str(sku_id), service, None
+        resolved_id = str(sku_id)
+        spec, price, currency = _cart_variant_label(result, resolved_id)
+        return resolved_id, service, spec, price, currency, None
 
     default_id = sku.get("selectedSkuIdStr") or sku.get("selectedSkuId")
     if default_id is None:
-        return None, None, (
+        return None, None, None, None, None, (
             f"Item {item_id} exposes no default SKU — pass sku_id explicitly "
             "(get_variants lists them)."
         )
     if sku.get("selectedSkuSaleable") is False:
-        return None, None, f"The default variant of item {item_id} is not saleable (out of stock)."
-    return str(default_id), service, None
+        return None, None, None, None, None, f"The default variant of item {item_id} is not saleable (out of stock)."
+    resolved_id = str(default_id)
+    spec, price, currency = _cart_variant_label(result, resolved_id)
+    return resolved_id, service, spec, price, currency, None
 
 
 def _resolve_cart_target(cookies: dict, item_id: str, cart_id: str, sku_id: str):
@@ -615,3 +733,69 @@ def _resolve_cart_target(cookies: dict, item_id: str, cart_id: str, sku_id: str)
             f"Item {item_id} occupies {len(matches)} cart lines — refusing to guess which "
             f"one you mean. Re-run with the cart_id:\n{listing}")
     return resp, matches[0], None
+
+
+def _cart_set_selected(cookies: dict, item_id: str, cart_id: str, sku_id: str,
+                       selected: bool) -> tuple[Optional[dict], Optional[str]]:
+    """
+    Tick or untick one cart line's checkout checkbox — the write side of the
+    `selected` field on cart items (see the CART_SELECT_FIELD / CART_OP_SELECT
+    comments above _extract_cart_droplet for what's confirmed vs. guessed).
+
+    Mirrors set_cart_quantity/remove_from_cart's own shape exactly: resolve the
+    target line via _resolve_cart_target, fire the operation via _cart_operate,
+    then re-read and check the ACTUAL state rather than trusting `ret` — this
+    API returns SUCCESS for no-ops as readily as for real changes, and that is
+    doubly true here since the operationType itself is an educated guess.
+
+    Deliberately does NOT special-case "already in that state, nothing to do"
+    the way set_cart_quantity does — until this is verified live, every call
+    should hit the network and get a real confirmation rather than trusting a
+    read that might itself be using the wrong field name.
+
+    Returns (line, error):
+      - (None, msg)  — resolution or the write itself failed outright.
+      - (line, msg)  — AliExpress returned ret=SUCCESS but the re-read shows
+        the line's selected flag didn't actually change (or couldn't be read
+        at all) — the operationType/field-name guess is probably wrong.
+      - (line, None) — confirmed: the re-read line's `selected` now matches
+        the requested value.
+    `line` is the matching entry from _extract_cart_droplet's `items` list.
+    """
+    resp, target, err = _resolve_cart_target(cookies, item_id, cart_id, sku_id)
+    if err:
+        return None, err
+
+    try:
+        ret = _cart_operate(cookies, resp, target["component_id"], CART_OP_SELECT,
+                            selected=selected)
+    except Exception as e:
+        return None, f"Selection change failed: {e}"
+    if ret_problem({"ret": [ret]}) is not None:
+        return None, f"Could not update cart line {target['cart_id']} — AliExpress said: {ret}"
+
+    try:
+        fresh, _ = _cart_fetch_all_pages(cookies, _cart_droplet_render(cookies))
+    except Exception as e:
+        return None, f"Selection request sent (ret={ret}), but re-reading the cart failed: {e}"
+
+    cart = _extract_cart_droplet(fresh)
+    line = next((i for i in cart["items"] if str(i.get("cart_id")) == target["cart_id"]), None)
+    if line is None:
+        return None, f"Cart line {target['cart_id']} disappeared after the change — check view_cart."
+
+    now = line.get("selected")
+    if now is None:
+        return line, (
+            f"AliExpress accepted the request (ret={ret}) but the re-read cart carries no "
+            f"selection field to confirm against — CART_SELECT_FIELD ({CART_SELECT_FIELD!r}) is "
+            "probably the wrong guess for this shape. Needs a live capture to fix."
+        )
+    if now != selected:
+        return line, (
+            f"AliExpress accepted the request (ret={ret}) but cart line {target['cart_id']} is "
+            f"still {'selected' if now else 'unselected'}, not "
+            f"{'selected' if selected else 'unselected'} as requested — CART_OP_SELECT "
+            f"({CART_OP_SELECT!r}) is probably the wrong guess."
+        )
+    return line, None

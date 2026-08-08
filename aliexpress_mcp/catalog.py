@@ -41,30 +41,156 @@ def _search_total_results(html: str) -> Optional[int]:
     return int(m.group(1)) if m else None
 
 
+def _search_slug(query: str) -> str:
+    """
+    Build the `/w/wholesale-<slug>.html` path segment for a query.
+
+    Punctuation must be REMOVED, not percent-encoded. `quote_plus` turns "1/4W 1%"
+    into "1%2F4W-1%25", and AliExpress answers that path with a redirect to
+    /s/error/404 — a 13KB page with no grid and no `totalResults`, which parses as
+    zero cards and renders as "No listings found". Verified live Aug 2026 with
+    "2600pcs Metal Film Resistors Assorted Pack 130 Values 1/4W 1%": the raw title
+    404s, while the same words with the punctuation blanked return 1,849 results
+    with the exact product ranked #1.
+
+    Punctuation becomes a space rather than nothing so "1/4W" reads as "1 4W"
+    (two tokens AliExpress can match) instead of the meaningless "14W".
+    """
+    cleaned = re.sub(r"[^0-9A-Za-zÀ-￿]+", " ", query or "")
+    return quote_plus(" ".join(cleaned.split())).replace("+", "-")
+
+
+# Order the EU expansion by how much stock AliExpress actually warehouses in each
+# country, because only the FIRST entry is sent to the server (see
+# `_search_fetch_parse`) and a rare warehouse makes a useless probe. Counted over
+# 600 unfaceted live search cards (Aug 2026): PL 77, DE 53, FR 7, ES 4, and every
+# other member zero — against CN 459. Alphabetical order would have probed AT,
+# which never appeared once. Members with no observed stock keep a stable
+# alphabetical tail; they still filter correctly, they are just poor probes.
+EU_PROBE_ORDER = ("PL", "DE", "FR", "ES", "CZ")
+
+
+def normalize_ship_from(ship_from: Any) -> list[str]:
+    """
+    Resolve a warehouse filter into a list of country codes.
+
+    Accepts a single code ("PL"), a comma string ("PL,CZ,ES"), a list, or the alias
+    "EU" for the whole customs union — "anywhere in the EU" is the usual intent, and
+    naming 27 countries by hand is not something a caller should have to do.
+
+    Order is preserved and meaningful: the caller's first code is the one the server
+    is asked for, so an explicit ["ES","PL"] probes ES.
+    """
+    if not ship_from:
+        return []
+    raw = ship_from if isinstance(ship_from, (list, tuple, set)) else str(ship_from).split(",")
+    out: list[str] = []
+    for entry in raw:
+        code = str(entry or "").strip().upper()
+        if not code:
+            continue
+        if code in ("EU", "EEA"):
+            # DUTY_FREE_BLOCS[0] is the EU set already maintained for the duty
+            # logic, so there is one list, not two.
+            bloc = DUTY_FREE_BLOCS[0]
+            for c in list(EU_PROBE_ORDER) + sorted(bloc):
+                if c in bloc and c not in out:
+                    out.append(c)
+        elif code not in out:
+            out.append(code)
+    return out
+
+
+# A returned row "matches" when it carries at least half the query's tokens; the
+# result set is judged degraded when fewer than this fraction of rows do so.
+RELEVANCE_FLOOR = 0.5
+
+
+def _query_tokens(query: str) -> list[str]:
+    """Query words worth matching on — 2+ chars, punctuation split out."""
+    return [t for t in re.split(r"[^0-9a-z]+", (query or "").lower()) if len(t) >= 2]
+
+
+def _relevant_fraction(products: list[dict], query: str) -> Optional[float]:
+    """
+    Fraction of rows whose title carries at least half the query's tokens.
+
+    This exists to catch AliExpress silently REPLACING the query. Asking for
+    "4 pin PWM fan extension cable" with shipFromCountry=PL returned 34 cards of
+    cable protector ramps, mains extension cords and rubber speed bumps — the
+    server answers a thin keyword×warehouse intersection by quietly broadening the
+    keywords instead of returning few results. Measured over 5 live result sets
+    (Aug 2026) the separation is total: healthy sets score 0.95, 0.97, 1.00, 1.00,
+    1.00, the broadened set scores 0.00, and not one of its 34 cards reached even
+    0.40 coverage. Anything near the 0.5 floor has never been observed.
+    """
+    tokens = _query_tokens(query)
+    if not tokens or not products:
+        return None
+    need = len(tokens) / 2.0
+    hits = 0
+    for p in products:
+        body = " " + re.sub(r"[^0-9a-z]+", " ", str(p.get("title") or "").lower()) + " "
+        if sum(1 for t in tokens if f" {t} " in body or t in body) >= need:
+            hits += 1
+    return hits / len(products)
+
+
 def _search_fetch_parse(query: str, sort_by: str = "best_match",
-                        ship_from: str = "") -> tuple[list[dict], Optional[int]]:
+                        ship_from: Any = "") -> tuple[list[dict], Optional[int]]:
+    """
+    (items, total_results) — `search_with_notes` without the notes.
+
+    Kept as the two-value form so existing callers keep working unchanged; they
+    still get the warehouse intersection and the relevance guard, they just don't
+    print the sentences explaining them. Prefer `search_with_notes` in new code.
+    """
+    items, total, _notes = search_with_notes(query, sort_by, ship_from)
+    return items, total
+
+
+def search_with_notes(query: str, sort_by: str = "best_match",
+                      ship_from: Any = "") -> tuple[list[dict], Optional[int], list[str]]:
     """
     Fetch an AliExpress search results page and parse product cards.
 
-    Returns (items, total_results). `total_results` comes from the page's own
-    `pageInfo.totalResults` and is reported even when zero cards parse.
+    Returns (items, total_results, notes). `total_results` comes from the page's own
+    `pageInfo.totalResults` and is reported even when zero cards parse. `notes` are
+    caller-facing sentences about how the result set was actually produced — they
+    must be printed, because each one describes a way the rows differ from what was
+    literally asked for.
 
     AliExpress intermittently serves the results page WITHOUT the `mods.itemList`
     grid — same URL, same second, sometimes present and sometimes not. Parsing
     that as "no results" told the caller a 92,000-result query had no products,
     so an empty parse against a non-zero total is retried before believing it.
 
+    On the warehouse filter, three things are true and all three are handled here.
+    It is worth keeping despite them: for "usb c cable" the facet returned 4,929
+    PL-warehouse results while ZERO of the plain search's top 60 shipped from PL,
+    so filtering the unfaceted search client-side would have found nothing.
+      1. It is not exact. A PL request returned 27 PL cards plus ES 3, FR 2, DE 1
+         and CZ 1, so the rows are intersected against the requested set here.
+      2. It can replace the query outright when stock is thin — see
+         `_relevant_fraction`, which detects that and says so rather than letting
+         34 speed bumps pass as fan cables.
+      3. The server takes exactly ONE country: `shipFromCountry=PL,ES,DE` collapsed
+         "usb c cable" from 4,929 results to 60, of which 58 shipped from CN. So a
+         multi-country request asks the server for the first code and keeps any
+         warehouse in the set — which is precisely what leak (1) supplies.
+
     Raises RuntimeError(AUTH_EXPIRED_MSG) if AliExpress bounces us to login.
     """
-    slug = quote_plus(query.strip()).replace("+", "-")
-    url_path = f"/w/wholesale-{slug}.html"
+    wanted = normalize_ship_from(ship_from)
+    url_path = f"/w/wholesale-{_search_slug(query)}.html"
     params = {}
     if SORT_MAP.get(sort_by):
         params["SortType"] = SORT_MAP[sort_by]
-    if ship_from:
-        params["shipFromCountry"] = ship_from.strip().upper()
+    if wanted:
+        params["shipFromCountry"] = wanted[0]
 
     total = None
+    items: list[dict] = []
     for attempt in range(SEARCH_RENDER_ATTEMPTS):
         client = get_client()
         try:
@@ -78,12 +204,118 @@ def _search_fetch_parse(query: str, sort_by: str = "best_match",
             client.close()
 
         if items or not total:
-            return items, total
+            break
         logger.info("search grid missing for %r (total=%s), retry %d/%d",
                     query, total, attempt + 1, SEARCH_RENDER_ATTEMPTS - 1)
         _pace("search_retry", 1.0)
 
-    return [], total
+    return _finish_search(items, total, query, wanted)
+
+
+def _finish_search(items: list[dict], total: Optional[int], query: str,
+                   wanted: list[str]) -> tuple[list[dict], Optional[int], list[str]]:
+    """Apply the client-side warehouse intersection and describe what was done."""
+    notes: list[str] = []
+    if not wanted or not items:
+        return items, total, notes
+
+    share = _relevant_fraction(items, query)
+    if share is not None and share < RELEVANCE_FLOOR:
+        notes.append(
+            f"⚠ AliExpress appears to have broadened the query: only {share:.0%} of the "
+            f"{len(items)} returned listings match your keywords. It does this when a "
+            f"keyword/warehouse combination has little stock. Treat these as loosely "
+            f"related, and re-run without ship_from to see the relevant listings."
+        )
+
+    # The fallback parse paths carry no warehouse signal at all; filtering on a
+    # field nobody populated would silently empty the list.
+    if not any(p.get("ship_from") for p in items):
+        notes.append(
+            f"Could not verify the warehouse country of these listings, so the "
+            f"{'/'.join(wanted[:4])} filter was NOT applied — AliExpress's own filter "
+            "is the only thing narrowing them."
+        )
+        return items, total, notes
+
+    kept = [p for p in items if (p.get("ship_from") or "") in wanted]
+    dropped = len(items) - len(kept)
+    where = "/".join(wanted) if len(wanted) <= 4 else f"{len(wanted)} countries"
+    note = (f"Warehouse filter: asked AliExpress for {wanted[0]} stock, then kept only "
+            f"listings shipping from {where}, checked here against each listing's own "
+            f"warehouse field.")
+    if dropped:
+        note += f" {dropped} of {len(items)} were dropped as shipping from elsewhere."
+    notes.append(note)
+    return kept, total, notes
+
+
+# Where to cut a keyword-stuffed title when searching for the same product under
+# other storefronts. Measured on the reported failure — a 61-char, 10-token title
+# whose full form returned nothing while its first 7 tokens rank the exact product
+# #1 — plus the 240-card title survey behind `_short_title` (mean 123 chars, and
+# the tail is SEO filler). Descending, so the loop stops at the first rung that
+# answers and the broad ones are only ever reached on a total miss.
+#
+# It stops at 5 deliberately. Five tokens of a title head is still the product
+# ("2600pcs Metal Film Resistors Assorted"); three is its category ("2600pcs Metal
+# Film"), which would always return something and so would turn "no listings
+# found" into a confident list of the wrong product — worse than the miss.
+TITLE_LADDER_TOKENS = (10, 7, 5)
+
+
+def _title_query_ladder(title: str) -> list[str]:
+    """
+    Progressively shorter keyword subsets of a product title, longest first.
+
+    AliExpress titles are keyword-stuffed by convention — "2600pcs Metal Film
+    Resistors Assorted Pack 130 Values 1/4W 1%" is a *short* one — so searching a
+    title verbatim is the case that needs to work, not an edge case. Each rung
+    keeps the head of the title, which is where the identifying words are; the tail
+    is the compatibility run ("For Xiaomi Samsung Huawei…") that only narrows the
+    match to nothing.
+
+    The complete title is always rung one — with punctuation no longer able to 404
+    the URL (`_search_slug`) it is both the most specific query available and, for
+    the reported failure, one that works. Only then do the cuts descend.
+
+    Deduplicated and never empty: a two-word title yields exactly one query.
+    """
+    tokens = [t for t in " ".join((title or "").split()).split(" ") if t]
+    if not tokens:
+        return []
+    out = [" ".join(tokens)]
+    for n in TITLE_LADDER_TOKENS:
+        rung = " ".join(tokens[:n])
+        if rung and rung not in out:
+            out.append(rung)
+    return out
+
+
+def search_by_title(title: str, sort_by: str = "best_match",
+                    ship_from: Any = "") -> tuple[list[dict], str, list[str]]:
+    """
+    Search for a product title, shortening the query until AliExpress answers.
+
+    Returns (products, query_actually_used, notes). Callers must report the query
+    that was used: a caller told "no listings found" for the full title, when the
+    hits were really found under its first 7 words, cannot tell a genuinely absent
+    product from a query that was merely too long.
+    """
+    notes: list[str] = []
+    rungs = _title_query_ladder(title)
+    for i, rung in enumerate(rungs):
+        products, _total, ship_notes = search_with_notes(rung, sort_by, ship_from)
+        if products:
+            if i:
+                notes.append(
+                    f'Searched the first {len(rung.split())} words — "{rung}" — because '
+                    "the full title returned nothing. Confirm each hit is the same product."
+                )
+            return products, rung, notes + ship_notes
+        if i + 1 < len(rungs):
+            _pace("search_retry", 1.0)
+    return [], (rungs[0] if rungs else ""), notes
 
 
 TITLE_MAX = 80
@@ -162,6 +394,17 @@ def _format_product_lines(products: list[dict], header: str, limit: int = 25) ->
             line += f" · ships from {p['ship_from']}"
         if p.get("is_choice"):
             line += " · Choice"
+        # The price above belongs to ONE configuration — the SKU the card names in
+        # `prices.skuId` — and the field it comes from is called `minPrice` without
+        # being one: on item 1005007010293617 the card quoted 190.39 while the
+        # listing spans 48.10–190.39, i.e. the DEAREST config. Reported as a
+        # cross-tool contradiction (search said 50.26, get_product_details said
+        # 36.57–85.58); both were right. Marking the count is what makes the single
+        # figure readable as a sample rather than the listing's price. The legend
+        # for it lives in the tool docstring — it is identical on every row.
+        vc = p.get("variant_count")
+        if isinstance(vc, int) and vc > 1:
+            line += f" · {vc} variants"
         if p.get("listing_age"):
             line += f" · {p['listing_age']}"
         # Only the minority lacking a free-shipping badge is worth a mark; the
@@ -373,6 +616,91 @@ def _pdp_unavailable_msg(item_id: str, code: str) -> str:
     )
 
 
+# ─── Shipping states ──────────────────────────────────────────────────────────
+#
+# Three outcomes, and the whole point of the split is that the third exists.
+#
+#   SHIP_OK           AliExpress returned a delivery option for the configured
+#                     country. Freight may still be unpriced; reachability and
+#                     cost are separate questions.
+#   SHIP_UNREACHABLE  AliExpress said, explicitly, that there is no option.
+#   SHIP_UNKNOWN      we could not determine it. Carries a reason.
+#
+# It used to be two states inferred from one field, and the missing third was
+# reported as the second: `bizData.unreachable` set "does not ship to SE", and a
+# response with no SHIPPING block set nothing, which the renderer's else-branch
+# turned into "AliExpress needs a saved delivery address" — a confident diagnosis
+# of a configuration problem, produced by a response that had told us nothing.
+# Five consecutive lookups across five sellers were reported as unshippable to SE;
+# the same items quoted real freight and delivery windows minutes later.
+#
+# Two facts from 30 captured live responses (Aug 2026) shape this. First, the
+# string "unreachable" appears in NONE of them — every healthy response carries
+# shipFrom/shippingFee/shipToCode and simply omits the key — so the confirmed-
+# negative branch is close to unexercised, which is exactly why a missing block
+# must never be routed into it. Second, `bizData.shipToCode` is present on all 35
+# delivery layouts and reads "SE" on every one, so the destination AliExpress
+# actually quoted is checkable rather than assumed. That check is what catches a
+# recurrence of the `_lang` bug (MTOP resolves the destination from `_lang`, and
+# quoting for the wrong country is what made reachable items look unreachable)
+# no matter which cause brings it back.
+SHIP_OK = "ships"
+SHIP_UNREACHABLE = "unreachable"
+SHIP_UNKNOWN = "unknown"
+
+# Why a shipping answer is unknown. Phrased as sentence fragments because they are
+# printed to the caller, who otherwise cannot tell a blocked response from a
+# listing that genuinely has no courier.
+SHIP_UNKNOWN_REASONS = {
+    "no_data": "AliExpress returned no product data at all (a degraded or blocked response)",
+    "no_block": "the response carried no shipping section",
+    "no_layouts": "the response carried an empty shipping section",
+    "no_option": "the shipping section carried no delivery option",
+    "wrong_destination": "AliExpress quoted delivery to {quoted}, not {country}",
+}
+
+
+def _shipping_unknown(d: dict, reason: str, quoted: Optional[str] = None) -> None:
+    """Record that shipping could not be determined, and why."""
+    d["ship_status"] = SHIP_UNKNOWN
+    d["ship_status_reason"] = reason
+    d["ship_status_detail"] = SHIP_UNKNOWN_REASONS.get(reason, reason).format(
+        quoted=quoted or "somewhere else", country=COUNTRY)
+
+
+def shipping_line(d: dict) -> str:
+    """
+    The one-line shipping verdict for a PDP dict, in the caller's words.
+
+    Lives here rather than in the renderer because the wording is load-bearing: an
+    unknown must not be able to read as a negative, so the sentence that says we
+    do not know is written next to the code that decides we do not know.
+    """
+    status = d.get("ship_status")
+    cost = d.get("shipping_cost")
+    if status == SHIP_UNREACHABLE:
+        return (f"Shipping: does not ship to {COUNTRY} — AliExpress returned no "
+                "delivery option for this destination.")
+    if status == SHIP_UNKNOWN:
+        detail = d.get("ship_status_detail") or "the response did not say"
+        if d.get("ship_status_reason") == "wrong_destination":
+            # Not a retryable blip: the session is resolving to another country, so
+            # every freight figure on the page is for that country until it is fixed.
+            return (f"Shipping: UNKNOWN — {detail}, so its freight and delivery "
+                    f"estimates were discarded rather than reported as {COUNTRY} "
+                    "figures. Check the delivery address saved on the site.")
+        return (f"Shipping: UNKNOWN — {detail}. This is not a report that the item "
+                f"cannot ship to {COUNTRY}; retry, and if it persists check that the "
+                "session still has a delivery address saved.")
+    if cost is not None:
+        return "Shipping: " + ("Free" if cost == 0 else _fmt_money(cost, d.get("currency")))
+    if status == SHIP_OK:
+        return (f"Shipping: ships to {COUNTRY}, but AliExpress quoted no freight price "
+                "(a delivery estimate may still appear below).")
+    return (f"Shipping: UNKNOWN — no shipping data was returned. This is not a report "
+            f"that the item cannot ship to {COUNTRY}.")
+
+
 def _extract_pdp_fields(mtop_resp: dict, item_id: str) -> dict:
     """
     Pull fields we care about from an MTOP PDP response.
@@ -410,13 +738,25 @@ def _extract_pdp_fields(mtop_resp: dict, item_id: str) -> dict:
         "ship_from": None,
         "ship_from_code": None,
         "tax_note": None,
+        # True ONLY when AliExpress itself said the destination is unreachable.
+        # Never set from an absent or empty response — see the shipping states above.
         "ship_unreachable": None,
+        "ship_status": None,
+        "ship_status_reason": None,
+        "ship_status_detail": None,
+        "ship_to_code": None,
         "ship_days_min": None,
         "ship_days_max": None,
     }
 
     result = mtop_resp.get("data", {}).get("result", {})
-    if not isinstance(result, dict):
+    if not isinstance(result, dict) or not result:
+        # An empty `result` is the shape an anti-bot soft-block leaves behind
+        # (FAIL_SYS_USER_VALIDATE answers with the envelope and nothing in it).
+        # It is a dict, so an isinstance check alone waved it through to be
+        # reported as "no shipping section" — a statement about the listing, when
+        # the truth is that we never got a listing.
+        _shipping_unknown(d, "no_data")
         return d
 
     # ── Title ──────────────────────────────────────────────────────────
@@ -561,7 +901,9 @@ def _extract_pdp_fields(mtop_resp: dict, item_id: str) -> dict:
         d["tax_note"] = _strip_html(tax_info["content"])
 
     ship = result.get("SHIPPING")
-    if isinstance(ship, dict):
+    if not isinstance(ship, dict):
+        _shipping_unknown(d, "no_block")
+    else:
         # bizData lives inside originalLayoutResultList[0] or deliveryLayoutInfo[0]
         layouts = ship.get("originalLayoutResultList") or ship.get("deliveryLayoutInfo") or []
         biz = None
@@ -569,6 +911,10 @@ def _extract_pdp_fields(mtop_resp: dict, item_id: str) -> dict:
             l0 = layouts[0]
             if isinstance(l0, dict):
                 biz = l0.get("bizData")
+        if not isinstance(layouts, list) or not layouts:
+            _shipping_unknown(d, "no_layouts")
+        elif not isinstance(biz, dict):
+            _shipping_unknown(d, "no_option")
         if isinstance(biz, dict):
             amt = biz.get("displayAmount")
             if amt is not None:
@@ -605,8 +951,27 @@ def _extract_pdp_fields(mtop_resp: dict, item_id: str) -> dict:
                 d["shipping_estimate"] = eta_min
             d["ship_from"] = biz.get("shipFrom")
             d["ship_from_code"] = biz.get("shipFromCode")
+
+            quoted_to = biz.get("shipToCode")
+            d["ship_to_code"] = str(quoted_to).strip().upper() if quoted_to else None
             if biz.get("unreachable"):
+                d["ship_status"] = SHIP_UNREACHABLE
                 d["ship_unreachable"] = True
+            elif d["ship_to_code"] and d["ship_to_code"] != COUNTRY.upper():
+                # The freight, the ETA and the courier all belong to whatever
+                # destination MTOP resolved. Reporting them as the configured
+                # country's is how the `_lang` bug produced confident wrong answers,
+                # so a mismatch invalidates the quote rather than annotating it.
+                _shipping_unknown(d, "wrong_destination", d["ship_to_code"])
+                d["shipping_cost"] = None
+                d["shipping_free"] = None
+                d["shipping_estimate"] = None
+                d["free_shipping_over"] = None
+            elif (d["shipping_cost"] is not None or d["shipping_free"]
+                  or d["shipping_estimate"] or biz.get("deliveryDayMin") is not None):
+                d["ship_status"] = SHIP_OK
+            else:
+                _shipping_unknown(d, "no_option")
             dmin = biz.get("deliveryDayMin")
             dmax = biz.get("deliveryDayMax")
             if dmin is not None:
@@ -660,6 +1025,13 @@ def _extract_pdp_fields(mtop_resp: dict, item_id: str) -> dict:
                     "days_min": lo,
                     "days_max": hi,
                 })
+
+    # Every number in this block describes one destination. If that destination was
+    # not ours, none of them may survive — a leftover "5–10 days" under an UNKNOWN
+    # verdict reads as the answer and would be a quote for the wrong country.
+    if d["ship_status_reason"] == "wrong_destination":
+        d["ship_days_min"] = d["ship_days_max"] = None
+        d["shipping_alternatives"] = []
 
     return d
 

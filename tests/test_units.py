@@ -22,6 +22,7 @@ import time
 import unittest
 from datetime import datetime, timedelta
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # Pinned before import: several helpers read the configured country at module
@@ -29,7 +30,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 os.environ["ALIEXPRESS_COUNTRY"] = "SE"
 os.environ["ALIEXPRESS_CURRENCY"] = "SEK"
 
-from aliexpress_mcp import account, catalog, core, scrape  # noqa: E402
+from aliexpress_mcp import account, cart, catalog, core, scrape  # noqa: E402
 
 
 class TestNormalizePrice(unittest.TestCase):
@@ -519,6 +520,328 @@ class TestOrderItemLine(unittest.TestCase):
         self.assertNotIn("(", account._order_item_line(it))
 
 
+def _ship_resp(biz=None, *, layouts=None, shipping=True, result=True):
+    """A PDP response skeleton with just enough SHIPPING to drive the state machine."""
+    if not result:
+        return {"ret": ["SUCCESS::调用成功"], "data": {"result": {}}}
+    res = {"PRODUCT_TITLE": {"text": "A Thing"}}
+    if shipping:
+        if layouts is None:
+            layouts = [{"bizData": biz}] if biz is not None else []
+        res["SHIPPING"] = {"originalLayoutResultList": layouts}
+    return {"ret": ["SUCCESS::调用成功"], "data": {"result": res}}
+
+
+class TestShippingStates(unittest.TestCase):
+    """
+    The reported worst-case: a degraded response rendering as a confident negative.
+
+    "Does not ship to SE" may only ever come from AliExpress saying so. Everything
+    else — no data, no block, no option, a quote for the wrong country — is unknown,
+    and must SAY unknown.
+    """
+
+    def _fields(self, resp):
+        return catalog._extract_pdp_fields(resp, "1005000000000")
+
+    def test_real_quote_is_reported_as_a_quote(self):
+        d = self._fields(_ship_resp({"shipToCode": "SE", "displayAmount": 18.68,
+                                     "shipFromCode": "CN", "deliveryDayMin": 11}))
+        self.assertEqual(d["ship_status"], catalog.SHIP_OK)
+        self.assertEqual(d["shipping_cost"], 18.68)
+        self.assertIsNone(d["ship_unreachable"])
+        self.assertIn("18.68", catalog.shipping_line(d))
+
+    def test_free_option_carries_no_amount(self):
+        """8 of 22 live items: shippingFee="free" and no displayAmount."""
+        d = self._fields(_ship_resp({"shipToCode": "SE", "shippingFee": "free"}))
+        self.assertEqual(d["ship_status"], catalog.SHIP_OK)
+        self.assertEqual(catalog.shipping_line(d), "Shipping: Free")
+
+    def test_only_an_explicit_flag_produces_the_negative(self):
+        d = self._fields(_ship_resp({"shipToCode": "SE", "unreachable": True}))
+        self.assertEqual(d["ship_status"], catalog.SHIP_UNREACHABLE)
+        self.assertIs(d["ship_unreachable"], True)
+        self.assertIn("does not ship", catalog.shipping_line(d))
+
+    def test_degraded_responses_are_unknown_never_negative(self):
+        """Each of these once rendered as a confident statement about the listing."""
+        cases = {
+            "no_data": _ship_resp(result=False),
+            "no_block": _ship_resp(shipping=False),
+            "no_layouts": _ship_resp(layouts=[]),
+            "no_option": _ship_resp(layouts=[{}]),
+        }
+        for reason, resp in cases.items():
+            with self.subTest(reason=reason):
+                d = self._fields(resp)
+                self.assertEqual(d["ship_status"], catalog.SHIP_UNKNOWN)
+                self.assertEqual(d["ship_status_reason"], reason)
+                self.assertIsNone(d["ship_unreachable"])
+                line = catalog.shipping_line(d)
+                self.assertIn("UNKNOWN", line)
+                self.assertNotIn("does not ship", line)
+
+    def test_an_empty_result_dict_is_no_data_not_a_missing_block(self):
+        """The anti-bot soft-block shape: the envelope arrives, the payload doesn't."""
+        d = self._fields(_ship_resp(result=False))
+        self.assertEqual(d["ship_status_reason"], "no_data")
+        self.assertIn("no product data", catalog.shipping_line(d))
+
+    def test_a_quote_for_another_country_is_discarded_not_reported(self):
+        """The `_lang` bug's signature: real numbers, wrong destination."""
+        d = self._fields(_ship_resp({
+            "shipToCode": "US", "displayAmount": 18.68, "shippingFee": "charge",
+            "displayEtaMinDate": "Aug. 15", "displayEtaMaxDate": "Aug. 20",
+            "deliveryDayMin": 5, "deliveryDayMax": 9,
+        }))
+        self.assertEqual(d["ship_status_reason"], "wrong_destination")
+        self.assertEqual(d["ship_to_code"], "US")
+        for field in ("shipping_cost", "shipping_estimate", "ship_days_min", "ship_days_max"):
+            self.assertIsNone(d[field], f"{field} survived a wrong-destination quote")
+        self.assertEqual(d["shipping_alternatives"], [])
+        self.assertIn("US", catalog.shipping_line(d))
+
+    def test_the_configured_destination_passes_the_check(self):
+        d = self._fields(_ship_resp({"shipToCode": "se", "displayAmount": 5.0}))
+        self.assertEqual(d["ship_status"], catalog.SHIP_OK)
+
+    def test_unknown_never_claims_the_item_cannot_ship(self):
+        for resp in (_ship_resp(result=False), _ship_resp(shipping=False),
+                     _ship_resp(layouts=[]), _ship_resp(layouts=[{}])):
+            line = catalog.shipping_line(self._fields(resp))
+            self.assertIn("not a report that the item cannot ship", line)
+
+
+class TestShipFromFilter(unittest.TestCase):
+    """The warehouse facet is inexact, so the rows are intersected here."""
+
+    def test_accepts_every_input_shape(self):
+        self.assertEqual(catalog.normalize_ship_from("pl"), ["PL"])
+        self.assertEqual(catalog.normalize_ship_from("PL,CZ , es"), ["PL", "CZ", "ES"])
+        self.assertEqual(catalog.normalize_ship_from(["PL", "cz"]), ["PL", "CZ"])
+        self.assertEqual(catalog.normalize_ship_from(""), [])
+        self.assertEqual(catalog.normalize_ship_from(None), [])
+
+    def test_eu_expands_to_the_bloc_probing_the_biggest_warehouse_first(self):
+        eu = catalog.normalize_ship_from("EU")
+        self.assertEqual(len(eu), len(catalog.DUTY_FREE_BLOCS[0]))
+        self.assertEqual(eu[0], "PL")      # 77 of 600 live cards; AT had zero
+        self.assertIn("SE", eu)
+
+    def test_duplicates_collapse_and_order_is_the_callers(self):
+        self.assertEqual(catalog.normalize_ship_from(["ES", "PL", "es"]), ["ES", "PL"])
+
+    def test_rows_from_other_warehouses_are_dropped(self):
+        """A live PL request returned 27 PL cards plus ES 3, FR 2, DE 1, CZ 1."""
+        rows = [{"title": "usb c cable", "ship_from": w}
+                for w in ["PL", "PL", "ES", "FR", "DE", "CZ"]]
+        kept, _total, notes = catalog._finish_search(rows, None, "usb c cable", ["PL"])
+        self.assertEqual(len(kept), 2)
+        self.assertTrue(any("4 of 6 were dropped" in n for n in notes))
+
+    def test_a_bloc_request_keeps_every_member(self):
+        rows = [{"title": "usb c cable", "ship_from": w} for w in ["PL", "ES", "DE", "CN"]]
+        kept, _t, _n = catalog._finish_search(rows, None, "usb c cable",
+                                              catalog.normalize_ship_from("EU"))
+        self.assertEqual([p["ship_from"] for p in kept], ["PL", "ES", "DE"])
+
+    def test_the_client_side_step_is_always_disclosed(self):
+        rows = [{"title": "usb c cable", "ship_from": "PL"}]
+        _k, _t, notes = catalog._finish_search(rows, None, "usb c cable", ["PL"])
+        self.assertTrue(any("checked here against" in n for n in notes))
+
+    def test_rows_with_no_warehouse_signal_are_kept_and_flagged(self):
+        """Filtering on a field the fallback parser never sets would empty the list."""
+        rows = [{"title": "usb c cable", "ship_from": None} for _ in range(3)]
+        kept, _t, notes = catalog._finish_search(rows, None, "usb c cable", ["PL"])
+        self.assertEqual(len(kept), 3)
+        self.assertTrue(any("NOT applied" in n for n in notes))
+
+    def test_no_filter_means_no_notes(self):
+        rows = [{"title": "usb c cable", "ship_from": "CN"}]
+        kept, _t, notes = catalog._finish_search(rows, None, "usb c cable", [])
+        self.assertEqual((len(kept), notes), (1, []))
+
+
+class TestQueryBroadening(unittest.TestCase):
+    """
+    AliExpress answers a thin keyword×warehouse intersection by swapping the
+    keywords, not by returning few rows. Live: 5 healthy sets scored 0.95–1.00,
+    the broadened set 0.00.
+    """
+
+    FAN = "4 pin PWM fan extension cable"
+
+    def test_relevant_results_score_high(self):
+        rows = [{"title": t} for t in [
+            "New 4 Pin Pwm Fan Cable 1 To 4 Ways Splitter Black Sleeved Extension",
+            "PWM Fan Splitter 4pin Adapter Cable 1 To 4 Computer CPU Fan Splitter",
+        ]]
+        self.assertEqual(catalog._relevant_fraction(rows, self.FAN), 1.0)
+
+    def test_the_reported_broadening_scores_zero(self):
+        rows = [{"title": t} for t in [
+            "SucceBuy Cable Protector Ramp Wire Cable Cover Cord Guard 2 Channels",
+            "SucceBuy Rubber Speed Bump 2 Channel Speed Bump Hump Garage",
+            "3-Socket Extension Cord 3m White Power Strip",
+        ]]
+        self.assertEqual(catalog._relevant_fraction(rows, self.FAN), 0.0)
+
+    def test_the_warning_fires_only_below_the_floor(self):
+        good = [{"title": "4 pin PWM fan extension cable splitter", "ship_from": "PL"}]
+        bad = [{"title": "Rubber Speed Bump Garage", "ship_from": "PL"}]
+        _k, _t, good_notes = catalog._finish_search(good, None, self.FAN, ["PL"])
+        _k, _t, bad_notes = catalog._finish_search(bad, None, self.FAN, ["PL"])
+        self.assertFalse(any("broadened" in n for n in good_notes))
+        self.assertTrue(any("broadened" in n for n in bad_notes))
+
+    def test_no_tokens_or_no_rows_is_undecided(self):
+        self.assertIsNone(catalog._relevant_fraction([], "usb c cable"))
+        self.assertIsNone(catalog._relevant_fraction([{"title": "x"}], ""))
+
+
+class TestSearchSlug(unittest.TestCase):
+    """A percent-encoded title 404s the wholesale route, which read as "not found"."""
+
+    def test_punctuation_is_blanked_not_escaped(self):
+        slug = catalog._search_slug("2600pcs Metal Film Resistors 130 Values 1/4W 1%")
+        self.assertNotIn("%", slug)
+        self.assertEqual(slug, "2600pcs-Metal-Film-Resistors-130-Values-1-4W-1")
+
+    def test_a_slash_becomes_a_token_break_not_a_join(self):
+        """"1/4W" must read as "1 4W", never the meaningless "14W"."""
+        self.assertIn("1-4W", catalog._search_slug("1/4W"))
+
+    def test_plain_queries_are_unchanged(self):
+        self.assertEqual(catalog._search_slug("usb c cable"), "usb-c-cable")
+
+    def test_collapses_whitespace_and_survives_empties(self):
+        self.assertEqual(catalog._search_slug("  usb   c  "), "usb-c")
+        self.assertEqual(catalog._search_slug(""), "")
+
+
+class TestTitleLadder(unittest.TestCase):
+    """Long keyword-stuffed titles are the norm, so shortening is the common path."""
+
+    TITLE = "2600pcs Metal Film Resistors Assorted Pack 130 Values 1/4W 1%"
+
+    def test_rungs_get_shorter_and_keep_the_head(self):
+        rungs = catalog._title_query_ladder(self.TITLE)
+        self.assertEqual(rungs[0], self.TITLE)
+        lengths = [len(r.split()) for r in rungs]
+        self.assertEqual(lengths, sorted(lengths, reverse=True))
+        for r in rungs:
+            self.assertTrue(self.TITLE.startswith(r))
+
+    def test_short_titles_yield_one_rung_without_duplicates(self):
+        rungs = catalog._title_query_ladder("usb cable")
+        self.assertEqual(rungs, ["usb cable"])
+
+    def test_empty_title(self):
+        self.assertEqual(catalog._title_query_ladder(""), [])
+        self.assertEqual(catalog._title_query_ladder(None), [])
+
+
+class TestSearchByTitle(unittest.TestCase):
+    """
+    The reported miss: the full title found nothing while a shorter form of the
+    same phrase returned six near-identical listings.
+    """
+
+    def _run(self, answers):
+        """Drive the ladder with a canned reply per rung; record which were tried."""
+        tried = []
+
+        def fake(query, sort_by="best_match", ship_from=""):
+            tried.append(query)
+            return (answers.get(len(tried) - 1, []), None, [])
+
+        with mock.patch.object(catalog, "search_with_notes", side_effect=fake), \
+                mock.patch.object(catalog, "_pace"):
+            products, used, notes = catalog.search_by_title("A B C D E F G H I J K L")
+        return products, used, notes, tried
+
+    def test_a_hit_on_the_full_title_shortens_nothing(self):
+        products, used, notes, tried = self._run({0: [{"item_id": "1"}]})
+        self.assertEqual(len(tried), 1)
+        self.assertEqual(used, "A B C D E F G H I J K L")
+        self.assertEqual(notes, [])
+
+    def test_it_shortens_until_aliexpress_answers(self):
+        products, used, notes, tried = self._run({2: [{"item_id": "1"}]})
+        self.assertEqual(len(products), 1)
+        self.assertEqual(len(tried), 3)
+        self.assertLess(len(used.split()), len(tried[0].split()))
+
+    def test_the_query_actually_used_is_reported(self):
+        """Silently answering a different question is the failure mode being fixed."""
+        _p, used, notes, _t = self._run({1: [{"item_id": "1"}]})
+        self.assertTrue(any(used in n for n in notes), notes)
+        self.assertTrue(any("full title returned nothing" in n for n in notes))
+
+    def test_giving_up_still_names_the_query_it_started_from(self):
+        products, used, notes, tried = self._run({})
+        self.assertEqual(products, [])
+        self.assertEqual(used, "A B C D E F G H I J K L")
+        self.assertEqual(tried, catalog._title_query_ladder("A B C D E F G H I J K L"))
+
+    def test_the_ladder_never_broadens_to_a_category_query(self):
+        """A 3-token rung always returns something — the wrong product, confidently."""
+        for rung in catalog._title_query_ladder("A B C D E F G H I J K L"):
+            self.assertGreaterEqual(len(rung.split()), 5)
+
+
+class TestVariantCountSignal(unittest.TestCase):
+    """
+    The cross-tool "price disagreement": search quotes ONE SKU, the PDP quotes the
+    range. `prices.minPrice` is not a minimum — one live card quoted the dearest
+    config of its listing.
+    """
+
+    @staticmethod
+    def _card(sku_images_blob, sku_id="12000039050573849"):
+        import base64, gzip
+        raw = base64.b64encode(gzip.compress(sku_images_blob.encode())).decode()
+        return {"extraParams": {"sku_images": raw}, "prices": {"skuId": sku_id}}
+
+    def test_counts_one_entry_per_sku(self):
+        blob = "14:496:a.jpg;175:b.jpg;173:c.jpg"
+        self.assertEqual(scrape._sku_count(self._card(blob)), 3)
+
+    def test_repeated_images_still_count_as_separate_skus(self):
+        """Several SKUs share one picture; the entry count is what tracks skuPaths."""
+        blob = "14:200006155:a.jpg;200006155:a.jpg;201336447:b.jpg"
+        self.assertEqual(scrape._sku_count(self._card(blob)), 3)
+
+    def test_single_sku_listing(self):
+        self.assertEqual(scrape._sku_count(self._card("14:29:only.jpg")), 1)
+
+    def test_absent_or_unreadable_is_unknown_not_one(self):
+        for card in ({}, {"extraParams": {}}, {"extraParams": {"sku_images": ""}},
+                     {"extraParams": {"sku_images": "not-base64-gzip"}}):
+            with self.subTest(card=card):
+                self.assertIsNone(scrape._sku_count(card))
+
+    def test_signals_expose_the_quoted_sku(self):
+        sig = scrape._search_signals(self._card("14:1:a.jpg;2:b.jpg"))
+        self.assertEqual(sig["variant_count"], 2)
+        self.assertEqual(sig["price_sku_id"], "12000039050573849")
+
+    def test_multi_variant_rows_are_marked_single_variant_rows_are_not(self):
+        rows = [
+            {"item_id": "1", "title": "Kit", "price": 50.26, "original_price": None,
+             "discount_pct": None, "rating": None, "sold_count": None,
+             "currency": "SEK", "variant_count": 21},
+            {"item_id": "2", "title": "Cable", "price": 9.0, "original_price": None,
+             "discount_pct": None, "rating": None, "sold_count": None,
+             "currency": "SEK", "variant_count": 1},
+        ]
+        kit, cable = catalog._format_product_lines(rows, "H:").splitlines()[1:]
+        self.assertIn("· 21 variants", kit)
+        self.assertNotIn("variants", cable)     # a lone SKU has no range to warn about
+
+
 class TestGoldenSkeleton(unittest.TestCase):
     """
     The golden harness classifies each diff as volatile or structural. Getting
@@ -592,3 +915,178 @@ class TestSubtotalByCurrency(unittest.TestCase):
     def test_bad_quantity_falls_back_to_one(self):
         self.assertEqual(self.fn([{"price": 2.0, "currency": "SEK", "quantity": "x"}]),
                          {"SEK": 2.0})
+
+
+class TestCartLineSelected(unittest.TestCase):
+    """
+    Report #6: `view_cart` exposed no per-line selection state at all, so a
+    line whose checkbox silently got cleared (still valid, still in the cart,
+    just not part of the next checkout) was invisible. A real 24-line cart
+    showed "Checkout (17)" against 18 rendered lines — one item would not
+    have arrived and nothing said so.
+
+    `_cart_line_selected` is the single place that guess lives (see the
+    CART_SELECT_FIELD comment in cart.py above _extract_cart_droplet): try the
+    droplet field name, fall back to the legacy one, else None rather than a
+    wrong guess.
+    """
+
+    def test_prefers_the_droplet_field_name(self):
+        fields = {cart.CART_SELECT_FIELD: {"enable": True, "selected": True},
+                  "checkbox": {"enable": True, "selected": False}}
+        self.assertTrue(cart._cart_line_selected(fields))
+
+    def test_falls_back_to_the_legacy_field_name(self):
+        fields = {"checkbox": {"enable": True, "selected": False}}
+        self.assertFalse(cart._cart_line_selected(fields))
+
+    def test_neither_field_present_is_none_not_false(self):
+        """Unknown must never be reported as "unselected" — that's actionable and wrong."""
+        self.assertIsNone(cart._cart_line_selected({}))
+        self.assertIsNone(cart._cart_line_selected({"checkbox": "not-a-dict"}))
+
+
+class TestExtractCartSelectionLegacy(unittest.TestCase):
+    """
+    Trimmed excerpt of the real legacy-shape `cart.render` fixture (captured
+    Aug 2026): tag "product_item_component", fields promoted to the top level,
+    `fields.checkbox.selected` is the real, confirmed field — cross-checked in
+    the full fixture against the render's own `selectItemNum` count (10
+    selected of 24 total matched exactly).
+    """
+
+    RESP = {"data": {"data": {
+        "product_item_component_global_cart_30015571035972": {
+            "tag": "product_item_component",
+            "fields": {
+                "itemId": 1005010146452067,
+                "title": "30-Piece Set of Orange Combination Cable Connectors",
+                "cartId": 30015571035972,
+                "checkbox": {"enable": True, "selected": False},
+                "quantity": {"current": 1},
+            },
+        },
+        "product_item_component_global_cart_30015515153709": {
+            "tag": "product_item_component",
+            "fields": {
+                "itemId": 1005005062960321,
+                "title": "Silicone hookup wire",
+                "cartId": 30015515153709,
+                "checkbox": {"enable": True, "selected": True},
+                "quantity": {"current": 1},
+            },
+        },
+    }}}
+
+    def test_selected_and_unselected_lines_both_come_through(self):
+        result = cart._extract_cart(self.RESP)
+        by_cart_id = {it["cart_id"]: it["selected"] for it in result["items"]}
+        self.assertIs(by_cart_id[30015571035972], False)
+        self.assertIs(by_cart_id[30015515153709], True)
+
+
+class TestExtractCartSelectionDroplet(unittest.TestCase):
+    """
+    The droplet shape `_cart_operate` actually writes against. No real
+    droplet-shaped cart render was available to confirm its checkbox field
+    name (see the CART_SELECT_FIELD comment in cart.py) — this pins the
+    best-effort fallback chain instead: try CART_SELECT_FIELD, then the
+    legacy name, then give up honestly with None.
+    """
+
+    RESP = {"data": {"data": {
+        "product_component_1": {
+            "fields": {
+                "itemView": {"itemId": 111, "title": "Guessed field name present",
+                            "cartId": 999, "valid": True},
+                "quantityView": {"current": 3},
+                cart.CART_SELECT_FIELD: {"enable": True, "selected": True},
+            },
+        },
+        "product_component_2": {
+            "fields": {
+                "itemView": {"itemId": 222, "title": "Only the legacy field name present",
+                            "cartId": 888, "valid": True},
+                "quantityView": {"current": 1},
+                "checkbox": {"enable": True, "selected": False},
+            },
+        },
+        "product_component_3": {
+            "fields": {
+                "itemView": {"itemId": 333, "title": "Neither field name present",
+                            "cartId": 777, "valid": True},
+                "quantityView": {"current": 1},
+            },
+        },
+    }}}
+
+    def test_guessed_field_name_is_tried_first(self):
+        result = cart._extract_cart_droplet(self.RESP)
+        by_cart_id = {it["cart_id"]: it["selected"] for it in result["items"]}
+        self.assertIs(by_cart_id[999], True)
+
+    def test_legacy_field_name_is_a_fallback(self):
+        result = cart._extract_cart_droplet(self.RESP)
+        by_cart_id = {it["cart_id"]: it["selected"] for it in result["items"]}
+        self.assertIs(by_cart_id[888], False)
+
+    def test_absence_is_none_not_a_guess(self):
+        result = cart._extract_cart_droplet(self.RESP)
+        by_cart_id = {it["cart_id"]: it["selected"] for it in result["items"]}
+        self.assertIsNone(by_cart_id[777])
+
+
+class TestCartVariantLabel(unittest.TestCase):
+    """
+    Report #8: `add_to_cart` confirmed with an opaque id — "Added item
+    1005007805734021 (variant 12000042262236139) x1" — which caught nothing
+    when three wrong-variant adds happened in one session. `_cart_variant_label`
+    is the data layer for the fix: resolve a sku_id to what a person can
+    actually check, e.g. '"28 AWG 60m" - 106.58 SEK'.
+
+    Trimmed PDP `result` shape: SKU.skuPaths (inline "id#Name" skuAttr
+    encoding, so no skuProperties needed) joined with PRICE.skuPriceInfoMap,
+    same source catalog._extract_variants / catalog._sku_spec_for_id already
+    read for get_variants.
+    """
+
+    RESULT = {
+        "SKU": {
+            "skuPaths": [
+                {"skuIdStr": "111", "skuAttr": "14:1#Red;200:2#Small"},
+                {"skuIdStr": "222", "skuAttr": "14:2#Blue;200:2#Small"},
+                # Same spec + price as 111: _extract_variants collapses this
+                # into 111's row and files it under covered_skus instead of
+                # giving it its own top-level entry.
+                {"skuIdStr": "333", "skuAttr": "14:1#Red;200:2#Small"},
+            ],
+        },
+        "PRICE": {
+            "skuPriceInfoMap": {
+                "111": {"salePriceString": "US $12.34"},
+                "222": {"salePriceString": "US $9.99"},
+                "333": {"salePriceString": "US $12.34"},
+            },
+        },
+        "GLOBAL_DATA": {"globalData": {"currencyCode": "USD"}},
+    }
+
+    def test_spec_and_price_for_a_plain_sku(self):
+        spec, price, currency = cart._cart_variant_label(self.RESULT, "222")
+        self.assertEqual(spec, "Blue · Small")
+        self.assertEqual(price, 9.99)
+        self.assertEqual(currency, "USD")
+
+    def test_price_still_resolves_for_a_sku_collapsed_into_another_row(self):
+        """333 shares 111's (spec, price) and has no top-level row of its own
+        in _extract_variants' output — covered_skus must still be checked."""
+        spec, price, currency = cart._cart_variant_label(self.RESULT, "333")
+        self.assertEqual(spec, "Red · Small")   # from the direct skuPaths lookup
+        self.assertEqual(price, 12.34)          # from the row that absorbed it
+        self.assertEqual(currency, "USD")
+
+    def test_unknown_sku_id_returns_all_none(self):
+        spec, price, currency = cart._cart_variant_label(self.RESULT, "does-not-exist")
+        self.assertIsNone(spec)
+        self.assertIsNone(price)
+        self.assertIsNone(currency)

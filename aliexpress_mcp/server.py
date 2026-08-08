@@ -943,7 +943,7 @@ def add_to_cart(item_id: str = "", url: str = "", sku_id: str = "", quantity: in
     if not cookies:
         return AUTH_EXPIRED_MSG
 
-    sku_id, service, err = _resolve_sku_for_cart(item_id, sku_id)
+    sku_id, service, spec, unit_price, unit_currency, err = _resolve_sku_for_cart(item_id, sku_id)
     if err:
         return err
 
@@ -1004,7 +1004,20 @@ def add_to_cart(item_id: str = "", url: str = "", sku_id: str = "", quantity: in
     if data.get("addFailed"):
         return f"Could not add item {item_id} to cart — AliExpress said: {ret or 'no status returned'}."
 
-    lines = [f"Added item {item_id} (variant {sku_id}) ×{quantity} to your cart."]
+    # Confirm in terms a person can check against what they meant to buy. A bare
+    # sku_id cannot be checked at all: one real session made three wrong-variant
+    # adds in a row — 28 AWG wire instead of 22, male headers instead of female,
+    # 10x 1mm drill bits instead of a graduated set — and every one of them was
+    # invisible in a confirmation that only echoed the id back. The spec/price
+    # lookup is best-effort (see _resolve_sku_for_cart), so fall back to the
+    # bare id rather than failing an add that actually succeeded.
+    descr = f"variant {sku_id}"
+    if spec:
+        descr = f'"{spec}"'
+        if unit_price is not None:
+            descr += f" — {_fmt_money(unit_price, unit_currency)}"
+        descr += f" [sku {sku_id}]"
+    lines = [f"Added item {item_id}: {descr} ×{quantity} to your cart."]
     if data.get("cartNum") is not None:
         lines.append(f"  Cart now holds {data['cartNum']} item(s).")
     if data.get("cartId") is not None:
@@ -1357,6 +1370,15 @@ def view_cart() -> str:
                 pass
             if it.get("sku_info"):
                 line += f"\n      variant: {it['sku_info']}"
+            # AliExpress only orders TICKED lines, and nothing in this output used
+            # to say which those were: one real cart showed "Checkout (17)" against
+            # 18 lines, so an item the user believed they were buying would simply
+            # not have arrived. Only the un-ticked state is called out — marking
+            # every normal line "selected" would bury the exception it matters to
+            # see. `selected is None` means the response didn't say, which is not
+            # the same as un-ticked and must not be rendered as a warning.
+            if it.get("selected") is False:
+                line += "\n      ⚠ NOT ticked for checkout — will NOT be ordered"
             detail = []
             ship_str = _ship_str(it)
             if common_ship is None:
@@ -1395,6 +1417,34 @@ def view_cart() -> str:
     # authoritative — the worst kind of number to hand a caller reconciling a
     # basket. When every line agrees (the normal case) this prints exactly as
     # it did before; when they don't, it refuses to fake a single total.
+    # Say it once, loudly, as well as per line: an un-ticked line is an item the
+    # user thinks they are buying and will not receive, and that is not
+    # recoverable after checkout.
+    unticked = [it for it in items if it.get("selected") is False]
+    # Cross-check our own parse against AliExpress's count of ticked lines. They
+    # can legitimately disagree: a line whose checkbox we couldn't read comes
+    # back `selected is None`, which is unknown, not un-ticked. Reporting only
+    # what we identified would then understate the problem by exactly the lines
+    # we understand least — so when the arithmetic doesn't close, say so.
+    server_selected = summary.get("selected_count") if used_droplet else None
+    excluded = (len(items) - server_selected
+                if isinstance(server_selected, int) and not truncated else None)
+    if unticked or excluded:
+        headline = (f"⚠ {excluded} of {len(items)} shown line(s) are NOT ticked for "
+                    "checkout and will not be ordered"
+                    if excluded is not None else
+                    f"⚠ {len(unticked)} of {len(items)} shown line(s) are NOT ticked "
+                    "for checkout and will not be ordered")
+        lines.append(headline + (":" if unticked else "."))
+        for it in unticked:
+            lines.append(f"    - {it['title'][:70]}")
+        if excluded is not None and excluded != len(unticked):
+            lines.append(
+                f"    (AliExpress reports {server_selected} ticked, so {excluded} are "
+                f"excluded, but only {len(unticked)} could be identified line-by-line "
+                "— check the cart on the site before ordering.)")
+        lines.append("")
+
     priced = [it for it in items if it.get("price") is not None]
     by_currency = _subtotal_by_currency(priced, currency)
     if priced:
