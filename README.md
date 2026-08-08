@@ -162,3 +162,9 @@ python3 tests/golden.py diff
 `tests/test_units.py` pins the pure parsing and formatting logic — localized money strings, abbreviated sold counts, duty expectations, sort ordering. It needs no cookies and no network, so it runs anywhere, and it is the suite to add to when fixing a data-quality bug.
 
 `tests/golden.py` answers the other question, the one that has cost the most time on this project: *did AliExpress change, or did I break it?* It snapshots what every read-only tool actually returns, then diffs. Because it hits a live API where prices and delivery dates legitimately move, it does not fail on any difference — it separates lines whose **numbers** moved (volatile) from lines whose **wording** changed (structural), reports them apart, and leaves the judgement to a human. Snapshots are gitignored: they contain real account data. The write tools are never called.
+
+## Credits
+
+Forked from [AlexSabaka/aliexpress-mcp-server](https://github.com/AlexSabaka/aliexpress-mcp-server) — the MTOP signing and PDP extraction came from there, which is the hard part. Session auth uses [MCP Auth Bridge](https://github.com/justinritchie/mcp-auth-bridge) by Justin Ritchie. Thanks to both.
+
+MIT licensed — see [LICENSE](LICENSE).
