@@ -1175,5 +1175,75 @@ class TestCartVariantLabel(unittest.TestCase):
         self.assertIsNone(currency)
 
 
+class TestAddManyToCart(unittest.TestCase):
+    """
+    The bulk add exists because ~25 rapid single adds is what trips AliExpress's
+    anti-bot check — a block that does NOT lift by waiting. So the behaviour that
+    actually matters is what it does once challenged: stop, and say precisely
+    which items went in, so a retry neither repeats nor loses any.
+
+    _add_one_to_cart is patched out; these test the loop, not the HTTP call.
+    """
+
+    def setUp(self):
+        import aliexpress_mcp.server as server
+        self.server = server
+        self.fn = getattr(server.add_many_to_cart, "fn", server.add_many_to_cart)
+
+    @staticmethod
+    def _result(ok=True, challenged=False, descr="x", text=""):
+        return {"ok": ok, "challenged": challenged, "descr": descr, "text": text,
+                "cart_num": None, "cart_id": None}
+
+    def test_a_challenge_stops_the_run_and_reports_what_was_untried(self):
+        calls = []
+
+        def fake(cookies, item_id, sku_id="", quantity=1):
+            calls.append(item_id)
+            if item_id == "2":
+                return self._result(ok=False, challenged=True,
+                                    text="AliExpress is holding a human-verification challenge")
+            return self._result(descr='"spec"')
+
+        with mock.patch.object(self.server, "load_cookies", return_value={"x": "y"}), \
+             mock.patch.object(self.server, "_add_one_to_cart", side_effect=fake):
+            out = self.fn([{"item_id": "1"}, {"item_id": "2"}, {"item_id": "3"}, {"item_id": "4"}])
+
+        # Items after the challenge must not be attempted at all.
+        self.assertEqual(calls, ["1", "2"])
+        self.assertIn("Added 1 of 4", out)
+        self.assertIn("Not attempted (2)", out)
+        self.assertIn("human-verification challenge", out)
+
+    def test_one_bad_item_does_not_abort_the_rest(self):
+        """An ordinary failure is not a challenge — keep going."""
+        def fake(cookies, item_id, sku_id="", quantity=1):
+            if item_id == "2":
+                return self._result(ok=False, text="sold out")
+            return self._result(descr='"spec"')
+
+        with mock.patch.object(self.server, "load_cookies", return_value={"x": "y"}), \
+             mock.patch.object(self.server, "_add_one_to_cart", side_effect=fake):
+            out = self.fn([{"item_id": "1"}, {"item_id": "2"}, {"item_id": "3"}])
+
+        self.assertIn("Added 2 of 3", out)
+        self.assertIn("sold out", out)
+        self.assertNotIn("Not attempted", out)
+
+    def test_accepts_bare_id_strings(self):
+        with mock.patch.object(self.server, "load_cookies", return_value={"x": "y"}), \
+             mock.patch.object(self.server, "_add_one_to_cart",
+                               return_value=self._result(descr='"spec"')):
+            out = self.fn(["1005006", "1005007"])
+        self.assertIn("Added 2 of 2", out)
+
+    def test_never_claims_an_order_was_placed(self):
+        with mock.patch.object(self.server, "load_cookies", return_value={"x": "y"}), \
+             mock.patch.object(self.server, "_add_one_to_cart",
+                               return_value=self._result(descr='"spec"')):
+            out = self.fn(["1005006"])
+        self.assertIn("Nothing has been ordered or paid for.", out)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

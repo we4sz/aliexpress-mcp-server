@@ -1423,4 +1423,31 @@ def _extract_variants(result: dict) -> list[dict]:
             v["covered_skus"] = [entry]
             merged[key] = v
             order.append(key)
-    return [merged[k] for k in order]
+    rows = [merged[k] for k in order]
+
+    # Mark the config `add_to_cart` buys when it is given no sku_id. Read from the
+    # same expression cart.py's `_resolve_sku_for_cart` uses, so the marker cannot
+    # drift from the behaviour it describes.
+    #
+    # Worth marking because the default is not the neutral choice it reads as. On
+    # 20 multi-config listings (Aug 2026) it was the cheapest row on 17 — which is
+    # how three wrong-variant adds happened in one session, the caller assuming the
+    # default was the config they had been discussing. The other 3 are the reason
+    # "cheapest" can't just be assumed either: item 1005007010293617 defaults to the
+    # DEAREST of its 17 price levels (190.39) and 1005007129679040 to #15 of 16.
+    #
+    # The default may also be one of several SKUs collapsed into one row, in which
+    # case the row's own sku_id is NOT the one that would be bought — so the exact
+    # id is carried separately. That did not occur in the 20 sampled listings, but
+    # it is reachable: collapsed rows exist (item 1005011654394254 has them) and
+    # nothing makes AliExpress prefer the survivor as its default.
+    default_id = sku.get("selectedSkuIdStr") or sku.get("selectedSkuId")
+    if default_id is not None:
+        default_id = str(default_id)
+        for v in rows:
+            covered = [s for s, _ok, _st in (v.get("covered_skus") or [])]
+            if v["sku_id"] == default_id or default_id in covered:
+                v["is_default"] = True
+                v["default_sku_id"] = default_id
+                break
+    return rows

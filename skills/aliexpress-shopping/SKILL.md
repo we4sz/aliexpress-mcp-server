@@ -21,10 +21,10 @@ description: >-
 These tools wrap AliExpress's own signed mobile API (MTOP) plus its search page, giving
 clean structured data instead of scraped HTML.
 
-Most tools only read. Eight write to the user's real account — `add_to_cart`,
-`set_cart_selection`, `set_cart_quantity`, `remove_from_cart`, `add_to_wishlist`,
-`remove_from_wishlist`, `create_wishlist`, `delete_wishlist` — and three of those destroy
-something. **There is no path to checkout, pay, or cancel an order**, which is the
+Most tools only read. Nine write to the user's real account — `add_to_cart`,
+`add_many_to_cart`, `set_cart_selection`, `set_cart_quantity`, `remove_from_cart`,
+`add_to_wishlist`, `remove_from_wishlist`, `create_wishlist`, `delete_wishlist` — and three
+of those destroy something. **There is no path to checkout, pay, or cancel an order**, which is the
 reassurance a worried user actually wants; don't overstate it into "everything is
 read-only".
 
@@ -55,6 +55,7 @@ the exact table.
 | Their saved / liked items, and which got cheaper | `get_wishlist(max_items)` |
 | Their named wishlists / collections, with ids and counts | `list_wishlists()` |
 | To put something in their cart — **write** | `add_to_cart(item_id \| url, sku_id, quantity)` |
+| To add SEVERAL items — **write, use instead of looping** | `add_many_to_cart(items)` |
 | To make sure a cart line will actually be included at checkout, or to leave it in the cart without ordering it — **write** | `set_cart_selection(selected, item_id \| url \| cart_id, sku_id)` |
 | To change how many of a cart line — **write** | `set_cart_quantity(quantity, item_id \| url \| cart_id, sku_id)` |
 | To take a line out of the cart — **destructive** | `remove_from_cart(item_id \| url \| cart_id, sku_id)` |
@@ -88,10 +89,21 @@ reconciled, convert explicitly and say you did.
 tagged **⚠ MSRP?** because AliExpress's reference prices are frequently inflated. Pass that
 skepticism on — don't present the "savings" as real without the flag.
 
+**`ship_from` isn't limited to one warehouse.** Pass a single two-letter code, a
+comma-separated string or list of codes, or the alias `"EU"`/`"EEA"` for the whole customs
+union instead of naming every member country by hand. Shipping from inside the user's own
+customs union usually arrives in days rather than weeks and avoids import charges.
+
 **The cart usually comes back in full.** AliExpress paginates it behind an opaque cursor,
 but `view_cart` walks that automatically (up to 10 pages), so most carts are complete. Only
 when a page fetch fails or a cart exceeds the cap is it labelled "showing N of M items" —
 if you see that, say so rather than implying it's everything.
+
+**Never loop `add_to_cart` over a shopping list.** Rapid sequential writes are what trips
+the anti-bot check, and that block does **not** clear by waiting — only a human completing
+a challenge in a logged-in browser lifts it, so a retry loop makes things worse and locks
+the user out of their own cart meanwhile. Use `add_many_to_cart`, which paces the writes
+and stops the moment a challenge lands, telling you exactly which items went in.
 
 **AliExpress orders only the TICKED cart lines.** An un-ticked line stays fully visible in
 the cart and simply never arrives, and that is not recoverable after checkout — so it is

@@ -66,10 +66,13 @@ mcp = FastMCP(
     instructions=(
         "Browse, search, and manage an AliExpress account: search products, compare "
         "sellers, check reviews/shipping/variants, and inspect your cart, orders, and "
-        "wishlist. Eight tools write to the real, signed-in account (add_to_cart, "
-        "set_cart_quantity, set_cart_selection, remove_from_cart, add_to_wishlist, "
-        "remove_from_wishlist, create_wishlist, delete_wishlist) but none of them "
-        "ever checks out, places an order, or pays — checkout is not implemented. "
+        "wishlist. Nine tools write to the real, signed-in account (add_to_cart, "
+        "add_many_to_cart, set_cart_quantity, set_cart_selection, remove_from_cart, "
+        "add_to_wishlist, remove_from_wishlist, create_wishlist, delete_wishlist) but "
+        "none of them ever checks out, places an order, or pays — checkout is not "
+        "implemented. Add several items with add_many_to_cart rather than looping "
+        "add_to_cart: rapid repeated writes trip an anti-bot block that does NOT clear "
+        "by waiting. "
         "Note AliExpress orders only the TICKED cart lines: an un-ticked line stays "
         "visible in the cart and simply never arrives, which view_cart flags and "
         "set_cart_selection fixes."
@@ -913,42 +916,43 @@ def get_variants(item_id: str = "", url: str = "") -> str:
     return "\n".join(lines)
 
 
-@mcp.tool(
-    title="Add to Cart",
-    annotations=ToolAnnotations(
-        readOnlyHint=False, destructiveHint=False, idempotentHint=False,
-        openWorldHint=True
-    ),
-    structured_output=False,
-)
-def add_to_cart(item_id: str = "", url: str = "", sku_id: str = "", quantity: int = 1) -> str:
+def _add_one_to_cart(cookies: dict, item_id: str, sku_id: str = "",
+                     quantity: int = 1) -> dict:
     """
-    Add an item to your AliExpress cart. This WRITES to your real account.
+    Add a single line to the cart and report structurally what happened.
 
-    Does not buy anything — the item sits in the cart until you check out on the
-    site yourself. To remove an item you no longer want, use remove_from_cart.
+    Split out of add_to_cart so the bulk tool runs the exact same code rather
+    than a parallel near-copy — the two paths drifting apart is how the anti-bot
+    handling ended up implemented twice and inconsistently.
 
-    Args:
-        item_id: AliExpress item ID (e.g., "1005007655628250").
-        url: Full or short AliExpress product URL (alternative to item_id).
-        sku_id: Specific variant to add, as printed by get_variants
-            (`[sku_id: ...]`). Defaults to the item's preselected variant, which
-            is what the product page shows — pass one explicitly whenever the
-            options matter (size, colour, length, male/female).
-        quantity: How many to add (default 1).
+    Returns {ok, challenged, descr, text, cart_num, cart_id}. `challenged` is
+    called out separately from ordinary failure because it is the one condition
+    where continuing is actively harmful: the block does not lift on its own, so
+    a caller in a loop must stop rather than spend the rest of its items
+    confirming the same wall.
     """
-    item_id = _resolve_item_id(item_id, url)
-    if not item_id:
-        return "Provide a valid item_id or AliExpress product URL (short a.aliexpress.com links work too)."
-    if quantity < 1:
-        return "quantity must be at least 1."
-    cookies = load_cookies()
-    if not cookies:
-        return AUTH_EXPIRED_MSG
+    out = {"ok": False, "challenged": False, "descr": f"item {item_id}",
+           "text": "", "cart_num": None, "cart_id": None}
 
     sku_id, service, spec, unit_price, unit_currency, err = _resolve_sku_for_cart(item_id, sku_id)
     if err:
-        return err
+        out["text"] = err
+        return out
+
+    # Confirm in terms a person can check against what they meant to buy. A bare
+    # sku_id cannot be checked at all: one real session made three wrong-variant
+    # adds in a row — 28 AWG wire instead of 22, male headers instead of female,
+    # 10x 1mm drill bits instead of a graduated set — and every one of them was
+    # invisible in a confirmation that only echoed the id back. The spec/price
+    # lookup is best-effort (see _resolve_sku_for_cart), so fall back to the
+    # bare id rather than failing an add that actually succeeded.
+    descr = f"variant {sku_id}"
+    if spec:
+        descr = f'"{spec}"'
+        if unit_price is not None:
+            descr += f" — {_fmt_money(unit_price, unit_currency)}"
+        descr += f" [sku {sku_id}]"
+    out["descr"] = descr
 
     add_item: dict[str, Any] = {
         "itemId": str(item_id),
@@ -993,7 +997,8 @@ def add_to_cart(item_id: str = "", url: str = "", sku_id: str = "", quantity: in
             app_key=MTOP_CART_APP_KEY,
         )
     except Exception as e:
-        return f"MTOP call failed: {e}"
+        out["text"] = f"MTOP call failed: {e}"
+        return out
 
     ret = (resp.get("ret") or [""])[0]
     data = resp.get("data") or {}
@@ -1002,31 +1007,155 @@ def add_to_cart(item_id: str = "", url: str = "", sku_id: str = "", quantity: in
     # string-matched here as well, which is how the two copies drifted apart.
     problem = ret_problem(resp)
     if problem is not None:
-        return f"Item {item_id} was NOT added to your cart. {problem}"
+        out["challenged"] = "human-verification challenge" in problem
+        out["text"] = problem
+        return out
 
     if data.get("addFailed"):
-        return f"Could not add item {item_id} to cart — AliExpress said: {ret or 'no status returned'}."
+        out["text"] = f"AliExpress said: {ret or 'no status returned'}"
+        return out
 
-    # Confirm in terms a person can check against what they meant to buy. A bare
-    # sku_id cannot be checked at all: one real session made three wrong-variant
-    # adds in a row — 28 AWG wire instead of 22, male headers instead of female,
-    # 10x 1mm drill bits instead of a graduated set — and every one of them was
-    # invisible in a confirmation that only echoed the id back. The spec/price
-    # lookup is best-effort (see _resolve_sku_for_cart), so fall back to the
-    # bare id rather than failing an add that actually succeeded.
-    descr = f"variant {sku_id}"
-    if spec:
-        descr = f'"{spec}"'
-        if unit_price is not None:
-            descr += f" — {_fmt_money(unit_price, unit_currency)}"
-        descr += f" [sku {sku_id}]"
-    lines = [f"Added item {item_id}: {descr} ×{quantity} to your cart."]
-    if data.get("cartNum") is not None:
-        lines.append(f"  Cart now holds {data['cartNum']} item(s).")
-    if data.get("cartId") is not None:
-        lines.append(f"  Cart line ID: {data['cartId']}")
+    out["ok"] = True
+    out["cart_num"] = data.get("cartNum")
+    out["cart_id"] = data.get("cartId")
+    return out
+
+
+@mcp.tool(
+    title="Add to Cart",
+    annotations=ToolAnnotations(
+        readOnlyHint=False, destructiveHint=False, idempotentHint=False,
+        openWorldHint=True
+    ),
+    structured_output=False,
+)
+def add_to_cart(item_id: str = "", url: str = "", sku_id: str = "", quantity: int = 1) -> str:
+    """
+    Add an item to your AliExpress cart. This WRITES to your real account.
+
+    Does not buy anything — the item sits in the cart until you check out on the
+    site yourself. To remove an item you no longer want, use remove_from_cart.
+
+    Args:
+        item_id: AliExpress item ID (e.g., "1005007655628250").
+        url: Full or short AliExpress product URL (alternative to item_id).
+        sku_id: Specific variant to add, as printed by get_variants
+            (`[sku_id: ...]`). Defaults to the item's preselected variant, which
+            is what the product page shows — pass one explicitly whenever the
+            options matter (size, colour, length, male/female).
+        quantity: How many to add (default 1).
+    """
+    item_id = _resolve_item_id(item_id, url)
+    if not item_id:
+        return "Provide a valid item_id or AliExpress product URL (short a.aliexpress.com links work too)."
+    if quantity < 1:
+        return "quantity must be at least 1."
+    cookies = load_cookies()
+    if not cookies:
+        return AUTH_EXPIRED_MSG
+
+    r = _add_one_to_cart(cookies, item_id, sku_id, quantity)
+    if not r["ok"]:
+        return f"Item {item_id} was NOT added to your cart. {r['text']}"
+
+    lines = [f"Added item {item_id}: {r['descr']} ×{quantity} to your cart."]
+    if r["cart_num"] is not None:
+        lines.append(f"  Cart now holds {r['cart_num']} item(s).")
+    if r["cart_id"] is not None:
+        lines.append(f"  Cart line ID: {r['cart_id']}")
     lines.append("  Nothing has been ordered or paid for.")
     return "\n".join(lines)
+
+
+@mcp.tool(
+    title="Add Many to Cart",
+    annotations=ToolAnnotations(
+        readOnlyHint=False, destructiveHint=False, idempotentHint=False,
+        openWorldHint=True
+    ),
+    structured_output=False,
+)
+def add_many_to_cart(items: list[dict]) -> str:
+    """
+    Add several items to your cart in one call, paced. This WRITES.
+
+    Prefer this over looping add_to_cart. Twenty-plus rapid single adds is the
+    pattern that trips AliExpress's anti-bot check, and that block does NOT
+    clear by waiting — only completing a challenge in a logged-in browser does.
+    This spaces the writes and, if a challenge does land, STOPS immediately and
+    reports exactly which items made it in, so nothing is added twice on a retry.
+
+    Buys nothing. Each line is confirmed by variant name and price, not just an
+    id, so a wrong variant is visible straight away.
+
+    Args:
+        items: List of items to add. Each entry is an object with:
+            item_id (or url), and optionally sku_id (from get_variants — pass it
+            whenever size/colour/length matters) and quantity (default 1).
+            A bare list of item-id strings is also accepted.
+    """
+    if not items or not isinstance(items, list):
+        return ("Provide a list of items, e.g. "
+                '[{"item_id": "1005006", "sku_id": "12000039", "quantity": 2}].')
+
+    cookies = load_cookies()
+    if not cookies:
+        return AUTH_EXPIRED_MSG
+
+    added, failed, skipped = [], [], []
+    challenge_msg = None
+
+    for n, raw in enumerate(items, 1):
+        entry = {"item_id": raw} if isinstance(raw, str) else (raw or {})
+        if not isinstance(entry, dict):
+            failed.append(f"  #{n}: not an item id or object — {raw!r}")
+            continue
+
+        # Once challenged, every remaining call is a guaranteed failure that
+        # also deepens the block. Record the rest as untried rather than
+        # burning them, so a retry knows exactly where to resume.
+        if challenge_msg:
+            skipped.append(f"  {entry.get('item_id') or entry.get('url') or f'#{n}'}")
+            continue
+
+        item_id = _resolve_item_id(str(entry.get("item_id") or ""), str(entry.get("url") or ""))
+        if not item_id:
+            failed.append(f"  #{n}: no valid item_id or URL — {raw!r}")
+            continue
+        try:
+            qty = int(entry.get("quantity") or 1)
+        except (TypeError, ValueError):
+            qty = 1
+        if qty < 1:
+            failed.append(f"  #{n} ({item_id}): quantity must be at least 1")
+            continue
+
+        try:
+            r = _add_one_to_cart(cookies, item_id, str(entry.get("sku_id") or ""), qty)
+        except Exception as e:
+            failed.append(f"  {item_id}: {e}")
+            continue
+
+        if r["ok"]:
+            added.append(f"  {item_id}: {r['descr']} ×{qty}")
+        elif r["challenged"]:
+            challenge_msg = r["text"]
+            failed.append(f"  {item_id}: blocked by the verification challenge")
+        else:
+            failed.append(f"  {item_id}: {r['text']}")
+
+    out = [f"Added {len(added)} of {len(items)} item(s) to your cart."]
+    if added:
+        out += ["", "Added:"] + added
+    if failed:
+        out += ["", "Not added:"] + failed
+    if skipped:
+        out += ["", f"Not attempted ({len(skipped)}) — stopped after the challenge:"] + skipped
+    if challenge_msg:
+        out += ["", challenge_msg,
+                "Re-run with only the items listed as not added or not attempted."]
+    out += ["", "Nothing has been ordered or paid for."]
+    return "\n".join(out)
 
 
 @mcp.tool(
