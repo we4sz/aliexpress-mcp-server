@@ -25,7 +25,7 @@ from aliexpress_mcp.core import (
 )
 from aliexpress_mcp.scrape import (
     parse_search_results, SEARCH_SOURCE_GAPS,
-    classify_search_render, SSR_UNPARSEABLE,
+    classify_search_render, SSR_UNPARSEABLE, search_page_info,
 )
 
 
@@ -159,6 +159,19 @@ def _relevant_fraction(products: list[dict], query: str) -> Optional[float]:
     (Aug 2026) the separation is total: healthy sets score 0.95, 0.97, 1.00, 1.00,
     1.00, the broadened set scores 0.00, and not one of its 34 cards reached even
     0.40 coverage. Anything near the 0.5 floor has never been observed.
+
+    A WAREHOUSE FILTER IS NOT REQUIRED for this to happen, which is why the note
+    built on it is no longer produced inside the ship_from branch. Three plain
+    unfaceted searches measured Aug 2026, no ship_from anywhere:
+
+      "solder wire holder multiple spool axle rack"       0.03  (60 rows)
+      "angitu silicone soldering iron wire holder spool axle rack"
+                                                          0.03  (60 rows)
+      "brass spool axle rack solder wire stand double reel holder bench"
+                                                          0.02  (60 rows)
+
+    The first is the reported failure — it came back as mechanical keyboard
+    switches, Akko keycaps and pipe fittings, scored 3%, and said nothing.
     """
     tokens = _query_tokens(query)
     if not tokens or not products:
@@ -191,10 +204,12 @@ def search_with_notes(query: str, sort_by: str = "best_match",
     Fetch an AliExpress search results page and parse product cards.
 
     Returns (items, total_results, notes). `total_results` comes from the page's own
-    `pageInfo.totalResults` and is reported even when zero cards parse. `notes` are
-    caller-facing sentences about how the result set was actually produced — they
-    must be printed, because each one describes a way the rows differ from what was
-    literally asked for.
+    `pageInfo.totalResults` and is reported even when zero cards parse — EXCEPT when
+    the page also said `finished: true` and the figure looks like the page-size
+    placeholder rather than a count, in which case it is dropped rather than printed
+    (see `_reconcile_total`). `notes` are caller-facing sentences about how the
+    result set was actually produced — they must be printed, because each one
+    describes a way the rows differ from what was literally asked for.
 
     AliExpress intermittently serves the results page WITHOUT the `mods.itemList`
     grid — same URL, same second, sometimes present and sometimes not. Parsing
@@ -226,6 +241,7 @@ def search_with_notes(query: str, sort_by: str = "best_match",
         params["shipFromCountry"] = wanted[0]
 
     total = None
+    page: dict = {}
     items: list[dict] = []
     render_notes: list[str] = []
     for attempt in range(SEARCH_RENDER_ATTEMPTS):
@@ -237,6 +253,7 @@ def search_with_notes(query: str, sort_by: str = "best_match",
             resp.raise_for_status()
             items = parse_search_results(resp.text)
             total = _search_total_results(resp.text)
+            page = search_page_info(resp.text)
             html = resp.text
         finally:
             client.close()
@@ -268,25 +285,119 @@ def search_with_notes(query: str, sort_by: str = "best_match",
                     query, total, why, attempt + 1, SEARCH_RENDER_ATTEMPTS - 1)
         time.sleep(_search_backoff(attempt))
 
-    items, total, notes = _finish_search(items, total, query, wanted)
+    items, total, notes = _finish_search(items, total, query, wanted, page)
     return items, total, render_notes + notes
 
 
+def _padded_page(items: list[dict], total: Optional[int], page: Optional[dict]) -> bool:
+    """
+    True when AliExpress padded a short result set out to a full grid.
+
+    The signature is a `finished: true` page carrying MORE cards than its own
+    `totalResults` — see `scrape.search_page_info` for the live measurements. It is
+    what makes "57 parsed (42 total)" a truthful pair rather than a broken one.
+
+    This is a property of the RESPONSE, not of the query, and it is not stable:
+    "brass spool axle rack solder wire stand double reel holder bench" answered
+    finished=true / totalResults 7 on one request and finished=false /
+    totalResults 3,006 on another twenty minutes later, both with a full 60-card
+    grid of the same irrelevant listings. So the padding diagnosis explains the
+    page in hand and must not be cached or generalised to the query.
+    """
+    return bool(page and page.get("finished") and total and len(items) > total)
+
+
+def _reconcile_total(items: list[dict], total: Optional[int],
+                     page: Optional[dict]) -> Optional[int]:
+    """
+    Drop `totalResults` when it is the page-size placeholder rather than a count.
+
+    On a `finished: true` page the figure is sometimes a round stand-in that
+    overstates wildly — 60 reported against 2 cards on "E15A metal solder wire
+    holder tin reel dispenser double layer axle", 60 against 52 on a PL-faceted
+    "ds18b20 waterproof temperature sensor", 50 against 26 on a PL-faceted "usb c
+    cable braided 1m". A finished page IS the whole result set, so `len(items)` is
+    the honest number and the placeholder adds nothing but a wrong figure.
+
+    Only ever dropped when there ARE rows. With an empty grid the number is the
+    only evidence that the query has results at all, and it is what tells the
+    caller (and the retry branch in `search_products`) that an empty parse is a
+    render failure rather than an empty catalogue.
+    """
+    if not items or not total or not page or not page.get("finished"):
+        return total
+    size = page.get("page_size")
+    # Above the card count AND at least page-size: a real count can sit above the
+    # card count only on an unfinished page, and every placeholder seen was
+    # page-size or a round number at least that large.
+    if total > len(items) and size and total >= size:
+        return None
+    return total
+
+
+def _relevance_note(items: list[dict], query: str, wanted: list[str],
+                    padded: bool) -> Optional[str]:
+    """
+    The sentence for a result set that does not match the keywords, or None.
+
+    Runs on EVERY search. It used to run only inside the warehouse-filter branch,
+    on the theory that a thin keyword×warehouse intersection is what provokes
+    AliExpress into swapping the keywords. That theory is half right: the swap also
+    happens with no filter at all — "solder wire holder multiple spool axle rack"
+    came back as mechanical keyboard switches and pipe fittings at 3% match with
+    ship_from unset, and said nothing, because the only code that could have
+    noticed sat behind `if not wanted: return`.
+
+    The wording forks because the fix differs. Dropping ship_from cannot help a
+    caller who never set it, and telling them to is the same class of confidently
+    wrong advice as the retry loop that once said "retry the same query".
+    """
+    share = _relevant_fraction(items, query)
+    if share is None or share >= RELEVANCE_FLOOR:
+        return None
+    head = (f"⚠ AliExpress appears to have broadened the query: only {share:.0%} of "
+            f"the {len(items)} returned listings match your keywords.")
+    if padded:
+        # A different mechanism with the same symptom, and worth naming separately:
+        # here AliExpress did not rewrite the keywords, it ran out of matches and
+        # topped the page up. Saying "broadened the query" alone would send the
+        # caller off to reword a query that was understood perfectly well.
+        return (head + " It found only a handful of real matches and filled the page "
+                "out with related listings, so most rows below are padding rather "
+                "than results. The count in the header says how many really matched.")
+    if wanted:
+        return (head + " It does this when a keyword/warehouse combination has little "
+                "stock. Treat these as loosely related, and re-run without ship_from "
+                "to see the relevant listings.")
+    return (head + " It does this rather than returning few rows, so a full page of "
+            "results is not evidence the product exists. Treat these as loosely "
+            "related and try different or fewer keywords — no warehouse filter is "
+            "involved here, so removing one is not the fix.")
+
+
 def _finish_search(items: list[dict], total: Optional[int], query: str,
-                   wanted: list[str]) -> tuple[list[dict], Optional[int], list[str]]:
-    """Apply the client-side warehouse intersection and describe what was done."""
+                   wanted: list[str], page: Optional[dict] = None
+                   ) -> tuple[list[dict], Optional[int], list[str]]:
+    """
+    Reconcile the counts, judge relevance, apply the warehouse intersection.
+
+    `page` is `scrape.search_page_info`'s dict and is optional only so the older
+    four-argument form keeps working; without it the count reconciliation and the
+    padding diagnosis are simply not available, which is the same position this
+    function was in before they existed.
+    """
     notes: list[str] = []
+    padded = _padded_page(items, total, page)
+    total = _reconcile_total(items, total, page)
+
+    # Unconditional — see `_relevance_note`. This is the one note that describes
+    # the rows themselves rather than what was done to them, so it goes first.
+    relevance = _relevance_note(items, query, wanted, padded)
+    if relevance:
+        notes.append(relevance)
+
     if not wanted or not items:
         return items, total, notes
-
-    share = _relevant_fraction(items, query)
-    if share is not None and share < RELEVANCE_FLOOR:
-        notes.append(
-            f"⚠ AliExpress appears to have broadened the query: only {share:.0%} of the "
-            f"{len(items)} returned listings match your keywords. It does this when a "
-            f"keyword/warehouse combination has little stock. Treat these as loosely "
-            f"related, and re-run without ship_from to see the relevant listings."
-        )
 
     # The fallback parse paths carry no warehouse signal at all; filtering on a
     # field nobody populated would silently empty the list.
@@ -478,6 +589,31 @@ def _sponsored_note(products: list[dict]) -> Optional[str]:
             "not earned by the sort — they are kept in place and marked · sponsored.")
 
 
+def search_count_header(shown: int, parsed: int, total: Optional[int]) -> str:
+    """
+    The count clause of a search header, worded so parsed > total is not a bug.
+
+    "Showing 25 of 57 parsed (42 total)" was reported as a broken header, and the
+    reading it invites — that 57 rows were somehow drawn from a pool of 42 — is
+    indeed impossible. The pair is real: `totalResults` counts the listings that
+    matched the keywords, and once those run out AliExpress tops the grid up toward
+    `pageSize` with related items, so the grid is routinely larger than the count.
+    Live Aug 2026: 7 matches → 60 cards, 53 matches → 60 cards (see
+    `scrape.search_page_info`). The number was never wrong; the word "total" was.
+
+    `total` arrives already reconciled by `_reconcile_total`, so None here means
+    AliExpress gave no usable figure and none is invented to fill the gap.
+    """
+    head = f"Showing {shown} of {parsed} listing{'' if parsed == 1 else 's'}"
+    if not total:
+        return head
+    if parsed > total:
+        return (f"{head} — AliExpress found only {total:,} that match the keywords and "
+                f"padded the page out with related items, so {parsed - total} of the "
+                "rows below are not matches")
+    return f"{head} ({total:,} keyword matches in total)"
+
+
 def _format_product_lines(products: list[dict], header: str, limit: int = 25) -> str:
     """Render parsed product dicts into the compact text shared by search + deals."""
     lines = [header]
@@ -535,6 +671,15 @@ def _format_product_lines(products: list[dict], header: str, limit: int = 25) ->
             line += f" · ⚠ only {p['stock_left']} left"
         # Only the minority lacking a free-shipping badge is worth a mark; the
         # rest would just repeat themselves 48 times.
+        #
+        # This mark is the row's only warning that the listing pays its OWN freight
+        # rather than riding the pooled Choice fee, and it is a far better predictor
+        # of that than the "· Choice" beside it — see the FREIGHT_* block. The three
+        # KINGBO flux listings measured Aug 2026 make the point in one query: two
+        # were tagged Choice, only one had the badge, and the badged one shipped
+        # under the pooled 18.68 while the other cost 22.61 of its own. The mark is
+        # deliberately NOT worded as a freight prediction, because the card carries
+        # no freight figure — get_product_details is where the number lives.
         if p.get("free_shipping") is False:
             line += " · ⚠ no free-shipping badge"
         if p.get("duty_offset"):
@@ -798,6 +943,64 @@ SHIP_OK = "ships"
 SHIP_UNREACHABLE = "unreachable"
 SHIP_UNKNOWN = "unknown"
 
+
+# ─── Freight regimes ──────────────────────────────────────────────────────────
+#
+# A freight figure means nothing until you know WHICH OF THESE it is, and the two
+# charged regimes differ by more than an order of magnitude on the same page.
+# Three reversed purchases came out of reading a pooled figure as a per-line one.
+#
+#   FREIGHT_PER_LINE      this line's own freight, charged once per line and
+#                         pooled with nothing. 13.19 – 585.21 SEK live.
+#   FREIGHT_POOLED        the AliExpress Choice consolidated fee. A FLAT 18.68 SEK
+#                         in SE — the same number on every listing regardless of
+#                         weight, size or price — charged ONCE for the whole
+#                         Choice group in an order and waived above a threshold.
+#   FREIGHT_FREE          AliExpress said "free" outright.
+#
+# THE SIGNAL IS `bizData.choiceFreeShipping`, NOT THE CHOICE TAG. Verified across
+# 39 live PDPs (Aug 2026):
+#
+#   choiceFreeShipping == "yes"   18 items. displayAmount was 18.68 on ALL 18, and
+#                                 `logisticsComposeThreshold` ("100,00kr") was
+#                                 present on all 18 and on nothing else. The
+#                                 layout's own render condition spells the meaning
+#                                 out: "choiceFreeShipping=yes&&thresholdOverZero=
+#                                 yes&&meetLogisticsComposeThreshold!=yes&&
+#                                 shippingFee=charge" — i.e. show this amount only
+#                                 while the ORDER has not yet met the threshold.
+#   absent                        21 items. displayAmount is the line's own
+#                                 freight, or shippingFee=="free".
+#
+# The Choice tag (`GLOBAL_DATA.globalData.productTagInfo.mergeChoice`) does NOT
+# predict it, and gets it wrong in BOTH directions:
+#
+#   1005006579547770  KINGBO flux    Choice=yes, choiceFreeShipping absent
+#                                    → 22.61 SEK per line. Checkout charged 22.61.
+#   1005007129679040  FR warehouse   Choice=NO,  choiceFreeShipping="yes"
+#                                    → pooled 18.68.
+#
+# The cleanest proof is three sellers of the SAME product (KINGBO RMA-218 flux),
+# all fetched within a minute of each other:
+#
+#   1005006866633853  card: Choice + free-shipping badge   cfs=yes   18.68 pooled
+#   1005007226805763  card: Choice, NO badge               cfs=—     22.61 per line
+#   1005012305428718  card: not Choice, no selling points  cfs=—     32.02 per line
+#
+# `deliveryOptionCode` is not the signal either, and the same triple kills it: the
+# first two are both CAINIAO_FULFILLMENT_STD_SG. The "_SG" (Special Goods) suffix
+# looked like a good tell on a smaller sample and is not one.
+#
+# On the search card the counterpart is the free-shipping badge
+# (`platformFreeShipping_atm` / `Free_Shipping_atm`, see scrape.FREE_SHIPPING_SOURCES).
+# It agreed with the PDP flag on all three items where both were observed, plus a
+# fourth (item 1005009487098247, no badge, POP, 154.29 SEK). Four is enough to act
+# on and not enough to call a law — the PDP flag is what the code keys on, and the
+# badge is reported as the search-side hint it is.
+FREIGHT_PER_LINE = "per_line"
+FREIGHT_POOLED = "choice_pooled"
+FREIGHT_FREE = "free"
+
 # Why a shipping answer is unknown. Phrased as sentence fragments because they are
 # printed to the caller, who otherwise cannot tell a blocked response from a
 # listing that genuinely has no courier.
@@ -843,12 +1046,62 @@ def shipping_line(d: dict) -> str:
                 f"cannot ship to {COUNTRY}; retry, and if it persists check that the "
                 "session still has a delivery address saved.")
     if cost is not None:
-        return "Shipping: " + ("Free" if cost == 0 else _fmt_money(cost, d.get("currency")))
+        if cost == 0:
+            return "Shipping: Free"
+        money = _fmt_money(cost, d.get("currency"))
+        if d.get("freight_kind") == FREIGHT_POOLED:
+            # Never render this one as a bare number. It is a per-ORDER platform fee
+            # that every Choice listing quotes identically, so "Shipping: 18.68 SEK"
+            # on twelve listings reads as twelve charges of 18.68 when the order
+            # will be charged it once, or not at all.
+            over = d.get("free_shipping_over")
+            waived = (f", and waived entirely once the Choice part of your order reaches "
+                      f"{over}" if over else "")
+            return (f"Shipping: {money} for your whole AliExpress Choice group, not for "
+                    f"this item — it is a flat per-order fee shared by every Choice "
+                    f"listing in the basket{waived}. Adding this line to an order that "
+                    "already pays it costs no extra freight.")
+        return (f"Shipping: {money} for this line — the seller's own freight, charged "
+                "per line and pooled with nothing. It is added on top of any other "
+                "line's shipping.")
     if status == SHIP_OK:
         return (f"Shipping: ships to {COUNTRY}, but AliExpress quoted no freight price "
                 "(a delivery estimate may still appear below).")
     return (f"Shipping: UNKNOWN — no shipping data was returned. This is not a report "
             f"that the item cannot ship to {COUNTRY}.")
+
+
+def choice_line(d: dict) -> Optional[str]:
+    """
+    Whether the listing is Choice, and whether that buys it consolidated shipping.
+
+    These are two independent facts and the whole point of printing them together
+    is that a reader assumes they are one. Search shows the Choice tag and details
+    showed neither, so a listing tagged Choice looked like a listing with pooled
+    free shipping — which is what the KINGBO flux at 22.61 SEK per line was not.
+
+    Returns None when the PDP said nothing about either, rather than guessing "no".
+    """
+    is_choice = d.get("is_choice")
+    kind = d.get("freight_kind")
+    if is_choice is None and kind is None:
+        return None
+    tag = {True: "Choice: yes", False: "Choice: no",
+           None: "Choice: not stated by the page"}[is_choice]
+    if kind == FREIGHT_POOLED:
+        # The `is_choice is False` case is rare and real — item 1005007129679040,
+        # an FR warehouse, pools the fee with nothing calling it Choice — so the
+        # two halves are printed independently rather than one being inferred.
+        return f"{tag} — ships under the pooled Choice fee (see the shipping line)."
+    if kind is None:
+        # No usable quote came back, so the freight half is unknown and saying
+        # "pays its own freight" would be an invention.
+        return f"{tag} — no delivery quote came back, so the freight terms are unknown."
+    if is_choice:
+        return (f"{tag}, but WITHOUT Choice consolidated shipping — this listing carries "
+                "the tag and still ships on the seller's own terms. The tag is not a "
+                "shipping promise.")
+    return f"{tag} — ships on the seller's own terms, not the pooled Choice fee."
 
 
 # ─── Placeholder prices ───────────────────────────────────────────────────────
@@ -949,6 +1202,11 @@ def _extract_pdp_fields(mtop_resp: dict, item_id: str) -> dict:
         "shipping_cost": None,
         "shipping_free": None,
         "free_shipping_over": None,
+        # Which of the freight regimes `shipping_cost` belongs to, and the two
+        # independent facts behind it. See the FREIGHT_* block above.
+        "freight_kind": None,
+        "choice_free_shipping": None,
+        "is_choice": None,
         "shipping_alternatives": [],
         "shipping_estimate": None,
         "ship_from": None,
@@ -1121,6 +1379,20 @@ def _extract_pdp_fields(mtop_resp: dict, item_id: str) -> dict:
         except (TypeError, ValueError):
             pass
 
+    # ── Choice tag ────────────────────────────────────────────────────
+    # `productTagInfo.mergeChoice` is the tag itself and carries no shipping
+    # meaning — see the FREIGHT_* block. It was present and boolean on all 39 live
+    # PDPs sampled Aug 2026, and agreed with `buriedLogInfo.buriedData`'s
+    # {"choice":…} on every one, so one reader is enough.
+    #
+    # `globalData.choiceIcon` is NOT a Choice signal even though it reads like one:
+    # the same 232x98 badge URL is present on non-Choice listings too (verified on
+    # item 1005009487098247, mergeChoice False). Keying on it would have marked
+    # every listing Choice.
+    tag_info = gd.get("productTagInfo")
+    if isinstance(tag_info, dict) and isinstance(tag_info.get("mergeChoice"), bool):
+        d["is_choice"] = tag_info["mergeChoice"]
+
     # ── Shipping ──────────────────────────────────────────────────────
     # AliExpress computes the duty position per item for the configured
     # destination — "Import charges will apply" for a CN warehouse vs "No extra
@@ -1165,14 +1437,27 @@ def _extract_pdp_fields(mtop_resp: dict, item_id: str) -> dict:
                     d["shipping_cost"] = 0.0
             # `logisticsComposeThreshold` is the FREE-SHIPPING THRESHOLD, never the
             # freight price: it is a flat per-site figure ("100,00kr" on every SE
-            # listing, "C$10.00" on every CA one) sitting right next to a real
-            # freight of 18,68kr / C$3.08, and it is absent on listings whose
-            # freight is unusual. It used to be assigned to `shipping_cost`, which
+            # listing, "C$10.00" on every CA one) sitting right next to a freight of
+            # 18,68kr / C$3.08. It used to be assigned to `shipping_cost`, which
             # would print "Shipping: 100.00 SEK" for an item that ships for 18.68.
             # Keep it, but only ever as what it is. Verified live Aug 2026.
+            #
+            # It is present on exactly the `choiceFreeShipping=="yes"` listings and
+            # on nothing else (18 of 39 live PDPs, no exceptions either way), and
+            # the threshold is an ORDER total, not this item's price — which is why
+            # it may not be printed as a standalone consolation line next to a
+            # per-line freight it has nothing to do with.
             thresh = biz.get("logisticsComposeThreshold")
             if thresh:
                 d["free_shipping_over"] = _strip_html(thresh) or str(thresh)
+
+            # The freight regime. This is the field the whole shipping answer turns
+            # on — see the FREIGHT_* block for the 39-PDP evidence and for why the
+            # Choice tag, `identityType` and `deliveryOptionCode` are all the wrong
+            # thing to key on.
+            cfs = biz.get("choiceFreeShipping")
+            d["choice_free_shipping"] = (isinstance(cfs, str)
+                                         and cfs.strip().lower() == "yes")
             eta_min = biz.get("displayEtaMinDate")
             eta_max = biz.get("displayEtaMaxDate")
             if eta_min and eta_max:
@@ -1197,9 +1482,18 @@ def _extract_pdp_fields(mtop_resp: dict, item_id: str) -> dict:
                 d["shipping_free"] = None
                 d["shipping_estimate"] = None
                 d["free_shipping_over"] = None
+                # The regime describes the quote, and the quote has just been
+                # thrown away. `choice_free_shipping` is left alone: it is a
+                # property of the listing, not of the destination.
+                d["freight_kind"] = None
             elif (d["shipping_cost"] is not None or d["shipping_free"]
                   or d["shipping_estimate"] or biz.get("deliveryDayMin") is not None):
                 d["ship_status"] = SHIP_OK
+                if d["shipping_cost"] == 0 or d["shipping_free"]:
+                    d["freight_kind"] = FREIGHT_FREE
+                elif d["shipping_cost"] is not None:
+                    d["freight_kind"] = (FREIGHT_POOLED if d["choice_free_shipping"]
+                                         else FREIGHT_PER_LINE)
             else:
                 _shipping_unknown(d, "no_option")
             dmin = biz.get("deliveryDayMin")

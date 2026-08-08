@@ -91,15 +91,22 @@ mcp = FastMCP(
 BROADENED_ROW_LIMIT = 3
 
 
-def _row_limit(products: list, query: str, requested: int) -> tuple[int, Optional[str]]:
+def _row_limit(products: list, query: str, requested: int,
+               ship_from: Any = "") -> tuple[int, Optional[str]]:
     """(rows to print, note) — collapses the listing when the query was replaced."""
     share = _relevant_fraction(products, query)
     if share is not None and share < RELEVANCE_FLOOR and len(products) > BROADENED_ROW_LIMIT:
+        # Only suggest dropping the warehouse filter when there IS one. The
+        # detector now runs on every search, so this fires plenty of times with
+        # no ship_from in play, and telling someone to remove an argument they
+        # never passed is the kind of confidently-wrong advice this codebase
+        # keeps deleting.
+        fix = ("Re-run without ship_from, or with different keywords"
+               if ship_from else "Try different or fewer keywords")
         return BROADENED_ROW_LIMIT, (
             f"Showing only {BROADENED_ROW_LIMIT} of {len(products)} rows: at "
             f"{share:.0%} keyword match these are a different product category, "
-            "not near misses. Re-run without ship_from, or with different "
-            "keywords, to get real results.")
+            f"not near misses. {fix} to get real results.")
     return requested, None
 
 
@@ -194,7 +201,7 @@ def search_products(
                     f"(AliExpress reports {total_results:,} results before filtering).")
         return f"No products found for '{query}'{suffix}."
 
-    limit, broad_note = _row_limit(products, query, max(1, min(int(max_results or 25), 60)))
+    limit, broad_note = _row_limit(products, query, max(1, min(int(max_results or 25), 60)), ship_from)
     if broad_note:
         notes = list(notes) + [broad_note]
     shown = min(len(products), limit)
@@ -273,7 +280,7 @@ def find_deals(
     # Say what is actually printed. The header claimed "Found 58 deal(s)" while the
     # body carried 25 — the same header-disagrees-with-body bug already fixed in
     # search_products, still living in its sibling.
-    limit, broad_note = _row_limit(deals, query, max(1, min(int(max_results or 25), 60)))
+    limit, broad_note = _row_limit(deals, query, max(1, min(int(max_results or 25), 60)), ship_from)
     if broad_note:
         notes = list(notes) + [broad_note]
     shown = min(len(deals), limit)

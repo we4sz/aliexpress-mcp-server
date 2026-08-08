@@ -2448,5 +2448,263 @@ class TestUnparseablePayloadIsNotRetried(unittest.TestCase):
         self.assertEqual(notes, [note])   # once, not once per rung
 
 
+def _choice_resp(biz, *, merge_choice=None):
+    """A PDP response carrying both halves of the Choice/freight question."""
+    resp = _ship_resp(biz)
+    res = resp["data"]["result"]
+    if merge_choice is not None:
+        res["GLOBAL_DATA"] = {"globalData": {"productTagInfo": {"mergeChoice": merge_choice}}}
+    return resp
+
+
+# The two live shapes, copied field-for-field from captured PDPs (Aug 2026).
+_POOLED_BIZ = {"shipToCode": "SE", "displayAmount": 18.68, "shippingFee": "charge",
+               "choiceFreeShipping": "yes", "logisticsComposeThreshold": "100,00kr",
+               "deliveryOptionCode": "CAINIAO_FULFILLMENT_STD_SG",
+               "shipFromCode": "CN", "deliveryDayMin": 12, "deliveryDayMax": 18}
+_PER_LINE_BIZ = {"shipToCode": "SE", "displayAmount": 22.61, "shippingFee": "charge",
+                 "deliveryOptionCode": "CAINIAO_FULFILLMENT_STD_SG",
+                 "shipFromCode": "CN", "deliveryDayMin": 12, "deliveryDayMax": 18}
+
+
+class TestFreightRegime(unittest.TestCase):
+    """
+    18.68 SEK pooled across an order and 154.29 SEK on one line are both
+    "displayAmount", and reading the first as the second is what reversed three
+    purchases. `choiceFreeShipping` is the only field that separates them.
+    """
+
+    def _fields(self, resp):
+        return catalog._extract_pdp_fields(resp, "1005000000000")
+
+    def test_the_pooled_fee_is_recognised(self):
+        d = self._fields(_choice_resp(_POOLED_BIZ, merge_choice=True))
+        self.assertEqual(d["freight_kind"], catalog.FREIGHT_POOLED)
+        self.assertIs(d["choice_free_shipping"], True)
+        self.assertEqual(d["shipping_cost"], 18.68)
+        self.assertEqual(d["free_shipping_over"], "100,00kr")
+
+    def test_a_choice_listing_without_the_flag_pays_per_line(self):
+        """
+        Item 1005006579547770, the KINGBO flux: Choice tag, no choiceFreeShipping,
+        22.61 SEK freight on the PDP and 22.61 SEK charged at checkout.
+        """
+        d = self._fields(_choice_resp(_PER_LINE_BIZ, merge_choice=True))
+        self.assertEqual(d["freight_kind"], catalog.FREIGHT_PER_LINE)
+        self.assertIs(d["is_choice"], True)
+        self.assertIs(d["choice_free_shipping"], False)
+        self.assertIsNone(d["free_shipping_over"])
+
+    def test_a_non_choice_listing_with_the_flag_is_still_pooled(self):
+        """Item 1005007129679040, an FR warehouse: the flag outranks the tag."""
+        d = self._fields(_choice_resp(_POOLED_BIZ, merge_choice=False))
+        self.assertIs(d["is_choice"], False)
+        self.assertEqual(d["freight_kind"], catalog.FREIGHT_POOLED)
+
+    def test_the_same_delivery_option_code_spans_both_regimes(self):
+        """CAINIAO_FULFILLMENT_STD_SG appeared on both KINGBO listings, so the
+        courier code cannot be used as a shortcut for the flag."""
+        self.assertEqual(_POOLED_BIZ["deliveryOptionCode"],
+                         _PER_LINE_BIZ["deliveryOptionCode"])
+        pooled = self._fields(_choice_resp(_POOLED_BIZ))
+        per_line = self._fields(_choice_resp(_PER_LINE_BIZ))
+        self.assertNotEqual(pooled["freight_kind"], per_line["freight_kind"])
+
+    def test_free_is_its_own_regime(self):
+        d = self._fields(_choice_resp({"shipToCode": "SE", "shippingFee": "free"}))
+        self.assertEqual(d["freight_kind"], catalog.FREIGHT_FREE)
+        self.assertEqual(catalog.shipping_line(d), "Shipping: Free")
+
+    def test_a_discarded_quote_carries_no_regime(self):
+        """A wrong-destination quote is thrown away; its regime must go with it."""
+        biz = dict(_POOLED_BIZ, shipToCode="US")
+        d = self._fields(_choice_resp(biz))
+        self.assertIsNone(d["freight_kind"])
+        self.assertIsNone(d["shipping_cost"])
+        self.assertIsNone(d["free_shipping_over"])
+
+    def test_no_shipping_block_leaves_the_regime_unknown(self):
+        d = self._fields(_ship_resp(shipping=False))
+        self.assertIsNone(d["freight_kind"])
+        self.assertIsNone(d["choice_free_shipping"])
+
+
+class TestFreightWording(unittest.TestCase):
+    """The number was right and the sentence around it was what misled."""
+
+    def _fields(self, resp):
+        return catalog._extract_pdp_fields(resp, "1005000000000")
+
+    def test_the_pooled_fee_never_reads_as_this_item_s_freight(self):
+        line = catalog.shipping_line(self._fields(_choice_resp(_POOLED_BIZ)))
+        self.assertIn("18.68", line)
+        self.assertIn("not for this item", line)
+        self.assertIn("100,00kr", line)
+
+    def test_a_per_line_freight_says_it_is_additive(self):
+        line = catalog.shipping_line(self._fields(_choice_resp(_PER_LINE_BIZ)))
+        self.assertIn("22.61", line)
+        self.assertIn("per line", line)
+        self.assertNotIn("Choice", line)
+
+    def test_the_threshold_is_never_printed_beside_a_per_line_freight(self):
+        """"Free shipping on orders over 100,00kr" under a 154.29 SEK line was
+        the reported shape; the threshold only exists on pooled listings now."""
+        d = self._fields(_choice_resp(_PER_LINE_BIZ))
+        self.assertIsNone(d["free_shipping_over"])
+
+    def test_choice_line_splits_the_tag_from_the_shipping(self):
+        tagged_pooled = catalog.choice_line(
+            self._fields(_choice_resp(_POOLED_BIZ, merge_choice=True)))
+        tagged_per_line = catalog.choice_line(
+            self._fields(_choice_resp(_PER_LINE_BIZ, merge_choice=True)))
+        self.assertIn("Choice: yes", tagged_pooled)
+        self.assertIn("Choice: yes", tagged_per_line)
+        self.assertIn("not a shipping promise", tagged_per_line)
+
+    def test_choice_line_claims_nothing_when_nothing_is_known(self):
+        self.assertIsNone(catalog.choice_line(self._fields(_ship_resp(result=False))))
+
+    def test_choice_line_does_not_invent_freight_terms(self):
+        """Tag known, quote missing: say so rather than assume per-line."""
+        resp = _ship_resp(shipping=False)
+        resp["data"]["result"]["GLOBAL_DATA"] = {
+            "globalData": {"productTagInfo": {"mergeChoice": False}}}
+        line = catalog.choice_line(self._fields(resp))
+        self.assertIn("Choice: no", line)
+        self.assertIn("unknown", line)
+
+
+class TestSearchCountHeader(unittest.TestCase):
+    """
+    "Showing 25 of 57 parsed (42 total)" was read as a bug. Live: 7 keyword
+    matches against a 60-card grid, and 53 against another — AliExpress tops a
+    short result set up toward pageSize with related listings.
+    """
+
+    def test_a_padded_page_explains_itself(self):
+        head = catalog.search_count_header(25, 57, 42)
+        self.assertIn("57", head)
+        self.assertIn("42", head)
+        self.assertIn("15 of the rows below are not matches", head)
+
+    def test_an_ordinary_page_stays_short(self):
+        self.assertEqual(catalog.search_count_header(25, 60, 407),
+                         "Showing 25 of 60 listings (407 keyword matches in total)")
+
+    def test_no_total_invents_none(self):
+        self.assertEqual(catalog.search_count_header(2, 2, None), "Showing 2 of 2 listings")
+
+    def test_singular(self):
+        self.assertIn("of 1 listing (", catalog.search_count_header(1, 1, 3))
+
+
+class TestTotalReconciliation(unittest.TestCase):
+    """
+    On a `finished: true` page `totalResults` is sometimes the page-size
+    placeholder: 60 against 2 cards, 60 against 52, 50 against 26 (live Aug 2026).
+    """
+
+    ROWS = [{"title": "usb c cable", "ship_from": "CN"} for _ in range(2)]
+
+    def test_the_placeholder_is_dropped(self):
+        self.assertIsNone(catalog._reconcile_total(
+            self.ROWS, 60, {"finished": True, "page_size": 60}))
+
+    def test_a_real_count_survives_on_an_unfinished_page(self):
+        self.assertEqual(catalog._reconcile_total(
+            self.ROWS, 3071, {"finished": False, "page_size": 60}), 3071)
+
+    def test_a_count_below_the_card_count_survives(self):
+        """The padding case: 7 really is how many matched, and must be printed."""
+        rows = [{"title": "x"} for _ in range(60)]
+        self.assertEqual(catalog._reconcile_total(
+            rows, 7, {"finished": True, "page_size": 60}), 7)
+
+    def test_an_empty_grid_keeps_its_number(self):
+        """It is the only evidence that an empty parse is a render failure."""
+        self.assertEqual(catalog._reconcile_total(
+            [], 60, {"finished": True, "page_size": 60}), 60)
+
+    def test_no_page_info_changes_nothing(self):
+        self.assertEqual(catalog._reconcile_total(self.ROWS, 60, None), 60)
+
+    def test_padding_is_only_claimed_on_a_finished_page(self):
+        rows = [{"title": "x"} for _ in range(60)]
+        self.assertTrue(catalog._padded_page(rows, 7, {"finished": True}))
+        self.assertFalse(catalog._padded_page(rows, 7, {"finished": False}))
+        self.assertFalse(catalog._padded_page(rows, 90, {"finished": True}))
+        self.assertFalse(catalog._padded_page(rows, 7, None))
+
+
+class TestBroadeningWithoutAWarehouseFilter(unittest.TestCase):
+    """
+    The reported gap: "solder wire holder multiple spool axle rack" returned
+    mechanical keyboard switches, Akko keycaps and pipe fittings at 3% match with
+    no ship_from set, and the detector never ran because it sat behind
+    `if not wanted: return`.
+    """
+
+    QUERY = "solder wire holder multiple spool axle rack"
+    JUNK = [{"title": t} for t in [
+        "Akko Keycaps Set PBT Double Shot Cherry Profile 158 Keys",
+        "Gateron Mechanical Keyboard Switch 5 Pin Linear Silent",
+        "Brass Pipe Fitting 1/2 Inch Male Thread Connector Adapter",
+    ]]
+
+    def test_it_fires_with_no_filter_at_all(self):
+        _k, _t, notes = catalog._finish_search(self.JUNK, 3071, self.QUERY, [])
+        self.assertTrue(any("broadened" in n for n in notes))
+
+    def test_it_does_not_tell_you_to_drop_a_filter_you_never_set(self):
+        _k, _t, notes = catalog._finish_search(self.JUNK, 3071, self.QUERY, [])
+        self.assertTrue(all("re-run without ship_from" not in n for n in notes))
+
+    def test_the_filtered_wording_is_kept_when_there_is_a_filter(self):
+        rows = [dict(r, ship_from="PL") for r in self.JUNK]
+        _k, _t, notes = catalog._finish_search(rows, 3071, self.QUERY, ["PL"])
+        self.assertTrue(any("without ship_from" in n for n in notes))
+
+    def test_padding_is_diagnosed_as_padding_not_as_a_rewritten_query(self):
+        _k, _t, notes = catalog._finish_search(
+            self.JUNK, 2, self.QUERY, [], {"finished": True, "page_size": 60})
+        self.assertTrue(any("padding" in n for n in notes))
+        self.assertTrue(all("different or fewer keywords" not in n for n in notes))
+
+    def test_a_relevant_set_says_nothing(self):
+        rows = [{"title": "solder wire holder spool axle rack multiple reel stand"}]
+        _k, _t, notes = catalog._finish_search(rows, 100, self.QUERY, [])
+        self.assertEqual(notes, [])
+
+
+class TestSearchPageInfo(unittest.TestCase):
+    """`pageInfo` drives the count reconciliation, so a missing one must be silent."""
+
+    def _html(self, page_info):
+        return ('<script>window._dida_config_._init_data_ = { data: '
+                + json.dumps({"data": {"root": {"fields": {"pageInfo": page_info}}}})
+                + ' };</script>\n')
+
+    def test_it_reads_the_four_fields(self):
+        info = scrape.search_page_info(self._html(
+            {"totalResults": 7, "pageSize": 60, "finished": True,
+             "searchResultType": "normal_result"}))
+        self.assertEqual(info, {"total": 7, "page_size": 60, "finished": True,
+                                "result_type": "normal_result"})
+
+    def test_no_payload_is_all_unknown(self):
+        self.assertEqual(scrape.search_page_info("<html></html>"),
+                         {"total": None, "page_size": None,
+                          "finished": None, "result_type": None})
+
+    def test_junk_values_do_not_become_facts(self):
+        info = scrape.search_page_info(self._html(
+            {"totalResults": "many", "pageSize": None, "finished": "yes",
+             "searchResultType": "  "}))
+        self.assertEqual(info, {"total": None, "page_size": None,
+                                "finished": None, "result_type": None})
+
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

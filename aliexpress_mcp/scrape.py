@@ -325,6 +325,64 @@ def _extract_search_items(html: str) -> list[dict]:
     return _walk_for_items(_search_init_data(html))
 
 
+def search_page_info(html: str) -> dict:
+    """
+    The search page's own description of its result set, from `pageInfo`.
+
+    Keys: total (int|None), page_size (int|None), finished (bool|None),
+    result_type (str|None). All None when the SSR payload is missing, which is a
+    statement about the response, not about the query.
+
+    `finished` is the load-bearing one and is why this exists at all. It means
+    "this page IS the whole result set", and on such a page `totalResults` stops
+    being the number of rows the grid was drawn from — measured live Aug 2026:
+
+      finished=false (a full result set, grid always 60 cards)
+        "esp32 wroom 38 pin devkit v1 usb c type c development board"   927
+        "solder wire holder multiple spool axle rack"                 3,071
+        …plus 90 / 139 / 407 / 3,000 on other queries. Plausible counts.
+
+      finished=true, totalResults BELOW the card count
+        "brass spool axle rack solder wire stand double reel holder bench"
+            totalResults 7   grid 60
+        "kingbo rma 218 flux syringe 10cc no clean bga reballing paste original"
+            totalResults 53  grid 60
+        AliExpress fills the grid toward `pageSize` with related listings once
+        the keyword hits run out. The padding is NOT the sponsored rows: the
+        first query carried 16 sponsored cards against 53 padding rows.
+
+      finished=true, totalResults ABOVE the card count and suspiciously round
+        "E15A metal solder wire holder tin reel dispenser double layer axle"
+            few_result,    totalResults 60 (== pageSize), 2 cards
+        "ds18b20 waterproof temperature sensor" + shipFromCountry=PL
+            normal_result, totalResults 60 (== pageSize), 52 cards
+        "usb c cable braided 1m" + shipFromCountry=PL
+            few_result,    totalResults 50, 26 cards
+
+    So on a finished page the figure may run in either direction, and catalog.py
+    decides what to do about that — this function only reports what was said.
+    """
+    info: dict[str, Any] = {"total": None, "page_size": None,
+                            "finished": None, "result_type": None}
+    data = _search_init_data(html)
+    if not isinstance(data, dict):
+        return info
+    fields = ((data.get("data") or {}).get("root") or {}).get("fields")
+    pi = fields.get("pageInfo") if isinstance(fields, dict) else None
+    if not isinstance(pi, dict):
+        return info
+    for key, src in (("total", "totalResults"), ("page_size", "pageSize")):
+        v = pi.get(src)
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            info[key] = int(v)
+    if isinstance(pi.get("finished"), bool):
+        info["finished"] = pi["finished"]
+    rt = pi.get("searchResultType")
+    if isinstance(rt, str) and rt.strip():
+        info["result_type"] = rt.strip()
+    return info
+
+
 # report item #3: catalog.py's SEARCH_RENDER_ATTEMPTS retry loop treats "no
 # items parsed, total_results > 0" as one fact — "AliExpress rendered the page
 # without its grid" — and retries against that single diagnosis. That is why
