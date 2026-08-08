@@ -1138,6 +1138,42 @@ def _fetch_pdp_mtop(item_id: str) -> Optional[dict]:
     return None
 
 
+def _pdp_error_code(mtop_resp: dict) -> Optional[str]:
+    """
+    Detect the PDP "this listing isn't available here" response.
+
+    A delisted / banned / region-blocked / nonexistent item still answers
+    `SUCCESS::调用成功`, so `ret_problem` passes it. What actually changes is the
+    payload: `data.result` collapses to GLOBAL_DATA alone, carrying
+    `globalData.errorCode` (e.g. "SITEM_NOT_EXIST") and boilerplate i18n, with no
+    PRICE / PRODUCT_TITLE / SHIPPING. Unchecked, the PDP tools fell through to the
+    HTML scrape and emitted a plausible shell — title "# Aliexpress" and
+    "Shipping: not available (AliExpress needs a saved delivery address)", which
+    reads as a fixable config problem rather than a dead listing.
+
+    (There is no `bigBossBan` field in this API version, and `errorCode` is absent
+    on healthy items — those carry `itemStatus`/`offlineInfo` instead. Verified
+    against live responses Aug 2026.)
+    """
+    result = (mtop_resp.get("data") or {}).get("result")
+    if not isinstance(result, dict):
+        return None
+    gd = result.get("GLOBAL_DATA")
+    gd = gd.get("globalData") if isinstance(gd, dict) else None
+    code = gd.get("errorCode") if isinstance(gd, dict) else None
+    return str(code) if code else None
+
+
+def _pdp_unavailable_msg(item_id: str, code: str) -> str:
+    """One wording for the dead-listing answer, shared by every PDP tool."""
+    return (
+        f"Item {item_id} is unavailable in {COUNTRY} (AliExpress returned {code}). "
+        "It may be delisted, blocked for this region, or the id may be wrong — "
+        "there is no price, shipping, or seller data to report. "
+        "Check the item URL, or search for the product again."
+    )
+
+
 def _extract_pdp_fields(mtop_resp: dict, item_id: str) -> dict:
     """
     Pull fields we care about from an MTOP PDP response.
@@ -1163,6 +1199,7 @@ def _extract_pdp_fields(mtop_resp: dict, item_id: str) -> dict:
         "seller_positive_rate": None,
         "seller_total_reviews": None,
         "shipping_cost": None,
+        "free_shipping_over": None,
         "shipping_estimate": None,
         "ship_from": None,
         "ship_from_code": None,
@@ -1310,9 +1347,16 @@ def _extract_pdp_fields(mtop_resp: dict, item_id: str) -> dict:
                     d["shipping_cost"] = float(amt)
                 except (TypeError, ValueError):
                     d["shipping_cost"] = parse_price(str(amt))
-            if d["shipping_cost"] is None and biz.get("logisticsComposeThreshold"):
-                # e.g., "C$0.00" — sometimes the "threshold" is actually the freight text
-                d["shipping_cost"] = parse_price(biz["logisticsComposeThreshold"])
+            # `logisticsComposeThreshold` is the FREE-SHIPPING THRESHOLD, never the
+            # freight price: it is a flat per-site figure ("100,00kr" on every SE
+            # listing, "C$10.00" on every CA one) sitting right next to a real
+            # freight of 18,68kr / C$3.08, and it is absent on listings whose
+            # freight is unusual. It used to be assigned to `shipping_cost`, which
+            # would print "Shipping: 100.00 SEK" for an item that ships for 18.68.
+            # Keep it, but only ever as what it is. Verified live Aug 2026.
+            thresh = biz.get("logisticsComposeThreshold")
+            if thresh:
+                d["free_shipping_over"] = _strip_html(thresh) or str(thresh)
             eta_min = biz.get("displayEtaMinDate")
             eta_max = biz.get("displayEtaMaxDate")
             if eta_min and eta_max:
@@ -1374,6 +1418,9 @@ def get_product_details(item_id: str = "", url: str = "") -> str:
     try:
         resp = _fetch_pdp_mtop(item_id)
         if resp:
+            err = _pdp_error_code(resp)
+            if err:
+                return _pdp_unavailable_msg(item_id, err)
             d = _extract_pdp_fields(resp, item_id)
     except Exception as e:
         logger.warning("MTOP PDP fetch failed: %s", e)
@@ -1444,6 +1491,10 @@ def get_product_details(item_id: str = "", url: str = "") -> str:
         lines.append("Shipping: " + ("Free" if d["shipping_cost"] == 0 else _fmt_money(d["shipping_cost"], cur)))
     else:
         lines.append("Shipping: not available (AliExpress needs a saved delivery address to quote it)")
+    # Printed verbatim as AliExpress formatted it — it is an order-level threshold,
+    # not this item's freight, so it must never read as the shipping cost.
+    if d.get("free_shipping_over"):
+        lines.append(f"  Free shipping on orders over {d['free_shipping_over']}")
     if d.get("shipping_estimate"):
         eta_line = f"Estimated delivery: {d['shipping_estimate']}"
         if d.get("ship_days_min") and d.get("ship_days_max"):
@@ -1496,6 +1547,10 @@ def get_shipping_estimate(item_id: str = "", url: str = "") -> str:
             "no usable response. Try re-saving AliExpress credentials."
         )
 
+    err = _pdp_error_code(resp)
+    if err:
+        return _pdp_unavailable_msg(item_id, err)
+
     d = _extract_pdp_fields(resp, item_id)
     if d.get("shipping_cost") is None and not d.get("shipping_estimate"):
         if d.get("ship_unreachable"):
@@ -1512,6 +1567,8 @@ def get_shipping_estimate(item_id: str = "", url: str = "") -> str:
     lines = [f"Shipping to {COUNTRY} for item {item_id}:"]
     if d.get("shipping_cost") is not None:
         lines.append("  Cost: " + ("Free" if d["shipping_cost"] == 0 else _fmt_money(d["shipping_cost"], d.get("currency"))))
+    if d.get("free_shipping_over"):
+        lines.append(f"  Free shipping on orders over {d['free_shipping_over']}")
     if d.get("shipping_estimate"):
         lines.append(f"  Estimated delivery: {d['shipping_estimate']}")
     if d.get("ship_from"):
@@ -1750,6 +1807,10 @@ def get_seller(item_id: str = "", url: str = "") -> str:
             f"Could not fetch seller info for item {item_id} — MTOP returned no data. "
             "Try re-saving AliExpress credentials."
         )
+
+    err = _pdp_error_code(resp)
+    if err:
+        return _pdp_unavailable_msg(item_id, err)
 
     shop = resp.get("data", {}).get("result", {}).get("SHOP_CARD_PC", {})
     d = _extract_seller(shop)
@@ -2107,6 +2168,10 @@ def get_variants(item_id: str = "", url: str = "") -> str:
             "Try re-saving AliExpress credentials."
         )
 
+    err = _pdp_error_code(resp)
+    if err:
+        return _pdp_unavailable_msg(item_id, err)
+
     variants = _extract_variants(resp.get("data", {}).get("result", {}))
     if not variants:
         return f"No variant/SKU data for item {item_id} (likely a single-configuration listing)."
@@ -2317,6 +2382,75 @@ def _extract_cart_droplet(resp: dict) -> dict:
     result["count"] = len(result["items"]) or None
     result["currency"] = next((i.get("currency") for i in result["items"] if i.get("currency")), None)
     return result
+
+
+def _extract_cart_summary(resp: dict) -> dict:
+    """
+    Pull the cart's own totals out of the droplet render's summary component.
+
+    These are the ONLY totals denominated in the session's pay currency. The
+    legacy `platformType=DESKTOP` render ignores `_currency`/`shipToCountry` and
+    always answers in USD, so merging its subtotal/total into the droplet result
+    printed a USD number under the droplet's SEK label — a 67.63 USD estimate
+    rendered as "67.63 SEK" against a cart whose real total was 1 366,66kr.
+
+    Every amount here is a string AliExpress already formatted in the pay
+    currency ("1 366,66kr", "- 1 021,35kr", "Free", "VAT included"). We pass them
+    through verbatim rather than parsing to float and re-formatting, so a figure
+    can never be relabelled into a currency it wasn't denominated in.
+
+    Shape (live Aug 2026), block id `app_cart_summary_component_summary`:
+        fields.payCurrencyCode                          "SEK"
+        fields.summaryTabVO.priceBlockList[0]
+            .summaryLines[]  {type, title.title, content.content}
+            .selectItemNum                              20
+        fields.totalSummaryLines[]                      (same row shape, fallback)
+    """
+    out: dict[str, Any] = {"currency": None, "lines": [], "selected_count": None}
+
+    for bid, block in blocks(resp).items():
+        if "summary" not in bid.lower() or not isinstance(block, dict):
+            continue
+        f = block.get("fields")
+        if not isinstance(f, dict):
+            continue
+        out["currency"] = f.get("payCurrencyCode") or out["currency"]
+
+        # priceBlockList[0] is the itemised breakdown (items total, discounts,
+        # shipping, tax, estimated total); totalSummaryLines is the two-line
+        # summary shown on the button. Prefer the breakdown, fall back to the
+        # short form if the shape changes.
+        rows: list = []
+        tab = f.get("summaryTabVO")
+        if isinstance(tab, dict):
+            pbl = tab.get("priceBlockList")
+            if isinstance(pbl, list) and pbl and isinstance(pbl[0], dict):
+                pb = pbl[0]
+                if isinstance(pb.get("selectItemNum"), int):
+                    out["selected_count"] = pb["selectItemNum"]
+                if isinstance(pb.get("summaryLines"), list):
+                    rows = pb["summaryLines"]
+        if not rows and isinstance(f.get("totalSummaryLines"), list):
+            rows = f["totalSummaryLines"]
+
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            content = row.get("content")
+            text = content.get("content") if isinstance(content, dict) else None
+            if not text:
+                continue
+            title = row.get("title")
+            label = title.get("title") if isinstance(title, dict) else None
+            out["lines"].append({
+                "type": row.get("type"),
+                "label": _strip_html(label) if label else None,
+                "text": _strip_html(text) or str(text),
+            })
+        if out["lines"]:
+            break
+
+    return out
 
 
 CART_PAGINATION_COMPONENT = "app_cart_pagination_container_page"
@@ -3041,6 +3175,8 @@ def view_cart() -> str:
 
     legacy_cart = _extract_cart(resp)
     page_warning = None
+    summary: dict[str, Any] = {}
+    used_droplet = False
 
     # The legacy render only ever returns page 1. Re-render in the droplet shape,
     # which is the only one carrying pagination, and walk the rest. Fall back to
@@ -3059,11 +3195,16 @@ def view_cart() -> str:
             droplet, page_warning = _cart_fetch_all_pages(cookies, droplet)
             paged = _extract_cart_droplet(droplet)
             if len(paged["items"]) > len(legacy_cart["items"]):
+                # Item prices below now come from the droplet (pay currency). The
+                # legacy render's subtotal/shipping/total are USD no matter what
+                # `_currency` says, so they are NOT carried over — printing them
+                # under this cart's currency label is exactly the bug. The server
+                # item count is the one legacy figure that is currency-free and
+                # still the more complete of the two.
                 paged["count"] = legacy_cart.get("count") or paged.get("count")
-                for key in ("subtotal", "shipping_fee", "total"):
-                    paged[key] = legacy_cart.get(key)
-                paged["currency"] = paged.get("currency") or legacy_cart.get("currency")
                 legacy_cart = paged
+                used_droplet = True
+            summary = _extract_cart_summary(droplet)
     except Exception as e:
         logger.info("cart pagination unavailable, using first page only: %s", e)
         page_warning = f"pagination failed ({e})"
@@ -3084,7 +3225,7 @@ def view_cart() -> str:
             "The cart-line block shape may have changed."
         )
 
-    currency = cart.get("currency") or CURRENCY
+    currency = cart.get("currency") or (summary.get("currency") if used_droplet else None) or CURRENCY
     n = len(items)
 
     # Honest header. AliExpress paginates the cart (append / infinite-scroll behind
@@ -3138,7 +3279,14 @@ def view_cart() -> str:
                 line += f"\n      delivery: {it['delivery_date']}"
             if not it.get("valid", True):
                 line += f"\n      ⚠️ unavailable — {it.get('unavailable_reason') or 'sold out or removed'}"
+            # cart_id identifies the LINE, item_id only the product — the same
+            # product sits on several lines whenever it's in the cart under more
+            # than one variant, and set_cart_quantity / remove_from_cart refuse to
+            # act on an ambiguous item_id. Their docstrings promise this value
+            # comes "from view_cart", so it has to actually be here.
             line += f"\n      item_id: {it['item_id']}"
+            if it.get("cart_id"):
+                line += f"  ·  cart_id: {it['cart_id']}"
             lines.append(line)
         lines.append("")
 
@@ -3151,7 +3299,27 @@ def view_cart() -> str:
         shown_subtotal = round(sum(p * q for p, q in priced), 2)
         scope = f"{n} shown items" if truncated else "all items shown"
         lines.append(f"Subtotal ({scope}): {_fmt_money(shown_subtotal, currency)}")
-    if cart.get("total") is not None:
+    # AliExpress's own totals. On the droplet path they come from that response's
+    # summary component, already formatted in its pay currency, and are printed
+    # verbatim — never re-formatted under a label from somewhere else. On the
+    # legacy-only fallback path the legacy totals are printed with the legacy
+    # cart's own currency, which is self-consistent because the item prices above
+    # came from that same response.
+    if used_droplet:
+        if summary.get("lines"):
+            sel = summary.get("selected_count")
+            scope = (f"{sel} selected line(s)" if isinstance(sel, int)
+                     else "selected items only")
+            lines.append(f"AliExpress checkout estimate ({scope}):")
+            for row in summary["lines"]:
+                label = row.get("label")
+                lines.append(f"  {label}: {row['text']}" if label else f"  {row['text']}")
+        else:
+            lines.append(
+                "AliExpress checkout estimate: unavailable "
+                "(the cart summary block was missing from the response)."
+            )
+    elif cart.get("total") is not None:
         lines.append(
             f"AliExpress checkout estimate (selected items only): {_fmt_money(cart['total'], currency)}"
         )
@@ -3476,6 +3644,20 @@ WISHLIST_API = "mtop.ae.wishlist.allItems.render"
 # Wishlist *groups* ("lists") are managed by a different API, at v2.0, which takes
 # the group as a JSON string in `groupListString` rather than as an object.
 WISHLIST_GROUP_API = "mtop.aliexpress.wishlist.group.update"
+# Enumerating the lists is a *different* endpoint from reading their contents:
+# `allItems.render` returns saved products and never names the groups, while this
+# one returns the groups and never returns their products.
+WISHLIST_GROUPS_API = "mtop.ae.wishlist.myList.render"
+# Adds AND removes in one call: `addedItemIdStr` / `deletedItemIdStr` are JSON
+# *strings*, and `currentGroupId` targets the list directly — so saving straight
+# into a chosen list is one request, not save-then-move as the website does it.
+WISHLIST_SAVE_API = "mtop.ae.wishlist.myList.saveItem"
+# The ♡ itself. Saves a product into the wishlist (ungrouped); assigning it to a
+# named list is the separate myList.saveItem call above.
+WISHLIST_FAVOURITE_API = "mtop.aliexpress.wishlist.wishitem.save"
+# The group list paginates at 6 per page, independently of the item pagination.
+WISHLIST_GROUPS_PAGE_SIZE = 6
+WISHLIST_GROUPS_MAX_PAGES = 10
 _ITEM_URL_RE = re.compile(r"/item/(\d+)\.html")
 
 
@@ -3549,6 +3731,361 @@ def _extract_wishlist(resp: dict, max_items: int) -> dict:
         })
 
     return {"items": items[:max_items], "total": glob.get("itemTotalCount"), "has_more": has_more}
+
+
+def _fetch_wishlist_groups(cookies: dict) -> tuple[list[dict], Optional[str]]:
+    """
+    Enumerate the account's wishlists (groups).
+
+    Separate endpoint from the saved-items one: `allItems.render` returns products
+    and never names the groups; this returns groups and never their products.
+    Groups paginate at 6, independently of item pagination.
+
+    Returns (groups, error).
+    """
+    groups: list[dict] = []
+    for page in range(1, WISHLIST_GROUPS_MAX_PAGES + 1):
+        try:
+            resp = mtop_call(
+                WISHLIST_GROUPS_API, "1.0",
+                {"pageIndex": page, "locale": "en_US", "shipToCountry": COUNTRY,
+                 "deviceType": "PC", "_lang": LANG, "_currency": CURRENCY},
+                cookies=cookies, referer=f"{BASE_URL}/p/wish-manage/index.html",
+            )
+        except Exception as e:
+            return groups, f"Wishlist group call failed: {e}"
+
+        data = (resp.get("data") or {}).get("data") or {}
+        if not (resp.get("data") or {}).get("succeed", True):
+            return groups, f"AliExpress rejected the wishlist group request: {(resp.get('ret') or ['?'])[0]}"
+
+        before = len(groups)
+        for bid, block in (data.get("data") or {}).items():
+            if not bid.startswith("wln_group_container_"):
+                continue
+            f = block.get("fields") or {}
+            if f.get("groupId") is None:
+                continue
+            groups.append({
+                "group_id": str(f["groupId"]),
+                "name": f.get("name") or "(unnamed)",
+                "item_count": f.get("itemCount"),
+                # publishType "N" = private. `spreadId` is a share handle for a
+                # private list — deliberately not surfaced.
+                "public": f.get("publishType") == "Y",
+            })
+        paging = next((v.get("fields") for k, v in (data.get("data") or {}).items()
+                       if k.startswith("wln_paging")), {}) or {}
+        if len(groups) <= before or not paging.get("hasMore"):
+            return groups, None
+
+    return groups, f"stopped after {WISHLIST_GROUPS_MAX_PAGES} pages of lists"
+
+
+def _resolve_wishlist_group(cookies: dict, wishlist: str):
+    """
+    Turn a list name or id into exactly one group. Returns (group, error).
+
+    Refuses to guess: an unknown or ambiguous name is an error, never a silent
+    fallback to the ungrouped default — items landing somewhere the user does not
+    look is worse than a failed call.
+    """
+    groups, err = _fetch_wishlist_groups(cookies)
+    if err and not groups:
+        return None, err
+    if not groups:
+        return None, ("You have no wishlists yet — create one with create_wishlist first.")
+
+    want = (wishlist or "").strip()
+    exact_id = [g for g in groups if g["group_id"] == want]
+    if exact_id:
+        return exact_id[0], None
+
+    matches = [g for g in groups if g["name"].casefold() == want.casefold()]
+    if not matches:
+        matches = [g for g in groups if want.casefold() in g["name"].casefold()]
+
+    if not matches:
+        listing = ", ".join(f"{g['name']!r}" for g in groups)
+        return None, f"No wishlist matches {want!r}. Your lists: {listing}."
+    if len(matches) > 1:
+        listing = "\n".join(f"  - {g['name']!r} (id {g['group_id']})" for g in matches)
+        return None, (f"{want!r} matches {len(matches)} lists — say which one "
+                      f"(name exactly, or the id):\n{listing}")
+    return matches[0], None
+
+
+def _wishlist_saved_item_ids(cookies: dict, group_id: str = "0") -> set[str]:
+    """Item ids already saved in the wishlist (group 0 = every saved item)."""
+    try:
+        resp = mtop_call(
+            WISHLIST_API, "1.0",
+            {"pageIndex": 1, "shipToCountry": COUNTRY, "locale": "en_US", "deviceType": "PC",
+             "_lang": LANG, "_currency": CURRENCY, "wishGroupId": int(group_id)},
+            cookies=cookies, referer=f"{BASE_URL}/p/wish-manage/index.html",
+        )
+    except Exception:
+        return set()
+    found: set[str] = set()
+    for bid, block in blocks({"data": (resp.get("data") or {}).get("data") or {}}).items():
+        if not bid.startswith("wln_page_product_"):
+            continue
+        base = ((block.get("fields") or {}).get("productBaseDTO") or {})
+        if base.get("itemId") is not None:
+            found.add(str(base["itemId"]))
+    return found
+
+
+def _wishlist_favourite(cookies: dict, item_id: str) -> str:
+    """Save a product into the wishlist (the ♡). Lands ungrouped; returns MTOP ret."""
+    _pace("cart_write", CART_WRITE_MIN_INTERVAL)
+    resp = mtop_call(
+        WISHLIST_FAVOURITE_API, "1.0",
+        {"platform": "pc", "itemType": "product", "itemId": str(item_id)},
+        cookies=cookies, referer=f"{BASE_URL}/item/{item_id}.html",
+    )
+    ret = (resp.get("ret") or ["?"])[0]
+    data = resp.get("data") or {}
+    if ret.startswith("SUCCESS") and data.get("succeed") is False:
+        return f"FAILED::{data.get('message') or 'server reported no success'}"
+    return ret
+
+
+def _wishlist_delete_item(cookies: dict, item_id: str) -> str:
+    """
+    Permanently delete a saved item from the wishlist.
+
+    Different mechanism from `saveItem`: this is an Ultron/droplet operation on
+    the *render* endpoint — echo the item's component back with
+    `fields.operationType = "DELETE_PRODUCT"`, alongside the render's own linkage
+    and hierarchy. `params` is a plain JSON string of nested OBJECTS here, unlike
+    the orders pager which nests JSON *strings*.
+
+    AliExpress distinguishes this from un-grouping: removing from a collection
+    keeps the item in the wishlist, deleting removes it everywhere. This is the
+    destructive one.
+    """
+    render = mtop_call(
+        WISHLIST_API, "1.0",
+        {"pageIndex": 1, "shipToCountry": COUNTRY, "locale": "en_US", "deviceType": "PC",
+         "_lang": LANG, "_currency": CURRENCY, "wishGroupId": 0},
+        cookies=cookies, referer=f"{BASE_URL}/p/wish-manage/index.html",
+    )
+    tree = (render.get("data") or {}).get("data") or {}
+    comp_id = f"wln_page_product_I_{item_id}"
+    component = (tree.get("data") or {}).get(comp_id)
+    if not component:
+        return "NOTFOUND::item is not in your wishlist"
+
+    operated = json.loads(json.dumps(component))
+    operated.setdefault("fields", {})["operationType"] = "DELETE_PRODUCT"
+
+    inner = {
+        "endpoint": tree.get("endpoint") or {},
+        "operator": comp_id,
+        "linkage": tree.get("linkage") or {},
+        "data": {comp_id: operated},
+        "hierarchy": tree.get("hierarchy") or {},
+    }
+    payload = {
+        "params": json.dumps(inner, separators=(",", ":"), ensure_ascii=False),
+        "pageIndex": 1, "locale": "en_US", "shipToCountry": COUNTRY,
+        "deviceType": "PC", "_lang": LANG, "_currency": CURRENCY, "wishGroupId": 0,
+    }
+    _pace("cart_write", CART_WRITE_MIN_INTERVAL)
+    resp = mtop_call(WISHLIST_API, "1.0", payload, cookies=cookies,
+                     referer=f"{BASE_URL}/p/wish-manage/index.html",
+                     extra_query={"needLogin": "true"})
+    ret = (resp.get("ret") or ["?"])[0]
+    if ret.startswith("SUCCESS") and not (resp.get("data") or {}).get("succeed", True):
+        return f"FAILED::{((resp.get('data') or {}).get('message')) or 'server reported no success'}"
+    return ret
+
+
+def _wishlist_save_item(cookies: dict, group_id: str, add: list[str], remove: list[str]) -> str:
+    """
+    Add and/or remove items in one list. Returns the MTOP `ret`.
+
+    Item id arrays go as JSON *strings*, not arrays — the same nested-string
+    encoding the cart and order protocols use.
+    """
+    payload = {
+        "addedItemIdStr": json.dumps([int(i) for i in add], separators=(",", ":")),
+        "deletedItemIdStr": json.dumps([int(i) for i in remove], separators=(",", ":")),
+        "currentGroupId": int(group_id),
+        "_lang": LANG,
+        "_currency": CURRENCY,
+    }
+    _pace("cart_write", CART_WRITE_MIN_INTERVAL)
+    resp = mtop_call(WISHLIST_SAVE_API, "1.0", payload, cookies=cookies,
+                     referer=f"{BASE_URL}/p/wish-manage/index.html")
+    ret = (resp.get("ret") or ["?"])[0]
+    # This API family reports ret=SUCCESS while failing in `data`, so the inner
+    # flag is the real verdict.
+    if ret.startswith("SUCCESS") and not (resp.get("data") or {}).get("succeed"):
+        return f"FAILED::{(resp.get('data') or {}).get('message') or 'server reported no success'}"
+    return ret
+
+
+@mcp.tool(
+    title="List Wishlists",
+    annotations=ToolAnnotations(
+        readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True
+    ),
+    structured_output=False,
+)
+def list_wishlists() -> str:
+    """
+    List the wishlists (saved-item collections) on your AliExpress account.
+
+    Returns each list's name, id and item count. Use this before add_to_wishlist
+    or remove_from_wishlist, which need a list to target. Note this is separate
+    from get_wishlist, which returns saved *items* rather than the lists.
+    """
+    cookies = load_cookies()
+    if not cookies:
+        return AUTH_EXPIRED_MSG
+
+    groups, err = _fetch_wishlist_groups(cookies)
+    if err and not groups:
+        return err
+    if not groups:
+        return "You have no wishlists. Create one with create_wishlist."
+
+    lines = [f"Wishlists ({len(groups)}):"]
+    for g in groups:
+        count = g["item_count"]
+        lines.append(f"  - {g['name']}"
+                     + (f" — {count} item(s)" if isinstance(count, int) else "")
+                     + ("  [public]" if g["public"] else "")
+                     + f"  [id: {g['group_id']}]")
+    if err:
+        lines.append(f"  ⚠ {err}")
+    return "\n".join(lines)
+
+
+@mcp.tool(
+    title="Add To Wishlist",
+    annotations=ToolAnnotations(
+        readOnlyHint=False, destructiveHint=False, idempotentHint=True,
+        openWorldHint=True
+    ),
+    structured_output=False,
+)
+def add_to_wishlist(wishlist: str, item_id: str = "", url: str = "") -> str:
+    """
+    Put an ALREADY-SAVED item into one of your wishlists. This WRITES.
+
+    IMPORTANT — this moves, it does not save. AliExpress's list API only assigns
+    items that are already in your wishlist to a list; it cannot pull in a product
+    you have not saved. Saving a new product is a separate action (the ♡ on the
+    product page) that this server does not yet implement, so for an unsaved item
+    this reports what is missing rather than silently doing nothing.
+
+    The list is required — there is no default. Items landing in the ungrouped
+    bucket is how they end up somewhere you never look, so an unknown or ambiguous
+    list name is an error rather than a guess.
+
+    Args:
+        wishlist: Which list to move it into — name (case-insensitive) or id.
+        item_id: AliExpress item ID (e.g. "1005007655628250").
+        url: Full or short AliExpress product URL (alternative to item_id).
+    """
+    item_id = _resolve_item_id(item_id, url)
+    if not item_id:
+        return "Provide a valid item_id or AliExpress product URL."
+    if not (wishlist or "").strip():
+        return "Provide the wishlist to save into (name or id) — run list_wishlists to see them."
+
+    cookies = load_cookies()
+    if not cookies:
+        return AUTH_EXPIRED_MSG
+
+    group, err = _resolve_wishlist_group(cookies, wishlist)
+    if err:
+        return err
+
+    # Two steps, because AliExpress separates them: `wishitem.save` puts the
+    # product in the wishlist (ungrouped), and only then can `myList.saveItem`
+    # file it under a list. Calling the second on an unsaved item returns SUCCESS
+    # and does nothing, so the order matters.
+    newly_saved = False
+    if str(item_id) not in _wishlist_saved_item_ids(cookies):
+        try:
+            fav = _wishlist_favourite(cookies, str(item_id))
+        except Exception as e:
+            return f"Could not save item {item_id} to your wishlist: {e}"
+        if not fav.startswith("SUCCESS"):
+            return f"Could not save item {item_id} to your wishlist — AliExpress said: {fav}"
+        newly_saved = True
+
+    try:
+        ret = _wishlist_save_item(cookies, group["group_id"], [item_id], [])
+    except Exception as e:
+        return f"Wishlist save failed: {e}"
+    if not ret.startswith("SUCCESS"):
+        return f"Could not save item {item_id} to {group['name']!r} — AliExpress said: {ret}"
+
+    # SUCCESS from this family has been observed on no-ops, so confirm by re-reading.
+    in_group = _wishlist_saved_item_ids(cookies, group["group_id"])
+    if str(item_id) not in in_group:
+        return (f"AliExpress reported success but item {item_id} is not in "
+                f"{group['name']!r}" + (" (it is saved to your wishlist, just ungrouped)."
+                                        if newly_saved else "."))
+    verb = "Saved" if newly_saved else "Moved"
+    return (f"{verb} item {item_id} to wishlist {group['name']!r} "
+            f"({len(in_group)} item(s) in that list).")
+
+
+@mcp.tool(
+    title="Remove From Wishlist",
+    annotations=ToolAnnotations(
+        readOnlyHint=False, destructiveHint=True, idempotentHint=True,
+        openWorldHint=True
+    ),
+    structured_output=False,
+)
+def remove_from_wishlist(item_id: str = "", url: str = "") -> str:
+    """
+    Permanently DELETE a saved item from your wishlist. This WRITES and CANNOT
+    be undone — the item is removed from every list and from the wishlist itself.
+
+    AliExpress separates two things this tool does NOT do: taking an item out of
+    one list while keeping it saved, and moving it between lists. Use
+    add_to_wishlist to file a saved item under a different list. This tool is the
+    permanent one, so it takes no list argument — it deletes the item outright.
+
+    Args:
+        item_id: AliExpress item ID to delete from the wishlist.
+        url: Full or short AliExpress product URL (alternative to item_id).
+    """
+    item_id = _resolve_item_id(item_id, url)
+    if not item_id:
+        return "Provide a valid item_id or AliExpress product URL."
+
+    cookies = load_cookies()
+    if not cookies:
+        return AUTH_EXPIRED_MSG
+
+    saved = _wishlist_saved_item_ids(cookies)
+    if saved and str(item_id) not in saved:
+        return f"Item {item_id} is not in your wishlist — nothing to delete."
+
+    try:
+        ret = _wishlist_delete_item(cookies, str(item_id))
+    except Exception as e:
+        return f"Wishlist deletion failed: {e}"
+    if ret.startswith("NOTFOUND"):
+        return f"Item {item_id} is not in your wishlist — nothing to delete."
+    if not ret.startswith("SUCCESS"):
+        return f"Could not delete item {item_id} — AliExpress said: {ret}"
+
+    # Destructive and this API family acks no-ops, so confirm against a fresh read.
+    after = _wishlist_saved_item_ids(cookies)
+    if str(item_id) in after:
+        return (f"AliExpress reported success but item {item_id} is still in your "
+                "wishlist — nothing was deleted.")
+    return f"Deleted item {item_id} from your wishlist ({len(after)} item(s) left)."
 
 
 @mcp.tool(
