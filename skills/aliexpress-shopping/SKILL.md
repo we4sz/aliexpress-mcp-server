@@ -28,8 +28,10 @@ path to checkout, pay, or cancel an order**, which is the reassurance a worried 
 actually wants; don't overstate it into "everything is read-only".
 
 Say what a write will do before doing it, and prefer the reversible form: taking an item
-out of one list (`remove_from_wishlist` *with* `wishlist`) keeps it saved, while omitting
-`wishlist` deletes it outright. Nothing here can be undone by the server.
+out of one list (`remove_from_wishlist` with `wishlist=`) keeps it saved, while
+`permanent=True` deletes it outright. A call with neither removes nothing and asks which
+you meant — that refusal is the tool working correctly, not an error to route around.
+Nothing here can be undone by the server.
 
 ## Pick the right tool
 
@@ -55,8 +57,8 @@ the exact table.
 | To change how many of a cart line — **write** | `set_cart_quantity(quantity, item_id \| url \| cart_id)` |
 | To take a line out of the cart — **destructive** | `remove_from_cart(item_id \| url \| cart_id)` |
 | To save an item into one of their lists — **write** | `add_to_wishlist(wishlist, item_id \| url)` |
-| To take an item out of one list, keeping it saved — **destructive** | `remove_from_wishlist(item_id \| url, wishlist)` |
-| To delete a saved item outright — **destructive, permanent** | `remove_from_wishlist(item_id \| url)` (no `wishlist`) |
+| To take an item out of one list, keeping it saved — **write** | `remove_from_wishlist(item_id \| url, wishlist)` |
+| To delete a saved item outright — **destructive, permanent** | `remove_from_wishlist(item_id \| url, permanent=True)` |
 | A new list to organise saves into — **write** | `create_wishlist(name, public)` |
 | To get rid of a list (its items survive, ungrouped) — **destructive** | `delete_wishlist(wishlist)` |
 

@@ -1721,23 +1721,30 @@ def add_to_wishlist(wishlist: str, item_id: str = "", url: str = "") -> str:
     ),
     structured_output=False,
 )
-def remove_from_wishlist(item_id: str = "", url: str = "", wishlist: str = "") -> str:
+def remove_from_wishlist(item_id: str = "", url: str = "", wishlist: str = "",
+                         permanent: bool = False) -> str:
     """
-    Remove a saved item from your wishlist. This WRITES.
+    Remove a saved item from a wishlist, or delete it outright. This WRITES.
 
-    `wishlist` decides how far the removal goes — the two are separate operations
-    on AliExpress, and the default is the permanent one:
+    AliExpress has two separate removals and this tool will not choose between
+    them for you — a bare call removes nothing and tells you the options:
 
-      wishlist omitted -> DELETES the item from your wishlist entirely, out of
-                          every list. Cannot be undone.
-      wishlist given   -> takes it out of THAT list only; the item stays saved
-                          (ungrouped) and can be re-filed with add_to_wishlist.
+      wishlist="My list" -> takes it out of THAT list only. The item stays saved
+                            (ungrouped) and can be re-filed with add_to_wishlist.
+      permanent=True     -> DELETES it from your wishlist entirely, out of every
+                            list. Cannot be undone.
+
+    The destructive form used to be what you got by simply omitting an argument,
+    which is the wrong way round: the irreversible action should be the one you
+    have to ask for.
 
     Args:
         item_id: AliExpress item ID to remove.
         url: Full or short AliExpress product URL (alternative to item_id).
-        wishlist: Optional list to remove it from — name (case-insensitive) or id.
-            Pass this to keep the item saved; omit it to delete outright.
+        wishlist: List to take it out of — name (case-insensitive) or id.
+            Keeps the item saved.
+        permanent: Set True to delete the item from the wishlist altogether.
+            Ignored when `wishlist` is given, since that is the scoped removal.
     """
     item_id = _resolve_item_id(item_id, url)
     if not item_id:
@@ -1750,6 +1757,25 @@ def remove_from_wishlist(item_id: str = "", url: str = "", wishlist: str = "") -
     saved = _wishlist_saved_item_ids(cookies)
     if saved and str(item_id) not in saved:
         return f"Item {item_id} is not in your wishlist — nothing to remove."
+
+    # Neither scope given: refuse rather than guess, and say where the item
+    # actually sits so the caller can name a list without a second lookup.
+    if not (wishlist or "").strip() and not permanent:
+        groups, _ = _fetch_wishlist_groups(cookies)
+        holding = [g for g in groups
+                   if str(item_id) in _wishlist_saved_item_ids(cookies, g["group_id"])]
+        where = (f"It is currently in {holding[0]['name']!r}." if len(holding) == 1
+                 else "It is saved but not filed under any list."
+                 if not holding else
+                 "It appears in: " + ", ".join(repr(g["name"]) for g in holding) + ".")
+        return (
+            f"Nothing removed — say which removal you mean for item {item_id}.\n"
+            f"{where}\n"
+            f"  • To take it out of a list but keep it saved: "
+            f"remove_from_wishlist(item_id={item_id!r}, wishlist='<list name>')\n"
+            f"  • To delete it from your wishlist entirely (cannot be undone): "
+            f"remove_from_wishlist(item_id={item_id!r}, permanent=True)"
+        )
 
     group = None
     if (wishlist or "").strip():
