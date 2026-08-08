@@ -6,3 +6,7 @@ __pycache__/
 _diag_*.py
 _diag_*.html
 _diag_*.json
+
+# golden captures hit a live account; the harness is tracked, the output isn't
+tests/golden/
+tests/golden-*/

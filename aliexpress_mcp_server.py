@@ -19,9 +19,10 @@ import threading
 import time
 import hashlib
 import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import quote_plus
+from urllib.parse import quote_plus, unquote
 
 import httpx
 from bs4 import BeautifulSoup
@@ -439,6 +440,51 @@ def _strip_html(text: Any) -> Optional[str]:
     return clean or None
 
 
+# AliExpress abbreviates high sales volumes — "100K+ sold", "5.7K+ sold", "1M+ sold"
+# — and on some listings says "sales" instead ("10,000+ sales ౹ 50,000+ cross-platform
+# sales"). A digits-only pattern therefore lost exactly the best-selling listings:
+# every one of the top hits for `usb c cable` sorted by orders reads "100K+ sold" and
+# matched nothing, so get_product_details printed no Sold line at all while
+# search_products (which reads a different field) printed "100K+ sold". Verified live
+# Aug 2026. The leading alternative must stay first so "10,000+ sales" wins over the
+# broader "cross-platform sales" figure later in the same string.
+_SOLD_RX = re.compile(r"(\d[\d,.]*)\s*([KM])?\+?\s*(?:sold|sales)\b", re.IGNORECASE)
+
+
+def _sold_to_int(digits: str, suffix: Optional[str]) -> Optional[int]:
+    """Best-effort integer for a sold-count figure; None when it can't be read safely."""
+    t = digits.strip().rstrip(".,").replace(",", "")
+    if suffix:
+        try:
+            return int(float(t) * (1000 if suffix.upper() == "K" else 1_000_000))
+        except ValueError:
+            return None
+    if "." in t:
+        # Bare "1.234" is a thousands separator in some locales and a decimal in
+        # others — guessing would invent a number, so report only the display text.
+        return None
+    try:
+        return int(t)
+    except ValueError:
+        return None
+
+
+def _parse_sold_count(text: Any) -> tuple[Optional[str], Optional[int]]:
+    """
+    Find the first sold/sales figure in `text`.
+
+    Returns (display text as AliExpress wrote it, integer volume or None) — the
+    integer is what makes "100K+" comparable against "5,000+" without the consumer
+    having to parse an abbreviation.
+    """
+    if not isinstance(text, str) or not text:
+        return None, None
+    mt = _SOLD_RX.search(text)
+    if not mt:
+        return None, None
+    return mt.group(0).strip(), _sold_to_int(mt.group(1), mt.group(2))
+
+
 def _fmt_epoch_ms(ms: Any) -> Optional[str]:
     """Format an epoch-millisecond timestamp as a YYYY-MM-DD date (local)."""
     if not isinstance(ms, (int, float)) or ms <= 0:
@@ -447,6 +493,111 @@ def _fmt_epoch_ms(ms: Any) -> Optional[str]:
         return time.strftime("%Y-%m-%d", time.localtime(ms / 1000.0))
     except (ValueError, OSError, OverflowError):
         return None
+
+
+# A search card advertises free shipping through one of these selling-point
+# sources. 48 of 60 live hits carry one, so the *absence* is the notable case —
+# tagging the majority would be pure bloat. Verified live Aug 2026.
+FREE_SHIPPING_SOURCES = {"platformFreeShipping_atm", "Free_Shipping_atm"}
+
+
+def _listing_age(lunch_time: Any) -> Optional[str]:
+    """
+    Render a search card's `lunchTime` (the listing's publish date, sic) as a
+    compact age: "8d old", "14mo old", "5.5y old".
+
+    Age is a relister/dropshipper tell that no other field carries: a ★4.7 built
+    from 21 orders on a listing published four days ago is a very different bet
+    from the same rating on a three-year-old listing. Live values span 8 days to
+    5.5 years, and every one of 120 sampled cards had the field.
+    """
+    if not isinstance(lunch_time, str) or not lunch_time.strip():
+        return None
+    dt = None
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            dt = datetime.strptime(lunch_time.strip(), fmt)
+            break
+        except ValueError:
+            continue
+    if dt is None:
+        return None
+    days = (datetime.now() - dt).days
+    if days < 0:
+        return None
+    if days < 90:
+        return f"{days}d old"
+    if days < 730:
+        return f"{days // 30}mo old"
+    return f"{days / 365.0:.1f}y old"
+
+
+def _search_signals(it: dict) -> dict:
+    """
+    Pull the decision-relevant signals AliExpress hides in a search card's
+    tracking payload (`trace.pdpParams` / `trace.utLogMap`) and selling points.
+
+    Everything here is already on the wire for every card — we were dropping it:
+
+      ship_from     `pdp_cdi.shipFrom`, the warehouse country. The single most
+                    decision-relevant field on the card: an EU warehouse means
+                    days rather than weeks AND no import charges.
+      is_choice     `utLogMap.isChoice` — changes who fulfils and who handles returns.
+      sold_exact    `utLogMap.real_trade_count`, the exact order count. `trade.tradeDesc`
+                    buckets it, and the buckets are coarse enough to be useless at
+                    the top: 34 of 60 hits for one query all read "50,000+ sold"
+                    and 17 more all read "100K+ sold", so the listing ranked #1 and
+                    the one ranked #17 were indistinguishable. Live range 1–232,302.
+      listing_age   from `lunchTime` — see `_listing_age`.
+      duty_offset   `sellingPoints[source="npieces"]`, e.g. "Offset duty: 3€ off" —
+                    a real landed-cost input, present on 6 of 60 hits.
+      free_shipping whether any free-shipping badge is present (None if the card
+                    carries no selling points at all, i.e. unknown rather than no).
+    """
+    out: dict[str, Any] = {
+        "ship_from": None, "is_choice": False, "sold_exact": None,
+        "listing_age": None, "duty_offset": None, "free_shipping": None,
+    }
+    trace = it.get("trace") if isinstance(it.get("trace"), dict) else {}
+
+    pdp = trace.get("pdpParams") if isinstance(trace.get("pdpParams"), dict) else {}
+    raw = pdp.get("pdp_cdi")
+    if isinstance(raw, str) and raw:
+        # Doubly-encoded: a URL-escaped JSON blob inside a tracking param.
+        try:
+            cdi = json.loads(unquote(raw))
+        except (json.JSONDecodeError, ValueError):
+            cdi = None
+        if isinstance(cdi, dict):
+            sf = cdi.get("shipFrom")
+            if isinstance(sf, str) and sf.strip():
+                out["ship_from"] = sf.strip().upper()
+
+    ut = trace.get("utLogMap") if isinstance(trace.get("utLogMap"), dict) else {}
+    out["is_choice"] = str(ut.get("isChoice", "")).strip().lower() == "true"
+    rtc = ut.get("real_trade_count")
+    if rtc is not None:
+        try:
+            out["sold_exact"] = int(str(rtc).strip())
+        except (TypeError, ValueError):
+            pass
+
+    out["listing_age"] = _listing_age(it.get("lunchTime"))
+
+    sps = it.get("sellingPoints") if isinstance(it.get("sellingPoints"), list) else []
+    sources: set = set()
+    for sp in sps:
+        if not isinstance(sp, dict):
+            continue
+        sources.add(sp.get("source"))
+        if sp.get("source") == "npieces":
+            tc = sp.get("tagContent") if isinstance(sp.get("tagContent"), dict) else {}
+            txt = tc.get("tagText")
+            if isinstance(txt, str) and txt.strip():
+                out["duty_offset"] = txt.strip()
+    if sps:
+        out["free_shipping"] = bool(sources & FREE_SHIPPING_SOURCES)
+    return out
 
 
 def _extract_embedded_json(html: str, var_names: list[str]) -> Optional[dict]:
@@ -587,6 +738,15 @@ def parse_search_results(html: str) -> list[dict]:
         if isinstance(price, (int, float)) and isinstance(original_price, (int, float)) and original_price > price:
             discount_pct = round((1 - price / original_price) * 100)
 
+        # The seller's own declared discount, straight from the card. Ours is
+        # derived from the two prices and AliExpress *floors* where we round, so
+        # the two disagree by exactly 1pp on ~14% of live cards (never more). The
+        # ⚠ MSRP? flag stays keyed to the derived number; this is the raw claim
+        # shown next to it so the caller can see both.
+        seller_discount_pct = sp.get("discount") if isinstance(sp, dict) else None
+        if not isinstance(seller_discount_pct, (int, float)):
+            seller_discount_pct = None
+
         rating = None
         ev = it.get("evaluation")
         if isinstance(ev, dict) and ev.get("starRating") is not None:
@@ -598,6 +758,12 @@ def parse_search_results(html: str) -> list[dict]:
         trade = it.get("trade")
         sold_count = trade.get("tradeDesc") if isinstance(trade, dict) else None
 
+        sig = _search_signals(it)
+        # Prefer the exact order count over AliExpress's bucketed label — same
+        # line length on average, but it actually separates the top listings.
+        if sig["sold_exact"] is not None:
+            sold_count = f"{sig['sold_exact']:,} sold"
+
         seen_ids.add(pid)
         products.append({
             "item_id": pid,
@@ -605,9 +771,16 @@ def parse_search_results(html: str) -> list[dict]:
             "price": price,
             "original_price": original_price,
             "discount_pct": discount_pct,
+            "seller_discount_pct": seller_discount_pct,
             "currency": currency,
             "rating": rating,
             "sold_count": sold_count,
+            "sold_count_num": sig["sold_exact"],
+            "ship_from": sig["ship_from"],
+            "is_choice": sig["is_choice"],
+            "listing_age": sig["listing_age"],
+            "duty_offset": sig["duty_offset"],
+            "free_shipping": sig["free_shipping"],
             "url": f"{BASE_URL}/item/{pid}.html",
         })
 
@@ -741,8 +914,7 @@ def parse_search_results(html: str) -> list[dict]:
         if dm:
             discount_pct = int(dm.group(1))
 
-        sold_match = re.search(r"([\d,]+\+?)\s*sold", card_text, re.IGNORECASE)
-        sold_count = sold_match.group(0) if sold_match else None
+        sold_count, _ = _parse_sold_count(card_text)
 
         rating = None
         rmatch = re.search(r"\b([0-4]\.\d|5\.0)\b", card_text)
@@ -874,9 +1046,7 @@ def parse_product_detail(html: str, item_id: str) -> dict:
                 pass
 
     # Sold count
-    sold_match = re.search(r"([\d,]+\+?)\s*sold", body_text, re.IGNORECASE)
-    if sold_match:
-        details["sold_count"] = sold_match.group(0)
+    details["sold_count"], details["sold_count_num"] = _parse_sold_count(body_text)
 
     return details
 
@@ -958,11 +1128,37 @@ def _search_fetch_parse(query: str, sort_by: str = "best_match",
     return [], total
 
 
+TITLE_MAX = 80
+
+
+def _short_title(title: str, limit: int = TITLE_MAX) -> str:
+    """
+    Trim AliExpress's keyword-stuffed titles to their identifying head.
+
+    Measured over 240 live cards (usb-c cable / mechanical keyboard / nvme ssd /
+    desk lamp, Aug 2026): mean title 123 chars, max 179, and the tail is almost
+    always the SEO compatibility run ("For Xiaomi Samsung Huawei Honor Realme
+    OPPO"). Cutting at 80 on a word boundary produced ZERO new collisions on
+    those 240 cards — every pair that rendered identically was already an
+    identical full title. It does lose a trailing size token on 5 of 240
+    ("... 1M 2M 3M"), which is why the ellipsis is kept: it tells the caller the
+    title was cut and that get_product_details has the full one.
+    """
+    t = " ".join((title or "").split())
+    if len(t) <= limit:
+        return t
+    cut = t[:limit]
+    sp = cut.rfind(" ")
+    if sp >= limit * 0.6:
+        cut = cut[:sp]
+    return cut.rstrip(" ,·-") + "…"
+
+
 def _format_product_lines(products: list[dict], header: str, limit: int = 25) -> str:
     """Render parsed product dicts into the compact text shared by search + deals."""
     lines = [header]
     for p in products[:limit]:
-        line = f"- {p['title']}"
+        line = f"- {_short_title(p['title'])}"
         cur = p.get("currency") or CURRENCY
         if p["price"] is not None:
             line += f" — {_fmt_money(p['price'], cur)}"
@@ -970,11 +1166,31 @@ def _format_product_lines(products: list[dict], header: str, limit: int = 25) ->
             line += f" (was {p['original_price']:.2f})"
         if p["discount_pct"]:
             line += f" [-{p['discount_pct']}%]{_msrp_flag(p['discount_pct'])}"
+            sd = p.get("seller_discount_pct")
+            if sd is not None and round(sd) != p["discount_pct"]:
+                line += f" (seller says -{round(sd)}%)"
         if p["rating"]:
             line += f" ★{p['rating']}"
         if p["sold_count"]:
             line += f" · {p['sold_count']}"
-        line += f"\n  item_id: {p['item_id']}"
+        # Warehouse country decides both transit time and whether customs gets
+        # involved, so it belongs on every row, not behind a second call.
+        if p.get("ship_from"):
+            line += f" · ships from {p['ship_from']}"
+        if p.get("is_choice"):
+            line += " · Choice"
+        if p.get("listing_age"):
+            line += f" · {p['listing_age']}"
+        # Only the minority lacking a free-shipping badge is worth a mark; the
+        # rest would just repeat themselves 48 times.
+        if p.get("free_shipping") is False:
+            line += " · ⚠ no free-shipping badge"
+        if p.get("duty_offset"):
+            line += f" · {p['duty_offset']}"
+        # One row = one line. The id used to sit on a second line under its own
+        # "item_id:" label; the label is static per row, so it lives in the
+        # docstring legend now and only the value is repeated 25 times.
+        line += f" [{p['item_id']}]"
         lines.append(line)
     return "\n".join(lines)
 
@@ -995,6 +1211,11 @@ def search_products(
 ) -> str:
     """
     Search AliExpress for products.
+
+    Each result is one line ending in `[<item_id>]` — pass that number as
+    `item_id` to get_product_details / get_variants / get_reviews / get_seller.
+    Titles are trimmed to ~80 chars; a trailing "…" means AliExpress's full title
+    is longer, and get_product_details returns it in full.
 
     Args:
         query: Search term (e.g., "groudon plush", "usb c cable")
@@ -1070,6 +1291,10 @@ def find_deals(
     Same underlying search as `search_products`, but keeps only items with a
     visible discount and sorts by discount depth (biggest first).
 
+    Each result is one line ending in `[<item_id>]` — pass that number as
+    `item_id` to the per-product tools. Titles are trimmed to ~80 chars; a
+    trailing "…" means get_product_details has the full one.
+
     Args:
         query: Search term (e.g., "mechanical keyboard").
         min_discount: Minimum discount percent to include (e.g., 40). 0 keeps any discount.
@@ -1138,6 +1363,129 @@ def _fetch_pdp_mtop(item_id: str) -> Optional[dict]:
     return None
 
 
+# Countries between which goods move without import charges. Only used to decide
+# whether AliExpress's duty sentence tells us anything the warehouse country
+# hasn't already: across 22 live items the two agreed every single time (14 CN →
+# "Import charges will apply", 8 EU → "No extra duties"), so restating it is a
+# wasted line. Note the failure direction is safe — we drop the clause only on an
+# exact match, so an incomplete list here means we print more, never less.
+DUTY_FREE_BLOCS = [
+    {"AT", "BE", "BG", "HR", "CY", "CZ", "DK", "EE", "FI", "FR", "DE", "GR",
+     "HU", "IE", "IT", "LV", "LT", "LU", "MT", "NL", "PL", "PT", "RO", "SK",
+     "SI", "ES", "SE"},
+]
+
+
+def _duty_free_expected(ship_from_code: Optional[str]) -> Optional[bool]:
+    """True/False if the warehouse country settles the duty question, else None."""
+    if not ship_from_code:
+        return None
+    origin = ship_from_code.strip().upper()
+    if not origin:
+        return None
+    if origin == COUNTRY.upper():
+        return True
+    for bloc in DUTY_FREE_BLOCS:
+        if COUNTRY.upper() in bloc:
+            return origin in bloc
+    return False
+
+
+def _informative_tax_note(tax_note: Optional[str], ship_from_code: Optional[str]) -> Optional[str]:
+    """
+    Drop the duty clause when it merely repeats what "Ships from: X" already says.
+
+    AliExpress packs two facts into one string — "Price includes VAT | No extra
+    duties". The VAT half is never derivable and is always kept; the duty half is
+    kept only when it does NOT follow from the warehouse country, which is exactly
+    when it is worth the caller's attention (a CN warehouse with duty prepaid, or
+    an in-union warehouse that still attracts charges).
+    """
+    if not tax_note:
+        return None
+    expected = _duty_free_expected(ship_from_code)
+    if expected is None:
+        return tax_note
+    kept = []
+    for clause in re.split(r"\s*[|;]\s*", tax_note):
+        c = clause.strip()
+        if not c:
+            continue
+        low = c.lower()
+        is_duty = any(w in low for w in ("dut", "import charge", "customs"))
+        if is_duty:
+            says_free = any(w in low for w in ("no extra", "no import", "no customs", "free of", "duty-free"))
+            says_charge = any(w in low for w in ("will apply", "may apply", "applies"))
+            if (expected and says_free) or (not expected and says_charge):
+                continue  # exactly what the warehouse country already implied
+        kept.append(c)
+    return " | ".join(kept) if kept else None
+
+
+def _sku_spec_for_id(result: dict, sku_id: str) -> Optional[str]:
+    """
+    Human-readable spec of one SKU ("DDR4 32GB · R7 5825U"), by id.
+
+    Used to label the endpoints of a price range so "from 747.41" can say *which*
+    configuration costs that. Reads SKU.skuPaths, the same source get_variants uses.
+    """
+    sku = result.get("SKU") if isinstance(result.get("SKU"), dict) else {}
+    paths = sku.get("skuPaths") if isinstance(sku.get("skuPaths"), list) else []
+    if not paths:
+        return None
+    prop_map = _sku_prop_map(sku)
+    for p in paths:
+        if not isinstance(p, dict):
+            continue
+        pid = p.get("skuIdStr") or (str(p.get("skuId")) if p.get("skuId") is not None else None)
+        if pid and str(pid) == str(sku_id):
+            return _sku_attr_spec(p.get("skuAttr", ""), prop_map)
+    return None
+
+
+def _lot_note(result: dict, selected_sku_id: Any = None) -> Optional[str]:
+    """
+    Describe a lot listing's unit content, e.g. "100 pcs, 1,17kr/pc" or "lot of 40".
+
+    On a lot listing the quoted price buys a whole lot, not one piece, so the
+    number in the price column is not comparable with a single-unit listing's
+    until the caller knows the lot size. Two live shapes (Aug 2026):
+      LOT.unitContentSkuMap  {"<skuId>": "100 pcs,1,17kr/pc"}  — AliExpress has
+                             already done the per-unit division; use its string.
+      LOT.numberPerLot/unitContent  {"numberPerLot": 40, "unitContent": "40Pieces"}
+                             — lot size only, no per-unit figure supplied.
+    """
+    lot = result.get("LOT") if isinstance(result.get("LOT"), dict) else None
+    if not lot:
+        return None
+
+    ucm = lot.get("unitContentSkuMap")
+    if isinstance(ucm, dict) and ucm:
+        val = None
+        if selected_sku_id is not None:
+            val = ucm.get(str(selected_sku_id))
+        if not val:
+            val = next((v for v in ucm.values() if isinstance(v, str) and v.strip()), None)
+        if isinstance(val, str) and val.strip():
+            # "100 pcs,1,17kr/pc" — the comma is both the field separator and the
+            # SEK decimal mark, so split once from the left only, and print both
+            # halves exactly as AliExpress formatted them.
+            head, sep, tail = val.strip().partition(",")
+            return f"{head.strip()}, {tail.strip()}" if sep and tail.strip() else val.strip()
+
+    n = lot.get("numberPerLot")
+    unit = lot.get("unitContent") or lot.get("itemUnitContent")
+    # A "lot" of one is just a normal listing — saying so would be noise, and
+    # would wrongly imply the price needs dividing.
+    if isinstance(n, (int, float)) and n == 1:
+        return None
+    if isinstance(n, (int, float)) and n:
+        return f"price is per lot of {unit or n}"
+    if isinstance(unit, str) and unit.strip():
+        return f"price is per lot of {unit.strip()}"
+    return None
+
+
 def _pdp_error_code(mtop_resp: dict) -> Optional[str]:
     """
     Detect the PDP "this listing isn't available here" response.
@@ -1191,15 +1539,22 @@ def _extract_pdp_fields(mtop_resp: dict, item_id: str) -> dict:
         "original_price": None,
         "currency": None,
         "discount_pct": None,
+        "seller_discount_pct": None,
+        "price_low_spec": None,
+        "price_high_spec": None,
+        "lot_note": None,
         "rating": None,
         "review_count": None,
         "sold_count": None,
+        "sold_count_num": None,
         "seller_name": None,
         "store_url": None,
         "seller_positive_rate": None,
         "seller_total_reviews": None,
         "shipping_cost": None,
+        "shipping_free": None,
         "free_shipping_over": None,
+        "shipping_alternatives": [],
         "shipping_estimate": None,
         "ship_from": None,
         "ship_from_code": None,
@@ -1207,7 +1562,6 @@ def _extract_pdp_fields(mtop_resp: dict, item_id: str) -> dict:
         "ship_unreachable": None,
         "ship_days_min": None,
         "ship_days_max": None,
-        "image_url": None,
     }
 
     result = mtop_resp.get("data", {}).get("result", {})
@@ -1262,22 +1616,45 @@ def _extract_pdp_fields(mtop_resp: dict, item_id: str) -> dict:
         sku_map = pn.get("skuPriceInfoMap")
         if isinstance(sku_map, dict) and sku_map:
             prices = []
-            for sku in sku_map.values():
+            by_price: list[tuple[float, str]] = []
+            for sku_id, sku in sku_map.items():
                 if isinstance(sku, dict):
                     sp = sku.get("salePriceString")
                     if isinstance(sp, str):
                         p = _normalize_price(sp)
                         if p is not None:
                             prices.append(p)
+                            by_price.append((p, str(sku_id)))
             if prices:
                 lo, hi = min(prices), max(prices)
                 if lo != hi:
                     d["price_range"] = (lo, hi)
+                    # Name the configuration at each end. The headline "from"
+                    # price is routinely a stripped or non-functional SKU ("No Ram
+                    # No Storage"), and the top end is often a placeholder the
+                    # seller uses to mark a variant unavailable — a bare
+                    # "747.41–1221432.03 SEK" tells the caller neither.
+                    d["price_low_spec"] = _sku_spec_for_id(result, min(by_price)[1])
+                    d["price_high_spec"] = _sku_spec_for_id(result, max(by_price)[1])
                 if d["price"] is None:
                     d["price"] = lo
 
     if d["discount_pct"] is None and d["price"] and d["original_price"] and d["original_price"] > d["price"]:
         d["discount_pct"] = round((1 - d["price"] / d["original_price"]) * 100)
+
+    # The seller's own declared discount rate, as shown on the site. Ours is
+    # derived from sale-vs-was and AliExpress floors where we round, so the two
+    # differ by exactly 1pp on ~18% of live items. Keep both: the ⚠ MSRP? flag
+    # stays on the derived figure, this is the raw claim beside it.
+    dr = ((gd.get("eventInfo") or {}).get("clcEvent") or {}).get("discountRate") \
+        if isinstance(gd.get("eventInfo"), dict) else None
+    if isinstance(dr, (int, float)):
+        d["seller_discount_pct"] = round(dr)
+
+    # Lot listings quote the price PER LOT, so a 116.71 SEK row and a 2.67 SEK row
+    # are not comparable until you know one is 100 pieces. AliExpress ships the
+    # per-unit breakdown itself; print its string rather than recomputing money.
+    d["lot_note"] = _lot_note(result, pn.get("selectedSkuId") if isinstance(pn, dict) else None)
 
     # ── Rating / sold count ────────────────────────────────────────────
     rating_mod = result.get("PC_RATING")
@@ -1295,9 +1672,10 @@ def _extract_pdp_fields(mtop_resp: dict, item_id: str) -> dict:
             except (TypeError, ValueError):
                 pass
         other = rating_mod.get("otherText") or ""
-        sm = re.search(r"([\d,]+\+?)\s*sold", other, re.IGNORECASE)
-        if sm:
-            d["sold_count"] = sm.group(0)
+        sold_text, sold_n = _parse_sold_count(other)
+        if sold_text:
+            d["sold_count"] = sold_text
+            d["sold_count_num"] = sold_n
 
     # ── Seller / store ─────────────────────────────────────────────────
     shop = result.get("SHOP_CARD_PC")
@@ -1347,6 +1725,17 @@ def _extract_pdp_fields(mtop_resp: dict, item_id: str) -> dict:
                     d["shipping_cost"] = float(amt)
                 except (TypeError, ValueError):
                     d["shipping_cost"] = parse_price(str(amt))
+            # A genuinely free option carries shippingFee="free" and NO
+            # displayAmount (8 of 22 live items). Nothing read shippingFee, so
+            # those items fell through to "shipping cost not available", which
+            # both hid the best fact about them and blamed the caller's setup.
+            # The pairing is exact in the sample: free ⇔ no displayAmount,
+            # charge ⇔ displayAmount present.
+            fee = biz.get("shippingFee")
+            if isinstance(fee, str) and fee.strip().lower() == "free":
+                d["shipping_free"] = True
+                if d["shipping_cost"] is None:
+                    d["shipping_cost"] = 0.0
             # `logisticsComposeThreshold` is the FREE-SHIPPING THRESHOLD, never the
             # freight price: it is a flat per-site figure ("100,00kr" on every SE
             # listing, "C$10.00" on every CA one) sitting right next to a real
@@ -1380,14 +1769,66 @@ def _extract_pdp_fields(mtop_resp: dict, item_id: str) -> dict:
                 except (TypeError, ValueError):
                     pass
 
-    # ── Image ─────────────────────────────────────────────────────────
-    hdr = result.get("HEADER_IMAGE_PC")
-    if isinstance(hdr, dict):
-        imgs = hdr.get("imagePathList") or hdr.get("imgList")
-        if isinstance(imgs, list) and imgs and isinstance(imgs[0], str):
-            d["image_url"] = imgs[0]
+        # Faster-but-paid couriers live in the remaining layouts and were dropped
+        # entirely. One live item offers free 9–17 days, DHL 417.65 in 4–9, and
+        # Fedex 531.92 in 4–17 — a real speed/price trade the caller never saw.
+        # Only keep options that differ from the default in price OR day range:
+        # another live item lists 8 carriers, 7 of them identical.
+        if isinstance(layouts, list) and len(layouts) > 1:
+            seen_opts = {(d.get("shipping_cost"), d.get("ship_days_min"), d.get("ship_days_max"))}
+            for lay in layouts[1:]:
+                if not isinstance(lay, dict):
+                    continue
+                b = lay.get("bizData")
+                if not isinstance(b, dict):
+                    continue
+                cost = None
+                a = b.get("displayAmount")
+                if a is not None:
+                    try:
+                        cost = float(a)
+                    except (TypeError, ValueError):
+                        cost = parse_price(str(a))
+                elif isinstance(b.get("shippingFee"), str) and b["shippingFee"].strip().lower() == "free":
+                    cost = 0.0
+
+                def _as_int(v):
+                    try:
+                        return int(v) if v is not None else None
+                    except (TypeError, ValueError):
+                        return None
+
+                lo, hi = _as_int(b.get("deliveryDayMin")), _as_int(b.get("deliveryDayMax"))
+                key = (cost, lo, hi)
+                if key in seen_opts:
+                    continue
+                seen_opts.add(key)
+                d["shipping_alternatives"].append({
+                    "company": b.get("company"),
+                    "cost": cost,
+                    "days_min": lo,
+                    "days_max": hi,
+                })
 
     return d
+
+
+def _delivery_days(d: dict) -> Optional[str]:
+    """
+    Render the numeric delivery-day range ("19–25 days", "60 days") on its own.
+
+    AliExpress frequently returns deliveryDayMin/deliveryDayMax with NO
+    displayEtaMinDate/MaxDate — 9 of 48 live items sampled Aug 2026. Both PDP tools
+    used to reach the day range only *through* the display dates, so for those
+    listings the day range was extracted and then thrown away, and the tools
+    reported no delivery information at all. Test with `is not None`, not
+    truthiness: a same-day `0` is a real answer.
+    """
+    lo, hi = d.get("ship_days_min"), d.get("ship_days_max")
+    if lo is not None and hi is not None:
+        return f"{lo} days" if lo == hi else f"{lo}–{hi} days"
+    one = lo if lo is not None else hi
+    return f"{one} days" if one is not None else None
 
 
 @mcp.tool(
@@ -1400,6 +1841,11 @@ def _extract_pdp_fields(mtop_resp: dict, item_id: str) -> dict:
 def get_product_details(item_id: str = "", url: str = "") -> str:
     """
     Get detailed info for a specific AliExpress product.
+
+    A `Price:` line showing a range means the listing has several configurations —
+    call get_variants for the per-config price table. The store's own page URL is
+    not returned: no tool here accepts one, and get_seller answers store questions
+    from the same item_id.
 
     Args:
         item_id: AliExpress item ID (e.g., "1005007655628250")
@@ -1466,16 +1912,31 @@ def get_product_details(item_id: str = "", url: str = "") -> str:
             if d.get("discount_pct"):
                 line += f", -{d['discount_pct']}%"
             line += ")" + _msrp_flag(d.get("discount_pct"))
+            sd = d.get("seller_discount_pct")
+            if sd is not None and d.get("discount_pct") is not None and sd != d["discount_pct"]:
+                line += f" (seller says -{sd}%)"
         lines.append(line)
+        if d.get("lot_note"):
+            lines.append(f"  Lot listing — {d['lot_note']}")
         if d.get("price_range"):
-            lines.append("  (price varies by configuration — use get_variants for the per-config breakdown)")
+            # Say which configuration sits at each end: the cheap end is often a
+            # stripped SKU nobody wants and the dear end is often a placeholder.
+            lo_spec, hi_spec = d.get("price_low_spec"), d.get("price_high_spec")
+            if lo_spec or hi_spec:
+                lines.append(f"  Cheapest config: {lo_spec or 'unnamed'}"
+                             f"   ·   Dearest: {hi_spec or 'unnamed'}")
     if d.get("rating"):
         rating_line = f"Rating: ★{d['rating']}"
         if d.get("review_count"):
             rating_line += f" ({d['review_count']} reviews)"
         lines.append(rating_line)
     if d.get("sold_count"):
-        lines.append(f"Sold: {d['sold_count']}")
+        sold_line = f"Sold: {d['sold_count']}"
+        # Spell the number out only for the abbreviated forms ("100K+"), where a
+        # reader comparing against a plain "5,000+" could get the magnitude wrong.
+        if d.get("sold_count_num") and re.search(r"[KM]", d["sold_count"], re.IGNORECASE):
+            sold_line += f" (≈{d['sold_count_num']:,})"
+        lines.append(sold_line)
     if d.get("seller_name"):
         seller_line = f"Seller: {d['seller_name']}"
         if d.get("seller_positive_rate"):
@@ -1483,30 +1944,44 @@ def get_product_details(item_id: str = "", url: str = "") -> str:
         if d.get("seller_total_reviews"):
             seller_line += f" ({d['seller_total_reviews']} seller feedbacks)"
         lines.append(seller_line)
-        if d.get("store_url"):
-            lines.append(f"Store: {d['store_url']}")
     if d.get("ship_unreachable"):
         lines.append(f"Shipping: does not ship to {COUNTRY}")
     elif d.get("shipping_cost") is not None:
         lines.append("Shipping: " + ("Free" if d["shipping_cost"] == 0 else _fmt_money(d["shipping_cost"], cur)))
     else:
         lines.append("Shipping: not available (AliExpress needs a saved delivery address to quote it)")
+    for alt in d.get("shipping_alternatives") or []:
+        bits = []
+        if alt.get("cost") is not None:
+            bits.append("Free" if alt["cost"] == 0 else _fmt_money(alt["cost"], cur))
+        span = _delivery_days({"ship_days_min": alt.get("days_min"), "ship_days_max": alt.get("days_max")})
+        if span:
+            bits.append(span)
+        if bits:
+            lines.append(f"  Alt: {alt.get('company') or 'other carrier'} — " + ", ".join(bits))
     # Printed verbatim as AliExpress formatted it — it is an order-level threshold,
     # not this item's freight, so it must never read as the shipping cost.
     if d.get("free_shipping_over"):
         lines.append(f"  Free shipping on orders over {d['free_shipping_over']}")
+    eta_days = _delivery_days(d)
     if d.get("shipping_estimate"):
         eta_line = f"Estimated delivery: {d['shipping_estimate']}"
-        if d.get("ship_days_min") and d.get("ship_days_max"):
-            eta_line += f" ({d['ship_days_min']}–{d['ship_days_max']} days)"
+        if eta_days:
+            eta_line += f" ({eta_days})"
         lines.append(eta_line)
+    elif eta_days:
+        lines.append(f"Estimated delivery: {eta_days}")
     if d.get("ship_from"):
         origin = f"Ships from: {d['ship_from']}"
         if d.get("ship_from_code"):
             origin += f" ({d['ship_from_code']})"
         lines.append(origin)
-    if d.get("tax_note"):
-        lines.append(f"Duties: {d['tax_note']}")
+    tax_note = _informative_tax_note(d.get("tax_note"), d.get("ship_from_code"))
+    if tax_note:
+        # Once the duty clause is dropped as redundant, only the VAT half is left
+        # and "Duties:" would be the wrong word for it.
+        label = "Duties" if any(w in tax_note.lower() for w in ("dut", "import charge", "customs")) else "Tax"
+        lines.append(f"{label}: {tax_note}")
     return "\n".join(lines)
 
 
@@ -1552,7 +2027,12 @@ def get_shipping_estimate(item_id: str = "", url: str = "") -> str:
         return _pdp_unavailable_msg(item_id, err)
 
     d = _extract_pdp_fields(resp, item_id)
-    if d.get("shipping_cost") is None and not d.get("shipping_estimate"):
+    # A day range on its own is real shipping information, so it must both keep the
+    # tool from bailing out below and get printed — this tool had no day-range
+    # branch at all, and answered "set a delivery address" for listings that had
+    # told us "19–25 days".
+    eta_days = _delivery_days(d)
+    if d.get("shipping_cost") is None and not d.get("shipping_estimate") and not eta_days:
         if d.get("ship_unreachable"):
             return (
                 f"Item {item_id} does not ship to {COUNTRY} (AliExpress marked the "
@@ -1569,8 +2049,22 @@ def get_shipping_estimate(item_id: str = "", url: str = "") -> str:
         lines.append("  Cost: " + ("Free" if d["shipping_cost"] == 0 else _fmt_money(d["shipping_cost"], d.get("currency"))))
     if d.get("free_shipping_over"):
         lines.append(f"  Free shipping on orders over {d['free_shipping_over']}")
+    # Paid express options sit in the later layouts; without them the caller
+    # cannot see that 4-day delivery is even purchasable.
+    for alt in d.get("shipping_alternatives") or []:
+        bits = []
+        if alt.get("cost") is not None:
+            bits.append("Free" if alt["cost"] == 0 else _fmt_money(alt["cost"], d.get("currency")))
+        span = _delivery_days({"ship_days_min": alt.get("days_min"), "ship_days_max": alt.get("days_max")})
+        if span:
+            bits.append(span)
+        if bits:
+            lines.append(f"  Alt: {alt.get('company') or 'other carrier'} — " + ", ".join(bits))
     if d.get("shipping_estimate"):
-        lines.append(f"  Estimated delivery: {d['shipping_estimate']}")
+        lines.append(f"  Estimated delivery: {d['shipping_estimate']}"
+                     + (f" ({eta_days})" if eta_days else ""))
+    elif eta_days:
+        lines.append(f"  Estimated delivery: {eta_days}")
     if d.get("ship_from"):
         lines.append(f"  Ships from: {d['ship_from']}")
     return "\n".join(lines)
@@ -1664,6 +2158,66 @@ def _extract_reviews(data: dict, max_reviews: int) -> dict:
     return out
 
 
+REVIEW_BODY_MAX = 250
+
+
+def _clip_review(text: str, limit: int = REVIEW_BODY_MAX) -> str:
+    """
+    Keep the first `limit` characters of a review body, cut on a word boundary.
+
+    Buyer reviews have no length ceiling — one live review on item 1005004992957146
+    ran 1,003 characters and spent the last 700 restating its first sentence. The
+    verdict, and any concrete defect, is essentially always in the opening lines;
+    the tail is elaboration. The marker says how much was dropped so the caller
+    knows a long review is being summarised rather than quoted whole.
+    """
+    # The "(+N chars)" marker costs ~13 chars, so clipping a 255-char review would
+    # make the output longer. Only clip once there is something real to save.
+    if len(text) <= limit + 25:
+        return text
+    cut = text[:limit]
+    sp = cut.rfind(" ")
+    if sp >= limit * 0.6:
+        cut = cut[:sp]
+    return cut.rstrip(" ,.;:—-") + f"… (+{len(text) - len(cut)} chars)"
+
+
+def _common_sku_affixes(skus: list[str]) -> tuple[str, str]:
+    """
+    Longest common prefix/suffix of the shown reviews' skuInfo, on token boundaries.
+
+    Every review of an item that sells one colour in one warehouse repeats the whole
+    variant string — "Color:Light Grey Ships From:Poland Plug Type:EU" appeared on 7
+    of 10 shown reviews of one live item. The part that repeats is worth stating once;
+    the part that differs is what tells you a 1★ review is about a different SKU than
+    the 5★ ones, so it stays on the row.
+
+    skuInfo is NOT safely splittable into its axes — both axis names and values may
+    contain spaces ("Ships From:Poland"), so "Color:Light Grey Ships From:…" has more
+    than one valid reading. Plain string prefix/suffix needs no such guess. Both are
+    then pulled back to a space or ':' so a shared "Color:Bl" can never split
+    "Blue"/"Black" into "ue"/"ack".
+    """
+    if len(skus) < 2:
+        return "", ""
+    if len(set(skus)) == 1:
+        # Whole string is common; return it intact so no residual is left over.
+        return skus[0], ""
+    pre = os.path.commonprefix(skus)
+    cut = max(pre.rfind(" "), pre.rfind(":"))
+    pre = pre[:cut + 1] if cut >= 0 else ""
+
+    rev = [s[::-1] for s in skus]
+    suf = os.path.commonprefix(rev)[::-1]
+    # A suffix must begin at a token boundary, else "…1m"/"…2m" hoists a bare "m".
+    sp = suf.find(" ")
+    suf = suf[sp:] if sp >= 0 else ""
+    # Never let the two affixes overlap on the shortest string.
+    if pre and suf and len(pre) + len(suf) > min(len(s) for s in skus):
+        suf = ""
+    return pre, suf
+
+
 @mcp.tool(
     title="Get Reviews",
     annotations=ToolAnnotations(
@@ -1674,6 +2228,13 @@ def _extract_reviews(data: dict, max_reviews: int) -> dict:
 def get_reviews(item_id: str = "", url: str = "", max_reviews: int = 10, filter_by: str = "all") -> str:
     """
     Fetch buyer reviews and the rating breakdown for an AliExpress product.
+
+    Reading the output: the `5★:… 4★:…` histogram is the full aggregate — positive
+    / neutral / negative percentages are just that histogram re-divided, so they are
+    not repeated. If an "All shown reviews are for: …" line appears, it is the
+    variant string every shown review shares, and the `…` in it is filled in by the
+    `(…)` on each review below. A review body ending in "… (+N chars)" was clipped
+    at ~250 characters.
 
     Args:
         item_id: AliExpress item ID (e.g., "1005007655628250").
@@ -1706,16 +2267,31 @@ def get_reviews(item_id: str = "", url: str = "", max_reviews: int = 10, filter_
         if st.get("total") is not None:
             head += f" from {st['total']} ratings"
         lines.append(head)
-        if st.get("positive_rate") is not None:
+        sd = st.get("stars") or {}
+        breakdown = "  ".join(f"{k}★:{sd[k]}" for k in (5, 4, 3, 2, 1) if sd.get(k) is not None)
+        # The positive/neutral/negative percentages are AliExpress's own arithmetic
+        # over the very histogram printed on the next line — 466+21 of 502 IS the
+        # 97.0% positive it reports, and 5/502 IS the 1.0% neutral. Printing both is
+        # printing the same five numbers twice, and the histogram is the more
+        # informative of the two (it separates 1★ from 2★). The rate line is kept
+        # only when the histogram is missing, where it is the sole aggregate left.
+        if breakdown:
+            lines.append("  " + breakdown)
+        elif st.get("positive_rate") is not None:
             neu = st.get("neutral_rate")
             neu_str = f" · {neu}% neutral (3★)" if neu is not None else ""
             lines.append(f"  {st['positive_rate']}% positive{neu_str} · {st.get('negative_rate', 0)}% negative")
-        sd = st.get("stars") or {}
-        breakdown = "  ".join(f"{k}★:{sd[k]}" for k in (5, 4, 3, 2, 1) if sd.get(k) is not None)
-        if breakdown:
-            lines.append("  " + breakdown)
 
     if r["reviews"]:
+        skus = [rv["sku"] for rv in r["reviews"] if rv.get("sku")]
+        pre, suf = _common_sku_affixes(skus) if len(skus) == len(r["reviews"]) else ("", "")
+        if len(pre) + len(suf) < 8:
+            pre = suf = ""
+        if pre or suf:
+            if len(set(skus)) == 1:
+                lines.append(f"All shown reviews are for: {skus[0]}")
+            else:
+                lines.append(f"All shown reviews are for: {pre.rstrip()}…{suf}")
         lines.append("")
         for rv in r["reviews"]:
             star = f"★{rv['stars']}" if rv["stars"] is not None else "★?"
@@ -1726,9 +2302,11 @@ def get_reviews(item_id: str = "", url: str = "", max_reviews: int = 10, filter_
                 head += f" · {rv['date']}"
             lines.append(head)
             if rv.get("sku"):
-                lines.append(f"  ({rv['sku']})")
+                residual = rv["sku"][len(pre):len(rv["sku"]) - len(suf) if suf else None].strip()
+                if residual:
+                    lines.append(f"  ({residual})")
             if rv.get("text"):
-                lines.append(f"  {rv['text']}")
+                lines.append(f"  {_clip_review(rv['text'])}")
             if rv.get("up_votes"):
                 lines.append(f"  👍 {rv['up_votes']}")
     return "\n".join(lines)
@@ -1783,8 +2361,11 @@ def _extract_seller(shop: dict) -> dict:
 )
 def get_seller(item_id: str = "", url: str = "") -> str:
     """
-    Get the store / seller profile behind an AliExpress product: rating,
-    positive-feedback rate, seller level, age, and store link.
+    Get the store / seller profile behind an AliExpress product: positive-feedback
+    rate, feedback volume, how long the store has been open, and where it ships from.
+
+    AliExpress's own "seller level" and "seller score" are deliberately not
+    reported — it publishes no scale for either, so they cannot be compared.
 
     Args:
         item_id: AliExpress item ID (e.g., "1005007655628250").
@@ -1825,10 +2406,12 @@ def get_seller(item_id: str = "", url: str = "") -> str:
         lines.append(pr)
     elif d.get("total_reviews") is not None:
         lines.append(f"Seller feedbacks: {d['total_reviews']}")
-    if d.get("level"):
-        lines.append(f"Seller level: {d['level']}")
-    if d.get("score") is not None:
-        lines.append(f"Seller score: {d['score']}")
+    # `sellerLevel` and `sellerScore` are dropped, not merely hidden: AliExpress
+    # publishes no scale for either, and the live values make that plain — level
+    # came back as the string "23-s" on one store and "0" on another, score as
+    # 4271 with no stated maximum. A number nobody can place on a scale is not a
+    # number a shopper can reason with. Positive-feedback %, feedback volume and
+    # store age below are all self-describing, and they stay.
     if d.get("opened"):
         age = f" ({d['opened_years']} yr)" if d.get("opened_years") else ""
         lines.append(f"Opened: {d['opened']}{age}")
@@ -1841,8 +2424,6 @@ def get_seller(item_id: str = "", url: str = "") -> str:
         flags.append("Local seller")
     if flags:
         lines.append(" · ".join(flags))
-    if d.get("store_url"):
-        lines.append(f"Store: {d['store_url']}")
     return "\n".join(lines)
 
 
@@ -1863,6 +2444,11 @@ def compare_sellers(title: str = "", item_id: str = "", url: str = "", max_candi
     relisters, dropshippers). This surfaces the oldest / highest-volume seller so you
     can prefer them over a brand-new relister. It costs one search plus one lookup per
     candidate, so keep max_candidates modest.
+
+    Candidates are matched by a TITLE SEARCH, so confirm each listing is the exact
+    product and configuration you want before buying — same title does not mean
+    same SKU. Each row ends with `item <item_id>`; store page URLs are not returned
+    because no tool here takes one.
 
     Args:
         title: Product title / keywords to search (e.g. "AOOSTAR GEM10 mini pc").
@@ -1955,10 +2541,6 @@ def compare_sellers(title: str = "", item_id: str = "", url: str = "", max_candi
             lines.append("  " + " · ".join(stats))
         price_str = _fmt_money(c["price"], c.get("currency")) if c.get("price") is not None else "price N/A"
         lines.append(f"  {price_str} — item {c['item_id']}")
-        if s.get("store_url"):
-            lines.append(f"  {s['store_url']}")
-    lines.append("")
-    lines.append("Note: matches come from a title search — confirm each listing is the exact product/config you want.")
     return "\n".join(lines)
 
 
@@ -2120,14 +2702,27 @@ def _extract_variants(result: dict) -> list[dict]:
 
     # Collapse indistinguishable rows: some listings carry an extra unnamed
     # dimension (e.g. plug/region) that duplicates the same visible spec + price.
+    #
+    # Rows that collide here are NOT the same product — they are distinct SKUs whose
+    # difference AliExpress declined to label. Keeping only the first one and
+    # dropping the rest handed the caller one sku_id out of several and no hint that
+    # a choice was made for them, so `add_to_cart` could ship a different plug or
+    # region than intended. Live example (item 1005011654394254, Aug 2026): sku
+    # 12000056161378548 was silently dropped in favour of 12000056161378552 — same
+    # rendered spec "Poland · EU", same price, different colour code (14:193 vs
+    # 14:496) that resolves to no name. So keep the collapse for readability but
+    # carry every sku_id it covers; the renderer prints them all.
     merged: dict[tuple, dict] = {}
     order: list[tuple] = []
     for v in variants:
         key = (v["spec"], round(v["price"], 2) if v["price"] is not None else None)
+        entry = (v["sku_id"], v["in_stock"], v.get("stock"))
         if key in merged:
             if v["in_stock"]:
                 merged[key]["in_stock"] = True
+            merged[key]["covered_skus"].append(entry)
         else:
+            v["covered_skus"] = [entry]
             merged[key] = v
             order.append(key)
     return [merged[k] for k in order]
@@ -2145,6 +2740,13 @@ def get_variants(item_id: str = "", url: str = "") -> str:
     List every buyable configuration (SKU) of an AliExpress product with its own
     price — e.g. "DDR4 32GB 1TB SSD · R7 5825U" → 749.36. This is the price→spec
     map that `get_product_details`' price range can't give you.
+
+    Reading the output: `[sku_id: …]` is what add_to_cart needs to pick that exact
+    config. A trailing `img#N` appears only when the configs do not all share one
+    photo; rows with the same N share a photo, so a listing whose "Color" values
+    each carry their own N is often a grab-bag of unrelated products sold under
+    one item_id. A discount identical on every config is stated once under the
+    header instead of on every row.
 
     Args:
         item_id: AliExpress item ID (e.g., "1005009686220027").
@@ -2172,7 +2774,8 @@ def get_variants(item_id: str = "", url: str = "") -> str:
     if err:
         return _pdp_unavailable_msg(item_id, err)
 
-    variants = _extract_variants(resp.get("data", {}).get("result", {}))
+    result = resp.get("data", {}).get("result", {})
+    variants = _extract_variants(result)
     if not variants:
         return f"No variant/SKU data for item {item_id} (likely a single-configuration listing)."
 
@@ -2195,34 +2798,100 @@ def get_variants(item_id: str = "", url: str = "") -> str:
 
     # Per-variant images only help when they actually differ; on a normal listing
     # every SKU shares one image and printing it 20 times is pure noise.
-    seen_images = {v.get("image") for v in variants if v.get("image")}
-    images_vary = len(seen_images) > 1
+    #
+    # The consumer of this string is blind and cannot open a URL, so the URL text
+    # itself was never the payload — the payload is *which rows share a photo*,
+    # which is how a grab-bag listing (unrelated products hidden behind "Color")
+    # shows itself. Measured over 22 live listings: images varied on 14 of them,
+    # costing 177 lines / 16,269 chars of URLs. Numbering the distinct photos
+    # keeps the whole grouping for ~7 chars a row instead of ~92.
+    img_ix: dict[str, int] = {}
+    for v in variants:
+        im = v.get("image")
+        if im and im not in img_ix:
+            img_ix[im] = len(img_ix) + 1
+    images_vary = len(img_ix) > 1
 
     priced = [v["price"] for v in variants if v["price"] is not None]
     cur = next((v["currency"] for v in variants if v.get("currency")), None) or CURRENCY
+    total_skus = sum(len(v.get("covered_skus") or [v["sku_id"]]) for v in variants)
     header = f"Variants for item {item_id} ({len(variants)} configs"
+    if total_skus > len(variants):
+        # Say so rather than letting "9 configs" stand for 10 real SKUs.
+        header += f" covering {total_skus} SKUs"
     if priced:
         header += f", {_fmt_money(min(priced), cur)}–{_fmt_money(max(priced), cur)}"
     header += "):"
 
+    # Nearly every listing gives every config the same discount off the same kind
+    # of crossed-out price (9 of 22 live listings sampled had one identical
+    # percentage on every discounted row). Where that holds, "(was 44.99, -50%)"
+    # 64 times is one fact repeated 64 times, so state it once. Where the
+    # percentages actually differ, the per-row form stays — a config at -70%
+    # beside one at -20% is exactly the comparison worth spending tokens on.
+    discounts = [
+        round((1 - v["price"] / v["original_price"]) * 100)
+        for v in variants
+        if v.get("original_price") and v.get("price") and v["original_price"] > v["price"]
+    ]
+    uniform_discount = discounts[0] if len(discounts) > 1 and len(set(discounts)) == 1 else None
+
     lines = [header]
+    if uniform_discount is not None:
+        scope = "every config" if len(discounts) == len(variants) else f"{len(discounts)} of {len(variants)} configs"
+        lines.append(f"  {scope} listed at -{uniform_discount}% off the crossed-out price"
+                     f"{_msrp_flag(uniform_discount)}")
+    # On a lot listing every price below buys a LOT, not one piece, so the rows
+    # are not comparable with a single-unit listing until the lot size is stated.
+    # AliExpress supplies the per-unit breakdown per SKU; use its own strings.
+    lot_block = result.get("LOT") if isinstance(result.get("LOT"), dict) else {}
+    lot_map = lot_block.get("unitContentSkuMap") if isinstance(lot_block.get("unitContentSkuMap"), dict) else {}
+    if not lot_map:
+        whole_lot_note = _lot_note(result)
+        if whole_lot_note:
+            lines.append(f"  ⓘ Lot listing — {whole_lot_note}; prices below are per lot.")
     for v in variants:
         vc = v.get("currency") or cur
         price_str = _fmt_money(v["price"], vc) if v["price"] is not None else "price N/A"
         line = f"- {v.get('display_spec') or v['sku_id']} — {price_str}"
-        if v.get("original_price") and v["price"] and v["original_price"] > v["price"]:
+        lot_unit = lot_map.get(str(v["sku_id"])) if lot_map else None
+        if isinstance(lot_unit, str) and lot_unit.strip():
+            head, sep, tail = lot_unit.strip().partition(",")
+            line += f" ({head.strip()}, {tail.strip()})" if sep and tail.strip() else f" ({lot_unit.strip()})"
+        if (uniform_discount is None and v.get("original_price") and v["price"]
+                and v["original_price"] > v["price"]):
             disc = round((1 - v["price"] / v["original_price"]) * 100)
             line += f" (was {v['original_price']:.2f}, -{disc}%){_msrp_flag(disc)}"
-        if not v["in_stock"] or v.get("stock") == 0:
+        covered = v.get("covered_skus") or [(v["sku_id"], v["in_stock"], v.get("stock"))]
+        if not v["in_stock"]:
             line += " ⚠ out of stock"
-        elif isinstance(v.get("stock"), int):
+        elif len(covered) == 1 and v.get("stock") == 0:
+            line += " ⚠ out of stock"
+        elif len(covered) == 1 and isinstance(v.get("stock"), int):
             line += f", {v['stock']} in stock"
         # The sku_id is what add_to_cart needs to pick this exact configuration —
         # without it the caller can only ever add the item's preselected variant.
-        line += f"  [sku_id: {v['sku_id']}]"
-        lines.append(line)
+        if len(covered) == 1:
+            line += f"  [sku_id: {v['sku_id']}]"
+        else:
+            line += "  [sku_ids: " + ", ".join(s for s, _ok, _st in covered) + "]"
         if images_vary and v.get("image"):
-            lines.append(f"    image: {v['image']}")
+            line += f" img#{img_ix[v['image']]}"
+        lines.append(line)
+        if len(covered) > 1:
+            # Never let one of these read as "the" sku_id for the row: they are
+            # different SKUs, and add_to_cart would buy whichever one it is given.
+            def _stock_note(ok, st):
+                if not ok or st == 0:
+                    return "out of stock"
+                return f"{st} in stock" if isinstance(st, int) else "in stock"
+            lines.append(
+                f"    ⚠ {len(covered)} distinct SKUs share this spec and price — AliExpress "
+                "did not label what differs between them (usually plug, region or an "
+                "unnamed colour). Pick one only if you know which; otherwise check the "
+                "product page:"
+            )
+            lines.append("      " + " · ".join(f"{s} ({_stock_note(ok, st)})" for s, ok, st in covered))
 
     return "\n".join(lines)
 
@@ -2324,7 +2993,6 @@ def _extract_cart_droplet(resp: dict) -> dict:
                 "item_id": str(f["itemId"]),
                 "title": str(f.get("itemTitle") or "")[:200],
                 "sku_id": f.get("skuId"),
-                "image_url": f.get("itemImageUrl"),
                 "url": f"{BASE_URL}/item/{f['itemId']}.html",
                 "valid": False,
                 "status": f.get("status"),
@@ -2343,7 +3011,6 @@ def _extract_cart_droplet(resp: dict) -> dict:
             "sku_info": (iv["sku"].get("skuInfo") if isinstance(iv.get("sku"), dict)
                          else iv.get("sku") if isinstance(iv.get("sku"), str) else None),
             "sku_id": iv.get("skuId"),
-            "image_url": iv.get("imageUrl"),
             "url": f"{BASE_URL}/item/{item_id}.html",
             "valid": iv.get("valid", True),
             "status": iv.get("status"),
@@ -2689,7 +3356,6 @@ def _extract_cart(render_response: dict) -> dict:
                 "title": str(title)[:200],
                 "sku_info": (fields.get("sku") or {}).get("skuInfo") if isinstance(fields.get("sku"), dict) else None,
                 "sku_id": fields.get("skuId"),
-                "image_url": fields.get("img"),
                 "url": f"{BASE_URL}/item/{item_id}.html",
                 "valid": fields.get("valid", True),
                 "status": fields.get("status"),
@@ -3146,6 +3812,13 @@ def view_cart() -> str:
     """
     View current AliExpress cart contents (read-only).
 
+    Reading the output: an "Unless a line says otherwise: …" line gives the
+    shipping and/or delivery that applies to every line that does not state its
+    own. `cart_id` identifies the LINE and is what set_cart_quantity /
+    remove_from_cart need; `item_id` identifies only the product, and the same
+    product appears on several lines when it is in the cart under more than one
+    variant. Store page URLs are not returned — no tool here accepts one.
+
     Calls the signed MTOP endpoint `mtop.aliexpress.trade.cart.render` v1.0.
     Requires a fresh session — if you see an empty cart despite having items,
     re-save AliExpress cookies via the MCP Auth Bridge extension.
@@ -3254,10 +3927,46 @@ def view_cart() -> str:
             seen_shops.append(k)
         grouped[k].append(it)
 
+    # Shipping and delivery are the same answer on nearly every line of a real
+    # cart — the live 24-item cart sampled Aug 2026 said "shipping: Free" on 20
+    # lines and "delivery: Aug 16 - 22" on 20 — so state the prevailing value once
+    # and let each line override it. Nothing is dropped: a line that differs still
+    # carries its own value, and a line AliExpress gave no freight quote for says
+    # so explicitly rather than silently inheriting "Free", which is the one way
+    # this could mislead.
+    def _ship_str(it: dict) -> Optional[str]:
+        sc = it.get("shipping_cost")
+        if sc is None:
+            return None
+        return "Free" if sc == 0 else _fmt_money(sc, it.get("currency") or currency)
+
+    def _prevailing(vals: list[Optional[str]]) -> Optional[str]:
+        """Value shared by enough lines that hoisting it is a net saving."""
+        known = [v for v in vals if v]
+        if not known:
+            return None
+        top = max(set(known), key=known.count)
+        n = known.count(top)
+        # 4 lines and 70% keeps the header plus its exception markers strictly
+        # cheaper than repeating the value on every line, at every cart size.
+        return top if n >= 4 and n >= 0.7 * len(vals) else None
+
+    common_ship = _prevailing([_ship_str(it) for it in items])
+    common_date = _prevailing([it.get("delivery_date") for it in items])
+    if common_ship or common_date:
+        bits = []
+        if common_ship:
+            bits.append(f"shipping {common_ship}")
+        if common_date:
+            bits.append(f"delivery {common_date}")
+        lines.append("Unless a line says otherwise: " + " · ".join(bits))
+        lines.append("")
+
     for shop_name in seen_shops:
         group = grouped[shop_name]
-        url = next((it.get("shop_url") for it in group if it.get("shop_url")), None)
-        lines.append(f"▸ {shop_name}" + (f"  ({url})" if url else ""))
+        # The store page URL is not printed: no tool in this server accepts one,
+        # and the shop name above already groups and identifies the seller.
+        lines.append(f"▸ {shop_name}")
         for it in group:
             line = f"  - {it['title']}"
             if it.get("price") is not None:
@@ -3272,11 +3981,20 @@ def view_cart() -> str:
                 pass
             if it.get("sku_info"):
                 line += f"\n      variant: {it['sku_info']}"
-            if it.get("shipping_cost") is not None:
-                ship_str = "Free" if it["shipping_cost"] == 0 else _fmt_money(it["shipping_cost"], it.get("currency") or currency)
-                line += f"\n      shipping: {ship_str}"
-            if it.get("delivery_date"):
-                line += f"\n      delivery: {it['delivery_date']}"
+            detail = []
+            ship_str = _ship_str(it)
+            if common_ship is None:
+                if ship_str is not None:
+                    detail.append(f"shipping: {ship_str}")
+            elif ship_str != common_ship and it.get("valid", True):
+                # Never let a missing quote inherit the hoisted "Free". Skipped on
+                # an already-unavailable line, which has no freight to quote.
+                detail.append(f"shipping: {ship_str or 'not quoted'}")
+            date = it.get("delivery_date")
+            if date and date != common_date:
+                detail.append(f"delivery: {date}")
+            if detail:
+                line += "\n      " + " · ".join(detail)
             if not it.get("valid", True):
                 line += f"\n      ⚠️ unavailable — {it.get('unavailable_reason') or 'sold out or removed'}"
             # cart_id identifies the LINE, item_id only the product — the same
@@ -3409,6 +4127,12 @@ def _order_item_line(it: dict, bullet: str = "  • ") -> str:
     money = _order_money(it.get("price"), it.get("currency"), it.get("price_text"))
     if money:
         seg += f" — {money}"
+    # `productId` is parsed out of every order line and was then never printed, which
+    # left order output as a dead end: no id meant no get_product_details, no
+    # get_reviews and no re-order via add_to_cart. Name it `item_id` because that is
+    # the parameter every product tool actually takes.
+    if it.get("product_id"):
+        seg += f"  [item_id: {it['product_id']}]"
     return seg
 
 
@@ -3548,7 +4272,14 @@ def list_orders(max_orders: int = 10) -> str:
             "shape may have changed — update `_extract_orders`."
         )
 
-    lines = [f"Recent orders ({len(orders)}):"]
+    head_line = f"Recent orders ({len(orders)}"
+    if len(orders) < max_orders:
+        # The walk was bound and its outcome thrown away, so a truncated history
+        # looked identical to a complete one.
+        head_line += (f", history walk {page_warning}" if page_warning
+                      else "; that is all AliExpress returned")
+    head_line += "):"
+    lines = [head_line]
     for o in orders:
         lines.append("")
         head = f"- Order {o['order_id']}"
@@ -3559,8 +4290,13 @@ def list_orders(max_orders: int = 10) -> str:
             lines.append(f"  {o['date']}")
         if o.get("store"):
             lines.append(f"  store: {o['store']}")
-        for it in o.get("items", [])[:6]:
+        items = o.get("items", [])
+        for it in items[:6]:
             lines.append(_order_item_line(it))
+        # The cut used to be silent — a 9-line order rendered as 6 with nothing
+        # saying the rest existed. get_order prints them all.
+        if len(items) > 6:
+            lines.append(f"  … +{len(items) - 6} more line(s) — get_order({o['order_id']}) for all of them")
         money = _order_money(o.get("total"), o.get("currency"), o.get("total_text"))
         if money:
             lines.append(f"  total: {money}")
@@ -3590,8 +4326,14 @@ def get_order(order_id: str) -> str:
     if not cookies:
         return AUTH_EXPIRED_MSG
     try:
+        # `order.list` ignores {page,pageSize} — the old payload here asked for 20 and
+        # always got page 1's ten, so every order older than that reported "not found"
+        # even though list_orders(max_orders=40) listed it. Send the payload the site
+        # sends, then walk the same droplet pagination list_orders uses.
         resp = mtop_call(
-            ORDER_LIST_API, "1.0", {"page": 1, "pageSize": 20},
+            ORDER_LIST_API, "1.0",
+            {"statusTab": None, "renderType": "init", "clientPlatform": "pc",
+             "shipToCountry": COUNTRY, "_lang": LANG, "timeZone": "GMT+0200"},
             cookies=cookies, referer=f"{BASE_URL}/p/order/index.html",
         )
     except Exception as e:
@@ -3601,13 +4343,22 @@ def get_order(order_id: str) -> str:
     if problem:
         return problem
 
-    orders = _extract_orders(resp, 100)
+    ALL = 10 ** 6  # never truncate: we are looking for one id, not listing a page
+    orders = _extract_orders(resp, ALL)
     match = next((o for o in orders if o["order_id"] == str(order_id)), None)
+    page_warning = None
     if not match:
-        return (
-            f"Order {order_id} not found in your 20 most recent orders — it may be "
-            "older. Run list_orders to see what's available."
-        )
+        try:
+            resp, page_warning = _orders_fetch_all_pages(cookies, resp, ALL)
+        except Exception as e:
+            page_warning = f"stopped while paging back — {e}"
+        orders = _extract_orders(resp, ALL)
+        match = next((o for o in orders if o["order_id"] == str(order_id)), None)
+    if not match:
+        msg = f"Order {order_id} not found in the {len(orders)} orders reachable on your account"
+        msg += (f" — the history walk {page_warning}, so older orders may exist."
+                if page_warning else ". Run list_orders to see what's available.")
+        return msg
 
     lines = [f"Order {match['order_id']}:"]
     if match.get("status"):
