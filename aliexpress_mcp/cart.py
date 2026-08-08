@@ -663,7 +663,8 @@ def _cart_variant_label(result: dict, sku_id: str) -> tuple[Optional[str], Optio
 
 
 def _resolve_sku_for_cart(item_id: str, sku_id: str = "") -> tuple[
-        Optional[str], Optional[str], Optional[str], Optional[float], Optional[str], Optional[str]]:
+        Optional[str], Optional[str], Optional[str], Optional[float], Optional[str],
+        Optional[str], Optional[str]]:
     """
     Pull the fields `cart.add` needs but the caller shouldn't have to know.
 
@@ -686,9 +687,9 @@ def _resolve_sku_for_cart(item_id: str, sku_id: str = "") -> tuple[
     try:
         resp = _fetch_pdp_mtop(item_id)
     except Exception as e:
-        return None, None, None, None, None, f"MTOP call failed: {e}"
+        return None, None, None, None, None, f"MTOP call failed: {e}", None
     if not resp:
-        return None, None, None, None, None, f"Could not fetch item {item_id} — MTOP returned no usable response."
+        return None, None, None, None, None, f"Could not fetch item {item_id} — MTOP returned no usable response.", None
 
     result = (resp.get("data") or {}).get("result") or resp.get("result") or {}
     sku = result.get("SKU") or {}
@@ -706,22 +707,40 @@ def _resolve_sku_for_cart(item_id: str, sku_id: str = "") -> tuple[
             return None, None, None, None, None, (
                 f"sku_id {sku_id} is not a variant of item {item_id}. "
                 "Run get_variants on this item and use one of the listed sku_id values."
-            )
+            ), None
         resolved_id = str(sku_id)
         spec, price, currency = _cart_variant_label(result, resolved_id)
-        return resolved_id, service, spec, price, currency, None
+        return resolved_id, service, spec, price, currency, None, None
 
     default_id = sku.get("selectedSkuIdStr") or sku.get("selectedSkuId")
     if default_id is None:
         return None, None, None, None, None, (
             f"Item {item_id} exposes no default SKU — pass sku_id explicitly "
             "(get_variants lists them)."
-        )
+        ), None
     if sku.get("selectedSkuSaleable") is False:
-        return None, None, None, None, None, f"The default variant of item {item_id} is not saleable (out of stock)."
+        return None, None, None, None, None, f"The default variant of item {item_id} is not saleable (out of stock).", None
     resolved_id = str(default_id)
     spec, price, currency = _cart_variant_label(result, resolved_id)
-    return resolved_id, service, spec, price, currency, None
+
+    # How many configurations does this listing actually have? A caller who
+    # omitted sku_id on a multi-config listing is buying whichever one the
+    # seller happens to preselect, and across ~15 multi-variant listings checked
+    # in one real session that was the wanted config approximately NEVER: 80mm
+    # fan packs defaulting for a 120mm need, 8x8cm for 12x12cm, 1.5mm solder for
+    # 0.8mm, single-size drill packs where a set was wanted. The add still goes
+    # through — refusing would be worse, since some listings genuinely have one
+    # real choice — but the caller is told, by name, what it picked for them.
+    paths = sku.get("skuPaths") if isinstance(sku.get("skuPaths"), list) else []
+    n_configs = len({str(pth.get("skuIdStr") or pth.get("skuId"))
+                     for pth in paths
+                     if isinstance(pth, dict) and (pth.get("skuIdStr") or pth.get("skuId")) is not None})
+    if n_configs > 1:
+        warn = (f"no sku_id was given, so this is the seller's preselected config "
+                f"of {n_configs} — run get_variants on {item_id} and pass sku_id if "
+                "size, colour, length or pack count matters")
+        return resolved_id, service, spec, price, currency, None, warn
+    return resolved_id, service, spec, price, currency, None, None
 
 
 def _resolve_cart_target(cookies: dict, item_id: str, cart_id: str, sku_id: str):

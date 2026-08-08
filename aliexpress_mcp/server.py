@@ -1047,12 +1047,13 @@ def _add_one_to_cart(cookies: dict, item_id: str, sku_id: str = "",
     confirming the same wall.
     """
     out = {"ok": False, "challenged": False, "descr": f"item {item_id}",
-           "text": "", "cart_num": None, "cart_id": None}
+           "text": "", "cart_num": None, "cart_id": None, "warn": None}
 
-    sku_id, service, spec, unit_price, unit_currency, err = _resolve_sku_for_cart(item_id, sku_id)
+    sku_id, service, spec, unit_price, unit_currency, err, warn = _resolve_sku_for_cart(item_id, sku_id)
     if err:
         out["text"] = err
         return out
+    out["warn"] = warn
 
     # Confirm in terms a person can check against what they meant to buy. A bare
     # sku_id cannot be checked at all: one real session made three wrong-variant
@@ -1175,9 +1176,18 @@ def add_to_cart(item_id: str = "", url: str = "", sku_id: str = "", quantity: in
 
     lines = [f"Added item {item_id}: {r['descr']} ×{quantity} to your cart."]
     if r["cart_num"] is not None:
-        lines.append(f"  Cart now holds {r['cart_num']} item(s).")
+        # AliExpress's own running count, echoed as it came back. Under parallel
+        # adds it arrives out of order — a five-call batch reported 15, 18, 19,
+        # 16, 17 in that sequence, every add having landed. Labelled rather than
+        # suppressed: it is useful when calls are serial, and misleading only if
+        # you assume it is monotonic.
+        lines.append(f"  Cart now holds {r['cart_num']} item(s) "
+                     "(AliExpress's count at the moment of this add; not "
+                     "ordered under parallel calls).")
     if r["cart_id"] is not None:
         lines.append(f"  Cart line ID: {r['cart_id']}")
+    if r.get("warn"):
+        lines.append(f"  ⚠ {r['warn']}.")
     lines.append("  Nothing has been ordered or paid for.")
     return "\n".join(lines)
 
@@ -1224,6 +1234,24 @@ def add_many_to_cart(items: list[dict]) -> str:
     if not cookies:
         return AUTH_EXPIRED_MSG
 
+    # Snapshot the checkout selection once before and once after the batch.
+    # Cart MUTATIONS disturb it, not just selection writes: a session that made
+    # no set_cart_selection calls at all watched un-ticked lines go 10 -> 14
+    # across one remove and two adds. Two renders per batch is a proportionate
+    # price for noticing; doing it per item would double the write-path cost of
+    # a twenty-item batch against a rate limiter whose block does not clear by
+    # waiting. Nothing is re-asserted automatically — that would be more writes
+    # into the same churn; the caller is told, and set_cart_selection converges.
+    def _sel_snapshot():
+        try:
+            merged, _ = _cart_fetch_all_pages(cookies, _cart_droplet_render(cookies))
+            return {str(i.get("cart_id")): (bool(i.get("selected")), i.get("title"))
+                    for i in _extract_cart_droplet(merged)["items"]}
+        except Exception:
+            return None
+
+    sel_before = _sel_snapshot()
+
     added, failed, skipped = [], [], []
     challenge_msg = None
 
@@ -1259,12 +1287,19 @@ def add_many_to_cart(items: list[dict]) -> str:
             continue
 
         if r["ok"]:
-            added.append(f"  {item_id}: {r['descr']} ×{qty}")
+            note = f"  ⚠ {r['warn']}" if r.get("warn") else ""
+            added.append(f"  {item_id}: {r['descr']} ×{qty}{note}")
         elif r["challenged"]:
             challenge_msg = r["text"]
             failed.append(f"  {item_id}: blocked by the verification challenge")
         else:
             failed.append(f"  {item_id}: {r['text']}")
+
+    drift = []
+    sel_after = _sel_snapshot() if sel_before is not None else None
+    if sel_before and sel_after:
+        drift = [(cid, sel_before[cid][1]) for cid in sel_before
+                 if cid in sel_after and sel_before[cid][0] and not sel_after[cid][0]]
 
     out = [f"Added {len(added)} of {len(items)} item(s) to your cart."]
     if added:
@@ -1276,6 +1311,13 @@ def add_many_to_cart(items: list[dict]) -> str:
     if challenge_msg:
         out += ["", challenge_msg,
                 "Re-run with only the items listed as not added or not attempted."]
+    if drift:
+        out += ["", f"⚠ {len(drift)} line(s) that were ticked for checkout became "
+                    "UN-ticked while this batch ran, without being asked to. They stay "
+                    "in the cart but will NOT be ordered:"]
+        out += [f"    {str(t or c)[:70]}" for c, t in drift]
+        out += ["    Run set_cart_selection(selected=True, all_lines=True) to put them "
+                "back — it re-reads and converges."]
     out += ["", "Nothing has been ordered or paid for."]
     return "\n".join(out)
 
