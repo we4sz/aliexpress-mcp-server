@@ -1,7 +1,8 @@
 ---
 name: aliexpress-shopping
 description: >-
-  Read-only AliExpress research and account access. Use this whenever the user wants to
+  AliExpress research and account access — mostly read-only, but can also add/update/remove
+  cart items and create a wishlist (never checks out or pays). Use this whenever the user wants to
   search AliExpress, find deals, pull product details, compare per-configuration (SKU)
   prices, read buyer reviews, judge whether a seller is trustworthy, compare which store
   selling the same item is most established, estimate shipping, or reach their own
@@ -15,7 +16,7 @@ description: >-
   that merely mention AliExpress. It never checks out, pays, or cancels.
 ---
 
-# AliExpress (read-only)
+# AliExpress (read-only research + cart/wishlist writes)
 
 These tools wrap AliExpress's own signed mobile API (MTOP) plus its search page, giving
 clean structured data instead of scraped HTML. Everything here **only reads** — there is

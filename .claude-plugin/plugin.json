@@ -1,14 +1,14 @@
 {
   "name": "aliexpress",
-  "displayName": "AliExpress (read-only)",
+  "displayName": "AliExpress",
   "version": "1.0.0",
-  "description": "Read-only AliExpress research and account access — search, deals, product details, per-SKU pricing, reviews, seller reputation, shipping, cart, orders, and wishlist. Bundles the signed-MTOP MCP server and the aliexpress-shopping skill.",
+  "description": "AliExpress research and account access — search, deals, product details, per-SKU pricing, reviews, seller reputation, shipping, cart, orders, and wishlist, including cart and wishlist writes (never checks out or pays). Bundles the signed-MTOP MCP server and the aliexpress-shopping skill.",
   "author": {
     "name": "Alex Sabaka",
     "email": "alex.love.broadcast@gmail.com"
   },
   "homepage": "https://github.com/AlexSabaka/aliexpress-mcp-server",
   "repository": "https://github.com/AlexSabaka/aliexpress-mcp-server",
-  "keywords": ["aliexpress", "mcp", "shopping", "ecommerce", "read-only"],
+  "keywords": ["aliexpress", "mcp", "shopping", "ecommerce"],
   "mcpServers": "./.mcp.json"
 }

@@ -2,16 +2,20 @@
 """
 AliExpress MCP Server
 
-Search AliExpress, pull clean product details, check shipping to Canada,
-and peek at the current cart — all read-only.
+Search AliExpress, pull clean product details, check shipping to the
+configured country (ALIEXPRESS_COUNTRY, default CA), and manage your cart, orders, and wishlist.
 
 Auth: Session cookies from MCP Auth Bridge extension at
 ~/.mcp-credentials/aliexpress.json
 """
 
+import base64
+import gzip
 import json
 import os
+import random
 import re
+import threading
 import time
 import hashlib
 import logging
@@ -22,6 +26,7 @@ from urllib.parse import quote_plus
 import httpx
 from bs4 import BeautifulSoup
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 # ─── Configuration ──────────────────────────────────────────────────────────
 
@@ -31,6 +36,11 @@ CREDENTIALS_PATH = Path(
 
 COUNTRY = os.environ.get("ALIEXPRESS_COUNTRY", "CA")
 CURRENCY = os.environ.get("ALIEXPRESS_CURRENCY", "CAD")
+
+# MTOP resolves the shipping destination from `_lang`, NOT from the `country`
+# param — `country` is accepted and ignored. Sending a hardcoded "en_US" pins
+# every freight quote to the United States and makes items look unreachable.
+LANG = f"en_{COUNTRY}"
 
 BASE_URL = "https://www.aliexpress.com"
 USER_AGENT = (
@@ -44,15 +54,41 @@ logger = logging.getLogger("aliexpress-mcp")
 
 # ─── Auth ───────────────────────────────────────────────────────────────────
 
+# MTOP hands out a fresh `_m_h5_tk` whenever the current one is stale, as an
+# ordinary Set-Cookie on a 200 response whose body says FAIL_SYS_TOKEN_EXOIRED.
+# The credential file on disk therefore goes stale within minutes of being saved.
+# Without remembering the refreshed token, EVERY call paid the handshake twice —
+# one throwaway request plus the real one — doubling request volume against an
+# API that rate-limits on exactly that.
+_SESSION_COOKIE_KEYS = ("_m_h5_tk", "_m_h5_tk_enc")
+_cookie_lock = threading.Lock()
+_session_cookies: dict[str, str] = {}
+
+
+def remember_session_cookies(new: dict[str, str]) -> None:
+    """Cache refreshed MTOP tokens for the life of the process."""
+    fresh = {k: v for k, v in (new or {}).items() if k in _SESSION_COOKIE_KEYS and v}
+    if not fresh:
+        return
+    with _cookie_lock:
+        _session_cookies.update(fresh)
+
+
 def load_cookies() -> dict[str, str]:
-    """Load session cookies from the credential file written by MCP Auth Bridge."""
+    """
+    Load session cookies from the credential file written by MCP Auth Bridge,
+    overlaid with any MTOP token refreshed during this process.
+    """
     if not CREDENTIALS_PATH.exists():
         return {}
     try:
         data = json.loads(CREDENTIALS_PATH.read_text())
-        return data.get("cookies", {})
+        cookies = dict(data.get("cookies", {}))
     except (json.JSONDecodeError, KeyError):
         return {}
+    with _cookie_lock:
+        cookies.update(_session_cookies)
+    return cookies
 
 
 def get_client(referer: str = BASE_URL) -> httpx.Client:
@@ -120,7 +156,38 @@ FULL_AUTH_MSG = (
 # "FAIL_SYS_TOKEN_EMPTY" or "FAIL_SYS_TOKEN_EXPIRED" the server returns fresh
 # `_m_h5_tk` cookies — the real browser retries; we can too.
 
+# ─── Pacing ─────────────────────────────────────────────────────────────────
+#
+# AliExpress's risk engine (RGV587) answers bursts of calls with
+# FAIL_SYS_USER_VALIDATE — a short cooldown, not a ban. Nothing in the protocol
+# avoids it; the only remedy anyone reports is not firing requests back to back.
+# Writes are policed harder than reads, so they get their own longer floor.
+MTOP_MIN_INTERVAL = float(os.environ.get("ALIEXPRESS_MIN_INTERVAL", "0.7"))
+MTOP_JITTER = 0.6
+CART_WRITE_MIN_INTERVAL = float(os.environ.get("ALIEXPRESS_CART_INTERVAL", "5.0"))
+
+_pace_lock = threading.Lock()
+_last_call_at: dict[str, float] = {}
+
+
+def _pace(channel: str = "mtop", min_interval: float = MTOP_MIN_INTERVAL) -> None:
+    """
+    Sleep just long enough that consecutive calls on `channel` stay at least
+    `min_interval` apart, plus jitter so the cadence isn't machine-regular.
+    """
+    with _pace_lock:
+        now = time.monotonic()
+        wait = (_last_call_at.get(channel, 0.0) + min_interval) - now
+        if wait > 0:
+            time.sleep(wait + random.uniform(0, MTOP_JITTER))
+        _last_call_at[channel] = time.monotonic()
+
+
 MTOP_APP_KEY = "12574478"
+# The cart write endpoint is signed with a different appKey than the read APIs.
+# The sign is md5(token & t & appKey & data), so this must match the appKey in
+# the query string or the call fails with FAIL_SYS_ILLEGAL_ACCESS.
+MTOP_CART_APP_KEY = "24815441"
 MTOP_BASE = "https://acs.aliexpress.com"
 
 
@@ -146,6 +213,9 @@ def mtop_call(
     cookies: Optional[dict[str, str]] = None,
     retries: int = 1,
     referer: Optional[str] = None,
+    app_key: str = MTOP_APP_KEY,
+    method: str = "GET",
+    extra_query: Optional[dict[str, str]] = None,
 ) -> dict:
     """
     Make a signed MTOP request. Returns the parsed JSON response dict on success.
@@ -164,11 +234,11 @@ def mtop_call(
 
     data_str = json.dumps(payload, separators=(",", ":"), ensure_ascii=False)
     t_ms = str(int(time.time() * 1000))
-    sign = _mtop_sign(token, t_ms, MTOP_APP_KEY, data_str)
+    sign = _mtop_sign(token, t_ms, app_key, data_str)
 
     params = {
         "jsv": "2.6.2",
-        "appKey": MTOP_APP_KEY,
+        "appKey": app_key,
         "t": t_ms,
         "sign": sign,
         "api": api,
@@ -180,6 +250,8 @@ def mtop_call(
         "AntiFlood": "true",
         "data": data_str,
     }
+    if extra_query:
+        params.update(extra_query)
 
     cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
     headers = {
@@ -192,8 +264,19 @@ def mtop_call(
     }
     url = f"{MTOP_BASE}/h5/{api}/{version}/"
 
-    with httpx.Client(timeout=30.0, follow_redirects=True) as c:
-        resp = c.get(url, params=params, headers=headers)
+    _pace()
+    with httpx.Client(timeout=40.0, follow_redirects=True) as c:
+        if method.upper() == "POST":
+            # Some payloads (the cart's compressed component tree) run to several
+            # KB — far past the URL length MTOP's front end accepts, which answers
+            # with "Http-Header-Length-Exceed". Those must go in the form body;
+            # the signature still covers the same `data` string either way.
+            post_headers = dict(headers)
+            post_headers["Content-Type"] = "application/x-www-form-urlencoded"
+            query = {k: v for k, v in params.items() if k != "data"}
+            resp = c.post(url, params=query, headers=post_headers, data={"data": data_str})
+        else:
+            resp = c.get(url, params=params, headers=headers)
 
         # MTOP sometimes wraps valid JSON inside `mtopjsonp1({...})` even when
         # we request originaljson. Strip the wrapper if present.
@@ -217,13 +300,21 @@ def mtop_call(
         # correct spelling silently disables the refresh, so any `FAIL_SYS_TOKEN*`
         # triggers the single refresh-and-retry.
         # httpx.Response.cookies iterates as cookie-name strings, so pull values by key.
+        # Any response may hand back a refreshed token; keep it regardless of
+        # whether this call needed a retry, so later calls skip the handshake.
+        served = {}
+        for name in resp.cookies:
+            val = resp.cookies.get(name)
+            if val is not None:
+                served[name] = val
+        remember_session_cookies(served)
+
         if retries > 0 and "FAIL_SYS_TOKEN" in ret_str:
             new_cookies = dict(cookies)
-            for name in resp.cookies:
-                val = resp.cookies.get(name)
-                if val is not None:
-                    new_cookies[name] = val
-            return mtop_call(api, version, payload, cookies=new_cookies, retries=retries - 1, referer=referer)
+            new_cookies.update(served)
+            return mtop_call(api, version, payload, cookies=new_cookies, retries=retries - 1,
+                             referer=referer, app_key=app_key, method=method,
+                             extra_query=extra_query)
 
         return data
 
@@ -792,7 +883,17 @@ def parse_product_detail(html: str, item_id: str) -> dict:
 
 # ─── MCP Server ─────────────────────────────────────────────────────────────
 
-mcp = FastMCP("aliexpress", dependencies=["httpx", "beautifulsoup4"])
+mcp = FastMCP(
+    "aliexpress",
+    dependencies=["httpx", "beautifulsoup4"],
+    instructions=(
+        "Browse, search, and manage an AliExpress account: search products, compare "
+        "sellers, check reviews/shipping/variants, and inspect your cart, orders, and "
+        "wishlist. Four tools write to the real, signed-in account (add_to_cart, "
+        "set_cart_quantity, remove_from_cart, create_wishlist) but none of them ever "
+        "checks out, places an order, or pays — checkout is not implemented."
+    ),
+)
 
 
 SORT_MAP = {
@@ -803,9 +904,28 @@ SORT_MAP = {
 }
 
 
-def _search_fetch_parse(query: str, sort_by: str = "best_match") -> list[dict]:
+SEARCH_RENDER_ATTEMPTS = 3
+
+
+def _search_total_results(html: str) -> Optional[int]:
+    """Read the server's own result count, which is present even when the grid isn't."""
+    m = re.search(r'"totalResults"\s*:\s*(\d+)', html)
+    return int(m.group(1)) if m else None
+
+
+def _search_fetch_parse(query: str, sort_by: str = "best_match",
+                        ship_from: str = "") -> tuple[list[dict], Optional[int]]:
     """
     Fetch an AliExpress search results page and parse product cards.
+
+    Returns (items, total_results). `total_results` comes from the page's own
+    `pageInfo.totalResults` and is reported even when zero cards parse.
+
+    AliExpress intermittently serves the results page WITHOUT the `mods.itemList`
+    grid — same URL, same second, sometimes present and sometimes not. Parsing
+    that as "no results" told the caller a 92,000-result query had no products,
+    so an empty parse against a non-zero total is retried before believing it.
+
     Raises RuntimeError(AUTH_EXPIRED_MSG) if AliExpress bounces us to login.
     """
     slug = quote_plus(query.strip()).replace("+", "-")
@@ -813,16 +933,29 @@ def _search_fetch_parse(query: str, sort_by: str = "best_match") -> list[dict]:
     params = {}
     if SORT_MAP.get(sort_by):
         params["SortType"] = SORT_MAP[sort_by]
+    if ship_from:
+        params["shipFromCountry"] = ship_from.strip().upper()
 
-    client = get_client()
-    try:
-        resp = client.get(url_path, params=params)
-        if check_auth_redirect(resp):
-            raise RuntimeError(AUTH_EXPIRED_MSG)
-        resp.raise_for_status()
-        return parse_search_results(resp.text)
-    finally:
-        client.close()
+    total = None
+    for attempt in range(SEARCH_RENDER_ATTEMPTS):
+        client = get_client()
+        try:
+            resp = client.get(url_path, params=params)
+            if check_auth_redirect(resp):
+                raise RuntimeError(AUTH_EXPIRED_MSG)
+            resp.raise_for_status()
+            items = parse_search_results(resp.text)
+            total = _search_total_results(resp.text)
+        finally:
+            client.close()
+
+        if items or not total:
+            return items, total
+        logger.info("search grid missing for %r (total=%s), retry %d/%d",
+                    query, total, attempt + 1, SEARCH_RENDER_ATTEMPTS - 1)
+        _pace("search_retry", 1.0)
+
+    return [], total
 
 
 def _format_product_lines(products: list[dict], header: str, limit: int = 25) -> str:
@@ -846,12 +979,19 @@ def _format_product_lines(products: list[dict], header: str, limit: int = 25) ->
     return "\n".join(lines)
 
 
-@mcp.tool()
+@mcp.tool(
+    title="Search Products",
+    annotations=ToolAnnotations(
+        readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True
+    ),
+    structured_output=False,
+)
 def search_products(
     query: str,
     min_rating: float = 0,
     max_price: float = 0,
     sort_by: str = "best_match",
+    ship_from: str = "",
 ) -> str:
     """
     Search AliExpress for products.
@@ -862,9 +1002,13 @@ def search_products(
         max_price: Maximum price, in the search's local currency (your AliExpress
             site currency, e.g. UAH — not necessarily ALIEXPRESS_CURRENCY). 0 disables.
         sort_by: One of "best_match", "orders", "price_asc", "price_desc"
+        ship_from: Two-letter warehouse country to restrict results to, e.g. "ES",
+            "PL", "FR", "CZ", "IT", "UK" for EU stock or "CN" for mainland China.
+            Shipping from inside your own customs union arrives in days rather than
+            weeks and avoids import charges. Empty = any warehouse.
     """
     try:
-        products = _search_fetch_parse(query, sort_by)
+        products, total_results = _search_fetch_parse(query, sort_by, ship_from)
     except RuntimeError as e:
         return str(e)
 
@@ -880,20 +1024,45 @@ def search_products(
         if max_price > 0:
             filters.append(f"price ≤ ${max_price:.2f}")
         suffix = f" with {', '.join(filters)}" if filters else ""
+        # Distinguish "AliExpress has nothing" from "AliExpress did not render the
+        # grid". Reporting the second as the first told callers a 92,000-result
+        # query was empty, and they believed it.
+        if total_results and not filters:
+            return (
+                f"AliExpress reports {total_results:,} results for '{query}' but did not "
+                f"return the results grid after {SEARCH_RENDER_ATTEMPTS} attempts — this is "
+                "an intermittent server-side render failure, not an empty catalogue. "
+                "Retry the same query."
+            )
+        if total_results:
+            return (f"No products matched {', '.join(filters)} for '{query}' "
+                    f"(AliExpress reports {total_results:,} results before filtering).")
         return f"No products found for '{query}'{suffix}."
 
-    return _format_product_lines(
-        products, f"Found {len(products)} result(s) for '{query}' (sort: {sort_by}):"
-    )
+    shown = min(len(products), 25)
+    header = f"Showing {shown} of {len(products)} parsed"
+    if total_results:
+        header += f" ({total_results:,} total)"
+    header += f" for '{query}' (sort: {sort_by}"
+    header += f", ships from {ship_from.upper()}" if ship_from else ""
+    header += "):"
+    return _format_product_lines(products, header)
 
 
-@mcp.tool()
+@mcp.tool(
+    title="Find Deals",
+    annotations=ToolAnnotations(
+        readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True
+    ),
+    structured_output=False,
+)
 def find_deals(
     query: str,
     min_discount: int = 0,
     max_price: float = 0,
     min_rating: float = 0,
     sort_by: str = "orders",
+    ship_from: str = "",
 ) -> str:
     """
     Search AliExpress and surface the most-discounted listings for a query.
@@ -908,9 +1077,10 @@ def find_deals(
             site currency, e.g. UAH — not necessarily ALIEXPRESS_CURRENCY). 0 disables.
         min_rating: Minimum rating (0-5). 0 disables filter.
         sort_by: Search sort ("orders", "best_match", "price_asc", "price_desc").
+        ship_from: Two-letter warehouse country (e.g. "ES", "PL", "CN"). Empty = any.
     """
     try:
-        products = _search_fetch_parse(query, sort_by)
+        products, total_results = _search_fetch_parse(query, sort_by, ship_from)
     except RuntimeError as e:
         return str(e)
 
@@ -941,7 +1111,7 @@ def _fetch_pdp_mtop(item_id: str) -> Optional[dict]:
     payload = {
         "productId": item_id,
         "_currency": CURRENCY,
-        "_lang": "en_US",
+        "_lang": LANG,
         "country": COUNTRY,
         "channel": "",
         "sourceType": "pc",
@@ -959,7 +1129,7 @@ def _fetch_pdp_mtop(item_id: str) -> Optional[dict]:
             logger.debug("MTOP %s failed: %s", api, e)
             continue
         ret = resp.get("ret", [])
-        if ret and any("SUCCESS" in r for r in ret):
+        if ret_problem(resp) is None:
             return resp
         # Some endpoints return data even without SUCCESS::API_SUCCESS in ret
         if resp.get("data") and isinstance(resp["data"], dict) and resp["data"]:
@@ -995,6 +1165,8 @@ def _extract_pdp_fields(mtop_resp: dict, item_id: str) -> dict:
         "shipping_cost": None,
         "shipping_estimate": None,
         "ship_from": None,
+        "ship_from_code": None,
+        "tax_note": None,
         "ship_unreachable": None,
         "ship_days_min": None,
         "ship_days_max": None,
@@ -1114,6 +1286,14 @@ def _extract_pdp_fields(mtop_resp: dict, item_id: str) -> dict:
                 pass
 
     # ── Shipping ──────────────────────────────────────────────────────
+    # AliExpress computes the duty position per item for the configured
+    # destination — "Import charges will apply" for a CN warehouse vs "No extra
+    # duties" for an in-union one. That is the landed-cost answer straight from
+    # the source, so read it rather than inferring customs rules ourselves.
+    tax_info = (result.get("PRICE_EXTEND") or {}).get("taxInfo") or {}
+    if isinstance(tax_info, dict) and tax_info.get("content"):
+        d["tax_note"] = _strip_html(tax_info["content"])
+
     ship = result.get("SHIPPING")
     if isinstance(ship, dict):
         # bizData lives inside originalLayoutResultList[0] or deliveryLayoutInfo[0]
@@ -1140,6 +1320,7 @@ def _extract_pdp_fields(mtop_resp: dict, item_id: str) -> dict:
             elif eta_min:
                 d["shipping_estimate"] = eta_min
             d["ship_from"] = biz.get("shipFrom")
+            d["ship_from_code"] = biz.get("shipFromCode")
             if biz.get("unreachable"):
                 d["ship_unreachable"] = True
             dmin = biz.get("deliveryDayMin")
@@ -1165,7 +1346,13 @@ def _extract_pdp_fields(mtop_resp: dict, item_id: str) -> dict:
     return d
 
 
-@mcp.tool()
+@mcp.tool(
+    title="Get Product Details",
+    annotations=ToolAnnotations(
+        readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True
+    ),
+    structured_output=False,
+)
 def get_product_details(item_id: str = "", url: str = "") -> str:
     """
     Get detailed info for a specific AliExpress product.
@@ -1263,11 +1450,22 @@ def get_product_details(item_id: str = "", url: str = "") -> str:
             eta_line += f" ({d['ship_days_min']}–{d['ship_days_max']} days)"
         lines.append(eta_line)
     if d.get("ship_from"):
-        lines.append(f"Ships from: {d['ship_from']}")
+        origin = f"Ships from: {d['ship_from']}"
+        if d.get("ship_from_code"):
+            origin += f" ({d['ship_from_code']})"
+        lines.append(origin)
+    if d.get("tax_note"):
+        lines.append(f"Duties: {d['tax_note']}")
     return "\n".join(lines)
 
 
-@mcp.tool()
+@mcp.tool(
+    title="Get Shipping Estimate",
+    annotations=ToolAnnotations(
+        readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True
+    ),
+    structured_output=False,
+)
 def get_shipping_estimate(item_id: str = "", url: str = "") -> str:
     """
     Check shipping time and cost for a product to the configured country.
@@ -1331,9 +1529,11 @@ def get_shipping_estimate(item_id: str = "", url: str = "") -> str:
 FEEDBACK_URL = "https://feedback.aliexpress.com/pc/searchEvaluation.do"
 
 
-def _fetch_reviews(item_id: str, page: int = 1, page_size: int = 20, filt: str = "all") -> Optional[dict]:
+def _fetch_reviews(item_id: str, page: int = 1, page_size: int = 20, filt: str = "all",
+                    cookies: Optional[dict[str, str]] = None) -> Optional[dict]:
     """Fetch one page of reviews. Returns the response `data` block, or None."""
-    cookies = load_cookies()
+    if cookies is None:
+        cookies = load_cookies()
     cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
     headers = {
         "User-Agent": USER_AGENT,
@@ -1367,8 +1567,8 @@ def _extract_reviews(data: dict, max_reviews: int) -> dict:
         return out
 
     stat = data.get("productEvaluationStatistic") or {}
-    if isinstance(stat, dict):
-        out["stats"] = {
+    if isinstance(stat, dict) and stat:
+        stats = {
             "average": stat.get("evarageStar"),
             "total": stat.get("totalNum"),
             "positive_rate": stat.get("positiveRate"),
@@ -1382,6 +1582,11 @@ def _extract_reviews(data: dict, max_reviews: int) -> dict:
                 1: stat.get("oneStarNum"),
             },
         }
+        has_value = any(v is not None for k, v in stats.items() if k != "stars") or any(
+            v is not None for v in stats["stars"].values()
+        )
+        if has_value:
+            out["stats"] = stats
     out["total"] = data.get("totalNum") or (out["stats"] or {}).get("total")
 
     for ev in (data.get("evaViewList") or [])[:max_reviews]:
@@ -1402,7 +1607,13 @@ def _extract_reviews(data: dict, max_reviews: int) -> dict:
     return out
 
 
-@mcp.tool()
+@mcp.tool(
+    title="Get Reviews",
+    annotations=ToolAnnotations(
+        readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True
+    ),
+    structured_output=False,
+)
 def get_reviews(item_id: str = "", url: str = "", max_reviews: int = 10, filter_by: str = "all") -> str:
     """
     Fetch buyer reviews and the rating breakdown for an AliExpress product.
@@ -1418,8 +1629,12 @@ def get_reviews(item_id: str = "", url: str = "", max_reviews: int = 10, filter_
     if not item_id:
         return "Provide a valid item_id or AliExpress product URL (short a.aliexpress.com links work too)."
 
+    cookies = load_cookies()
+    if not cookies:
+        return AUTH_EXPIRED_MSG
+
     page_size = min(max(max_reviews, 10), 50)
-    data = _fetch_reviews(item_id, page=1, page_size=page_size, filt=filter_by)
+    data = _fetch_reviews(item_id, page=1, page_size=page_size, filt=filter_by, cookies=cookies)
     if data is None:
         return f"Could not fetch reviews for item {item_id} (no usable response)."
 
@@ -1502,7 +1717,13 @@ def _extract_seller(shop: dict) -> dict:
     return d
 
 
-@mcp.tool()
+@mcp.tool(
+    title="Get Seller",
+    annotations=ToolAnnotations(
+        readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True
+    ),
+    structured_output=False,
+)
 def get_seller(item_id: str = "", url: str = "") -> str:
     """
     Get the store / seller profile behind an AliExpress product: rating,
@@ -1564,7 +1785,13 @@ def get_seller(item_id: str = "", url: str = "") -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@mcp.tool(
+    title="Compare Sellers",
+    annotations=ToolAnnotations(
+        readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True
+    ),
+    structured_output=False,
+)
 def compare_sellers(title: str = "", item_id: str = "", url: str = "", max_candidates: int = 6) -> str:
     """
     Find which SELLERS offer the same product and rank them by how established each
@@ -1601,7 +1828,7 @@ def compare_sellers(title: str = "", item_id: str = "", url: str = "", max_candi
 
     max_candidates = min(max(max_candidates, 1), 10)
     try:
-        products = _search_fetch_parse(query)
+        products, _ = _search_fetch_parse(query)
     except RuntimeError as e:
         return str(e)
     if not products:
@@ -1705,6 +1932,62 @@ def _sku_prop_map(sku: dict) -> dict[str, str]:
     return prop_map
 
 
+def _sku_prop_details(sku: dict) -> dict[str, dict[str, Optional[str]]]:
+    """
+    Build {"<propId>:<valueId>": {"axis", "value", "raw_value", "image"}}.
+
+    Richer sibling of `_sku_prop_map`. The extra fields matter because AliExpress
+    sellers routinely sell unrelated products through one axis — a "Color" whose
+    values are "10pcs 40P male" / "5Sets male female". Exposing the axis name and
+    the per-variant image lets the caller notice that; the display value alone
+    hides it.
+    """
+    details: dict[str, dict[str, Optional[str]]] = {}
+    for prop in (sku.get("skuProperties") or []):
+        if not isinstance(prop, dict):
+            continue
+        pid = prop.get("skuPropertyId")
+        axis = prop.get("skuPropertyName")
+        for v in (prop.get("skuPropertyValues") or []):
+            if not isinstance(v, dict):
+                continue
+            vid = v.get("propertyValueIdLong") or v.get("propertyValueId")
+            if pid is None or vid is None:
+                continue
+            details[f"{pid}:{vid}"] = {
+                "axis": str(axis).strip() if axis else None,
+                "value": (v.get("propertyValueDisplayName") or v.get("propertyValueName") or "").strip() or None,
+                "raw_value": (v.get("propertyValueName") or "").strip() or None,
+                "image": v.get("skuPropertyImagePath") or None,
+            }
+    return details
+
+
+def _sku_attr_detail_parts(sku_attr: str, details: dict) -> tuple[list[str], Optional[str]]:
+    """
+    Resolve a skuAttr into ["Axis: Value", ...] plus the variant's image, if any.
+
+    Falls back to the bare value when the axis name is unknown, so listings that
+    only carry the inline "#name" encoding still render sensibly.
+    """
+    labels: list[str] = []
+    image: Optional[str] = None
+    for part in (sku_attr or "").split(";"):
+        part = part.strip()
+        if not part:
+            continue
+        key = part.split("#", 1)[0].strip()
+        meta = details.get(key) or {}
+        value = meta.get("value") or (part.split("#", 1)[1].strip() if "#" in part else None)
+        if not value:
+            continue
+        axis = meta.get("axis")
+        labels.append(f"{axis}: {value}" if axis else value)
+        if image is None and meta.get("image"):
+            image = meta["image"]
+    return labels, image
+
+
 def _sku_attr_parts(sku_attr: str, prop_map: Optional[dict[str, str]] = None) -> list[str]:
     """
     Resolve a skuAttr into its human-readable value components. Handles both encodings:
@@ -1739,6 +2022,7 @@ def _extract_variants(result: dict) -> list[dict]:
     price_map = price.get("skuPriceInfoMap") if isinstance(price.get("skuPriceInfoMap"), dict) else {}
     paths = sku.get("skuPaths") if isinstance(sku.get("skuPaths"), list) else []
     prop_map = _sku_prop_map(sku)
+    prop_details = _sku_prop_details(sku)
     gd = result.get("GLOBAL_DATA", {}).get("globalData", {})
     page_currency = gd.get("currencyCode") if isinstance(gd, dict) else None
 
@@ -1759,10 +2043,13 @@ def _extract_variants(result: dict) -> list[dict]:
                 original = op.get("value") if isinstance(op.get("value"), (int, float)) else _normalize_price(op.get("formatedAmount"))
                 currency = op.get("currency") or page_currency
         spec_parts = _sku_attr_parts(p.get("skuAttr", ""), prop_map)
+        label_parts, image = _sku_attr_detail_parts(p.get("skuAttr", ""), prop_details)
         variants.append({
             "sku_id": sku_id,
             "spec": " · ".join(spec_parts) if spec_parts else None,
             "spec_parts": spec_parts,
+            "label_parts": label_parts,
+            "image": image,
             "price": price_val,
             "original_price": original,
             "currency": currency,
@@ -1785,7 +2072,13 @@ def _extract_variants(result: dict) -> list[dict]:
     return [merged[k] for k in order]
 
 
-@mcp.tool()
+@mcp.tool(
+    title="Get Variants",
+    annotations=ToolAnnotations(
+        readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True
+    ),
+    structured_output=False,
+)
 def get_variants(item_id: str = "", url: str = "") -> str:
     """
     List every buyable configuration (SKU) of an AliExpress product with its own
@@ -1828,6 +2121,17 @@ def get_variants(item_id: str = "", url: str = "") -> str:
     for v in variants:
         kept = [p for p in (v.get("spec_parts") or []) if p not in common]
         v["display_spec"] = " · ".join(kept) if kept else (v.get("spec") or v["sku_id"])
+        # Prefer the "Axis: Value" form — it reveals when a seller is pushing
+        # unrelated products through a dimension like Color.
+        labels = v.get("label_parts") or []
+        kept_labels = [l for l in labels if l.split(": ", 1)[-1] not in common]
+        if kept_labels:
+            v["display_spec"] = " · ".join(kept_labels)
+
+    # Per-variant images only help when they actually differ; on a normal listing
+    # every SKU shares one image and printing it 20 times is pure noise.
+    seen_images = {v.get("image") for v in variants if v.get("image")}
+    images_vary = len(seen_images) > 1
 
     priced = [v["price"] for v in variants if v["price"] is not None]
     cur = next((v["currency"] for v in variants if v.get("currency")), None) or CURRENCY
@@ -1846,8 +2150,27 @@ def get_variants(item_id: str = "", url: str = "") -> str:
             line += f" (was {v['original_price']:.2f}, -{disc}%){_msrp_flag(disc)}"
         if not v["in_stock"] or v.get("stock") == 0:
             line += " ⚠ out of stock"
+        elif isinstance(v.get("stock"), int):
+            line += f", {v['stock']} in stock"
+        # The sku_id is what add_to_cart needs to pick this exact configuration —
+        # without it the caller can only ever add the item's preselected variant.
+        line += f"  [sku_id: {v['sku_id']}]"
         lines.append(line)
+        if images_vary and v.get("image"):
+            lines.append(f"    image: {v['image']}")
+
     return "\n".join(lines)
+
+
+def blocks(resp: dict) -> dict:
+    """
+    Return a response's `data.data` block-map ({} if the shape doesn't match).
+
+    Cart, order-list, and wishlist renders all key their components this way —
+    every read of that shape should go through here instead of retyping the dig.
+    """
+    b = (resp.get("data") or {}).get("data") or {}
+    return b if isinstance(b, dict) else {}
 
 
 def _iter_blocks(resp: dict):
@@ -1855,11 +2178,41 @@ def _iter_blocks(resp: dict):
     Yield (block_id, block) for each dict block in a dida `data.data` block-map.
     Shared by the cart / orders / wishlist extractors, which all render this shape.
     """
-    blocks = resp.get("data", {}).get("data", {})
-    if isinstance(blocks, dict):
-        for bid, b in blocks.items():
-            if isinstance(b, dict):
-                yield bid, b
+    for bid, b in blocks(resp).items():
+        if isinstance(b, dict):
+            yield bid, b
+
+
+def _block_by_prefix(resp: dict, prefix: str) -> tuple[Optional[str], dict]:
+    """
+    Find the first block whose id starts with `prefix`.
+
+    Component ids carry a server-assigned numeric suffix (cart pagination,
+    order-list body/header, …), so matching the bare name exactly stops working
+    silently the moment AliExpress changes the suffix — prefix matching is the
+    stable way to find them. Shared by the cart and order pagers.
+    """
+    for bid, block in blocks(resp).items():
+        if bid.startswith(prefix) and isinstance(block, dict):
+            return bid, block
+    return None, {}
+
+
+def ret_problem(resp: dict) -> Optional[str]:
+    """
+    Return a friendly message if an MTOP response's `ret` isn't a success, else
+    None. Shared by the cart, order, and wishlist tools — they all see the same
+    handful of failure shapes (expired quick-copy cookies, expired token, …).
+    """
+    ret = resp.get("ret", []) if isinstance(resp, dict) else []
+    ret_str = ret[0] if ret else ""
+    if any("SUCCESS" in r for r in ret):
+        return None
+    if any(s in ret_str for s in ("SESSION_EXPIRED", "NEED_LOGIN", "ILLEGAL_ACCESS", "NO_LOGIN")):
+        return FULL_AUTH_MSG
+    if "TOKEN" in ret_str:
+        return AUTH_EXPIRED_MSG
+    return f"AliExpress API returned: {ret_str or 'unknown error'}."
 
 
 def _cents_to_float(amt_dict: Any) -> tuple[Optional[float], Optional[str]]:
@@ -1876,6 +2229,266 @@ def _cents_to_float(amt_dict: Any) -> tuple[Optional[float], Optional[str]]:
     if isinstance(fmt, str):
         return parse_price(fmt), None
     return None, None
+
+
+def _extract_cart_droplet(resp: dict) -> dict:
+    """
+    Parse the cart's *droplet* render shape into the same dict `_extract_cart`
+    returns, so the renderer doesn't care which shape it came from.
+
+    `cart.render` answers in two different shapes depending on the payload: the
+    legacy one (`hierarchy`/`linkage`, first page only) and this Ultron/droplet
+    one (`components`/`page`), which is the only shape carrying pagination.
+    """
+    result: dict[str, Any] = {"items": [], "shops": {}, "count": None, "currency": None,
+                              "subtotal": None, "shipping_fee": None, "total": None}
+
+    for bid, block in blocks(resp).items():
+        if "product_component" not in bid or not isinstance(block, dict):
+            continue
+        f = block.get("fields") or {}
+        iv = f.get("itemView") or {}
+        item_id = iv.get("itemId")
+
+        # Unavailable lines (sold out, delisted, no longer shippable) use a
+        # different shape: no itemView, fields promoted to the top level, plus an
+        # `invalidText` saying why. Skipping them hid real cart contents — the
+        # caller needs to know something it may have planned around is gone.
+        if not item_id and f.get("itemId"):
+            result["items"].append({
+                "item_id": str(f["itemId"]),
+                "title": str(f.get("itemTitle") or "")[:200],
+                "sku_id": f.get("skuId"),
+                "image_url": f.get("itemImageUrl"),
+                "url": f"{BASE_URL}/item/{f['itemId']}.html",
+                "valid": False,
+                "status": f.get("status"),
+                "cart_id": f.get("cartId"),
+                "quantity": (f.get("quantityView") or {}).get("current") or 1,
+                "unavailable_reason": _strip_html(f.get("invalidText")) or "no longer available",
+            })
+            continue
+
+        if not item_id:
+            continue
+
+        item: dict[str, Any] = {
+            "item_id": str(item_id),
+            "title": str(iv.get("title") or "")[:200],
+            "sku_info": (iv["sku"].get("skuInfo") if isinstance(iv.get("sku"), dict)
+                         else iv.get("sku") if isinstance(iv.get("sku"), str) else None),
+            "sku_id": iv.get("skuId"),
+            "image_url": iv.get("imageUrl"),
+            "url": f"{BASE_URL}/item/{item_id}.html",
+            "valid": iv.get("valid", True),
+            "status": iv.get("status"),
+            "cart_id": iv.get("cartId"),
+            "quantity": (f.get("quantityView") or {}).get("current") or 1,
+        }
+
+        for pv in (f.get("priceViews") or []):
+            if not isinstance(pv, dict):
+                continue
+            if pv.get("priceType") == "showPrice" and isinstance(pv.get("value"), (int, float)):
+                item["price"] = pv["value"]
+                item["currency"] = pv.get("currency") or (pv.get("amount") or {}).get("currencyCode")
+            elif pv.get("priceType") == "crossedPrice" and isinstance(pv.get("value"), (int, float)):
+                item["original_price"] = pv["value"]
+
+        lv = f.get("logisticsView") or {}
+        if lv.get("freeShipping"):
+            item["shipping_cost"] = 0.0
+        elif lv.get("freightCost"):
+            item["shipping_cost"] = parse_price(str(lv["freightCost"]))
+        if lv.get("deliveryText"):
+            item["delivery_date"] = re.sub(r"<[^>]+>", "", str(lv["deliveryText"])).replace("Delivery:", "").strip()
+
+        shop = f.get("shopView") or {}
+        if shop.get("name"):
+            item["shop_name"] = shop["name"]
+        if shop.get("homeUrl"):
+            url = str(shop["homeUrl"])
+            item["shop_url"] = "https:" + url if url.startswith("//") else url
+        if shop.get("sellerId") is not None:
+            item["seller_id"] = str(shop["sellerId"])
+
+        result["items"].append(item)
+
+    result["count"] = len(result["items"]) or None
+    result["currency"] = next((i.get("currency") for i in result["items"] if i.get("currency")), None)
+    return result
+
+
+CART_PAGINATION_COMPONENT = "app_cart_pagination_container_page"
+CART_MAX_PAGES = 10
+
+
+def _cart_droplet_render(cookies: dict) -> dict:
+    """Render the cart in the droplet shape (the only one supporting paging/writes)."""
+    return mtop_call(
+        "mtop.aliexpress.trade.cart.render", "1.0",
+        {"_saasRegion": "AEG", "_currency": CURRENCY, "shipToCountry": COUNTRY,
+         "locale": "en_US", "language": "en", "system": "pc",
+         "bizParams": json.dumps({"platformType": "DESKTOP", "pcChoiceNewCart": 1},
+                                 separators=(",", ":"))},
+        cookies=cookies, referer=f"{BASE_URL}/p/shoppingcart/index.html",
+    )
+
+
+def _cart_operate(cookies: dict, resp: dict, component_id: str, operation: str,
+                  quantity: Optional[int] = None) -> str:
+    """
+    Run an Ultron/droplet operation against one cart line and return the MTOP `ret`.
+
+    The browser sends a deliberately small envelope: only the operated component
+    (carrying `fields.operationType`) and the page root, never the whole tree —
+    sending everything is rejected with AE-CART-PARSE-PARAM-ERROR.
+
+    For "update_quantity" it also *replaces* `fields.quantityView` with a bare
+    `{"current": N}` rather than editing the rendered object in place. Sending the
+    full quantityView back is accepted with SUCCESS but silently does nothing.
+    """
+    tree = resp.get("data") or {}
+    blocks = tree.get("data") or {}
+    root = (tree.get("page") or {}).get("root")
+
+    comp = json.loads(json.dumps(blocks[component_id]))
+    comp.setdefault("fields", {})["operationType"] = operation
+    if quantity is not None:
+        comp["fields"]["quantityView"] = {"current": int(quantity)}
+    comp["needSubmit"] = True
+    data = {component_id: comp}
+    if root and root in blocks:
+        root_comp = json.loads(json.dumps(blocks[root]))
+        root_comp["needSubmit"] = True
+        data[root] = root_comp
+
+    outer = {
+        "config": {"fromDroplet": True, "pageName": "cart_droplet2_web", "protocolVersion": "1.0"},
+        "operator": component_id,
+        "asyncHandler": tree.get("asyncHandler") or {},
+        "data": data,
+        "page": tree.get("page") or {},
+    }
+    payload = {
+        "compress": True,
+        "params": base64.b64encode(gzip.compress(
+            json.dumps(outer, separators=(",", ":"), ensure_ascii=False).encode())).decode(),
+        "bizParams": json.dumps({"platformType": "DESKTOP", "pcChoiceNewCart": 1},
+                                separators=(",", ":")),
+        "_saasRegion": "aeg", "_currency": CURRENCY, "shipToCountry": COUNTRY,
+        "_state": "", "_city": "", "locale": "en_US", "nextPage": False,
+    }
+    _pace("cart_write", CART_WRITE_MIN_INTERVAL)
+    resp2 = mtop_call("mtop.aliexpress.trade.cart.async", "1.0", payload, cookies=cookies,
+                      referer=f"{BASE_URL}/p/shoppingcart/index.html", method="POST")
+    return (resp2.get("ret") or ["?"])[0]
+
+
+def _cart_lines(resp: dict) -> list[dict]:
+    """Flatten a rendered cart into [{component_id, item_id, sku_id, cart_id, title, qty}]."""
+    rows = []
+    for bid, block in blocks(resp).items():
+        if "product_component" not in bid or not isinstance(block, dict):
+            continue
+        f = block.get("fields") or {}
+        iv = f.get("itemView") or {}
+        if not iv.get("itemId"):
+            continue
+        rows.append({
+            "component_id": bid,
+            "item_id": str(iv.get("itemId")),
+            "sku_id": str(iv.get("skuId")) if iv.get("skuId") is not None else None,
+            "cart_id": str(iv.get("cartId")) if iv.get("cartId") is not None else None,
+            "title": str(iv.get("title") or "")[:70],
+            "qty": (f.get("quantityView") or {}).get("current"),
+        })
+    return rows
+
+
+def _cart_fetch_all_pages(cookies: dict, first: dict) -> tuple[dict, Optional[str]]:
+    """
+    Walk the cart's remaining pages and merge them into `first`.
+
+    `cart.render` has no page parameter — it always returns page 1. Further pages
+    come from the Ultron/droplet endpoint: POST the rendered component tree back
+    with the pagination component as `operator` and `nextPage: true`, which
+    returns the next slice ("strategy": "append"). Merging the block maps lets
+    the ordinary cart extractor see every line.
+
+    The pagination component's id carries a server-assigned numeric suffix (like
+    order-list block ids), so it's found by prefix match on CART_PAGINATION_COMPONENT
+    and that discovered id is reused as `operator` for the whole walk, rather than
+    assuming the bare constant is the exact id.
+
+    Returns (merged_response, warning). `warning` is set when the walk stopped
+    early, so the caller can say so rather than silently under-reporting — this
+    includes the server replaying a page (0 net-new cart-line blocks after a
+    merge), which stops immediately instead of burning the rest of the page
+    budget only to blame the cap.
+    """
+    merged = json.loads(json.dumps(first))
+    page_id, state = _block_by_prefix(merged, CART_PAGINATION_COMPONENT)
+    if not state.get("hasMore"):
+        return merged, None
+
+    def cart_line_count(r):
+        return sum(1 for k in blocks(r) if "product_component" in k)
+
+    for _ in range(CART_MAX_PAGES - 1):
+        tree = merged.get("data") or {}
+        outer = {
+            "config": tree.get("config") or {
+                "fromDroplet": True, "pageName": "cart_droplet2_web", "protocolVersion": "1.0"},
+            "operator": page_id,
+            "asyncHandler": tree.get("asyncHandler") or {},
+            "data": tree.get("data") or {},
+            "page": tree.get("page") or {},
+        }
+        blob = base64.b64encode(gzip.compress(
+            json.dumps(outer, separators=(",", ":"), ensure_ascii=False).encode())).decode()
+        payload = {
+            "compress": True,
+            "params": blob,
+            "bizParams": json.dumps({"platformType": "DESKTOP", "pcChoiceNewCart": 1},
+                                    separators=(",", ":")),
+            "_saasRegion": "aeg", "_currency": CURRENCY, "shipToCountry": COUNTRY,
+            "_state": "", "_city": "", "locale": "en_US", "nextPage": True,
+        }
+        try:
+            resp = mtop_call(
+                "mtop.aliexpress.trade.cart.async", "1.0", payload,
+                cookies=cookies, referer=f"{BASE_URL}/p/shoppingcart/index.html",
+                method="POST",
+            )
+        except Exception as e:
+            return merged, f"stopped paging after an error: {e}"
+
+        if ret_problem(resp):
+            return merged, f"stopped paging — the cart API returned {(resp.get('ret') or ['?'])[0]}"
+
+        new_blocks = blocks(resp)
+        if not new_blocks:
+            return merged, None
+        before = cart_line_count(merged)
+        merged.setdefault("data", {}).setdefault("data", {}).update(new_blocks)
+        if cart_line_count(merged) <= before:
+            return merged, "stopped paging — the server replayed a page"
+
+        # Carry the response's own asyncHandler/page forward. The handler encodes
+        # where the cursor is, so reusing the first page's copy asks for "the page
+        # after page 1" every time — which silently caps the walk at two pages.
+        for key in ("asyncHandler", "page", "config"):
+            if (resp.get("data") or {}).get(key):
+                merged["data"][key] = (resp.get("data") or {})[key]
+
+        # The response carries a refreshed pagination component; trust it for the
+        # loop condition so a cart that grows mid-walk still terminates.
+        _, page_state = _block_by_prefix(resp, CART_PAGINATION_COMPONENT)
+        if not page_state.get("hasMore"):
+            return merged, None
+
+    return merged, f"stopped after {CART_MAX_PAGES} pages — some items may be missing"
 
 
 def _extract_cart(render_response: dict) -> dict:
@@ -2059,7 +2672,342 @@ def _extract_cart(render_response: dict) -> dict:
     return result
 
 
-@mcp.tool()
+def _resolve_sku_for_cart(item_id: str, sku_id: str = "") -> tuple[Optional[str], Optional[str], Optional[str]]:
+    """
+    Pull the fields `cart.add` needs but the caller shouldn't have to know.
+
+    Always resolves the shipping solution code (the browser sends it on every
+    add, including when a variant is chosen explicitly). When `sku_id` is given
+    it is validated against the item's real SKU list instead of being trusted —
+    a wrong id would otherwise be sent to AliExpress verbatim.
+
+    Returns (sku_id, fulfillment_service, error). On success `error` is None.
+    """
+    try:
+        resp = _fetch_pdp_mtop(item_id)
+    except Exception as e:
+        return None, None, f"MTOP call failed: {e}"
+    if not resp:
+        return None, None, f"Could not fetch item {item_id} — MTOP returned no usable response."
+
+    result = (resp.get("data") or {}).get("result") or resp.get("result") or {}
+    sku = result.get("SKU") or {}
+    layouts = (result.get("SHIPPING") or {}).get("originalLayoutResultList") or []
+    biz = (layouts[0].get("bizData") if layouts and isinstance(layouts[0], dict) else {}) or {}
+    service = biz.get("deliveryOptionCode")
+
+    if sku_id:
+        paths = sku.get("skuPaths") if isinstance(sku.get("skuPaths"), list) else []
+        known = {
+            str(p.get("skuIdStr") or p.get("skuId"))
+            for p in paths if isinstance(p, dict) and (p.get("skuIdStr") or p.get("skuId")) is not None
+        }
+        if known and str(sku_id) not in known:
+            return None, None, (
+                f"sku_id {sku_id} is not a variant of item {item_id}. "
+                "Run get_variants on this item and use one of the listed sku_id values."
+            )
+        return str(sku_id), service, None
+
+    default_id = sku.get("selectedSkuIdStr") or sku.get("selectedSkuId")
+    if default_id is None:
+        return None, None, (
+            f"Item {item_id} exposes no default SKU — pass sku_id explicitly "
+            "(get_variants lists them)."
+        )
+    if sku.get("selectedSkuSaleable") is False:
+        return None, None, f"The default variant of item {item_id} is not saleable (out of stock)."
+    return str(default_id), service, None
+
+
+@mcp.tool(
+    title="Add to Cart",
+    annotations=ToolAnnotations(
+        readOnlyHint=False, destructiveHint=False, idempotentHint=False,
+        openWorldHint=True
+    ),
+    structured_output=False,
+)
+def add_to_cart(item_id: str = "", url: str = "", sku_id: str = "", quantity: int = 1) -> str:
+    """
+    Add an item to your AliExpress cart. This WRITES to your real account.
+
+    Does not buy anything — the item sits in the cart until you check out on the
+    site yourself. To remove an item you no longer want, use remove_from_cart.
+
+    Args:
+        item_id: AliExpress item ID (e.g., "1005007655628250").
+        url: Full or short AliExpress product URL (alternative to item_id).
+        sku_id: Specific variant to add, as printed by get_variants
+            (`[sku_id: ...]`). Defaults to the item's preselected variant, which
+            is what the product page shows — pass one explicitly whenever the
+            options matter (size, colour, length, male/female).
+        quantity: How many to add (default 1).
+    """
+    item_id = _resolve_item_id(item_id, url)
+    if not item_id:
+        return "Provide a valid item_id or AliExpress product URL (short a.aliexpress.com links work too)."
+    if quantity < 1:
+        return "quantity must be at least 1."
+    cookies = load_cookies()
+    if not cookies:
+        return AUTH_EXPIRED_MSG
+
+    sku_id, service, err = _resolve_sku_for_cart(item_id, sku_id)
+    if err:
+        return err
+
+    add_item: dict[str, Any] = {
+        "itemId": str(item_id),
+        "skuId": str(sku_id),
+        "quantity": quantity,
+        "attributes": {"carAdditionalInfo": "{}", "sourceType": ""},
+    }
+    if service:
+        add_item["fulfillmentservice"] = service
+
+    payload = {
+        "_saasRegion": "AEG",
+        "_currency": CURRENCY,
+        "state": "",
+        "city": "",
+        "shipToCountry": COUNTRY,
+        "currency": CURRENCY,
+        "locale": "en_US",
+        "language": "en",
+        "system": "pc",
+        "bizParams": json.dumps({"platformType": "DESKTOP"}, separators=(",", ":")),
+        "addItems": json.dumps([add_item], separators=(",", ":")),
+        "addFrom": "main_detail",
+    }
+
+    def _is_challenged(r: dict) -> bool:
+        rets = r.get("ret") or [""]
+        return "FAIL_SYS_USER_VALIDATE" in rets[0] or any("RGV587" in str(x) for x in rets)
+
+    # Writes are the rate-limited surface, so hold them further apart than reads
+    # and absorb one cooldown transparently — it typically clears in seconds.
+    resp = None
+    for attempt, backoff in enumerate((6.0, 15.0, None)):
+        _pace("cart_write", CART_WRITE_MIN_INTERVAL)
+        try:
+            resp = mtop_call(
+                "mtop.aliexpress.trade.cart.add", "1.0", payload,
+                cookies=cookies,
+                referer=f"{BASE_URL}/item/{item_id}.html",
+                app_key=MTOP_CART_APP_KEY,
+            )
+        except Exception as e:
+            return f"MTOP call failed: {e}"
+        if not _is_challenged(resp) or backoff is None:
+            break
+        logger.info("cart.add rate-limited; retrying in %.0fs (attempt %d)", backoff, attempt + 1)
+        time.sleep(backoff + random.uniform(0, 2.0))
+
+    ret_all = resp.get("ret") or [""]
+    ret = ret_all[0]
+    data = resp.get("data") or {}
+
+    # AliExpress's risk engine (RGV587) challenges writes with a captcha. It is
+    # scoped to the write endpoint — reads keep working — and clears once the
+    # challenge is solved in a browser and fresh cookies are saved.
+    if "FAIL_SYS_USER_VALIDATE" in ret or any("RGV587" in str(x) for x in ret_all):
+        msg = [
+            f"AliExpress rate-limited this write (anti-bot check) — item {item_id} "
+            "was NOT added.",
+            "",
+            "This is usually a short cooldown triggered by adding several items in "
+            "quick succession, and it clears by itself — wait a minute or two and "
+            "retry. Searching and product lookups keep working meanwhile.",
+            "",
+            "Only if it persists across several minutes: open AliExpress in the "
+            "browser you exported cookies from, add anything to the cart manually, "
+            "then re-save credentials.",
+        ]
+        challenge = data.get("url")
+        if challenge:
+            msg += ["", f"(Verification URL, rarely needed: {challenge})"]
+        return "\n".join(msg)
+
+    if ret_problem(resp) is not None or data.get("addFailed"):
+        return f"Could not add item {item_id} to cart — AliExpress said: {ret or 'no status returned'}."
+
+    lines = [f"Added item {item_id} (variant {sku_id}) ×{quantity} to your cart."]
+    if data.get("cartNum") is not None:
+        lines.append(f"  Cart now holds {data['cartNum']} item(s).")
+    if data.get("cartId") is not None:
+        lines.append(f"  Cart line ID: {data['cartId']}")
+    lines.append("  Nothing has been ordered or paid for.")
+    return "\n".join(lines)
+
+
+def _resolve_cart_target(cookies: dict, item_id: str, cart_id: str, sku_id: str):
+    """
+    Find the single cart line a write should act on.
+
+    Returns (resp, target, error). Refuses to guess when one item_id spans
+    several lines — that happens whenever the same product is in the cart under
+    two variants, and picking wrong would edit the wrong thing.
+    """
+    try:
+        resp = _cart_droplet_render(cookies)
+        if ret_problem(resp):
+            return None, None, f"Could not read the cart: {(resp.get('ret') or ['?'])[0]}"
+        resp, _ = _cart_fetch_all_pages(cookies, resp)
+    except Exception as e:
+        return None, None, f"Cart MTOP call failed: {e}"
+
+    rows = _cart_lines(resp)
+    if cart_id:
+        matches = [r for r in rows if r["cart_id"] == str(cart_id)]
+    else:
+        matches = [r for r in rows if r["item_id"] == str(item_id)]
+        if sku_id:
+            matches = [r for r in matches if r["sku_id"] == str(sku_id)]
+
+    if not matches:
+        which = f"cart_id {cart_id}" if cart_id else f"item {item_id}"
+        return None, None, f"No cart line matches {which}. Run view_cart to see what's there."
+    if len(matches) > 1:
+        listing = "\n".join(
+            f"  - cart_id {m['cart_id']} · variant {m['sku_id']} · ×{m['qty']} · {m['title']}"
+            for m in matches)
+        return None, None, (
+            f"Item {item_id} occupies {len(matches)} cart lines — refusing to guess which "
+            f"one you mean. Re-run with the cart_id:\n{listing}")
+    return resp, matches[0], None
+
+
+@mcp.tool(
+    title="Set Cart Quantity",
+    annotations=ToolAnnotations(
+        readOnlyHint=False, destructiveHint=False, idempotentHint=True,
+        openWorldHint=True
+    ),
+    structured_output=False,
+)
+def set_cart_quantity(quantity: int, item_id: str = "", url: str = "",
+                      cart_id: str = "", sku_id: str = "") -> str:
+    """
+    Change how many of one cart line you have. This WRITES to your real account.
+
+    Sets an absolute quantity, not a delta — quantity=3 means "three of these",
+    whatever it was before. AliExpress caps this per listing; exceeding the cap
+    is reported back rather than silently clamped.
+
+    Args:
+        quantity: The new absolute quantity (1 or more). To remove a line
+            entirely use remove_from_cart, not quantity=0.
+        item_id: AliExpress item ID of the line to change.
+        url: Full or short AliExpress product URL (alternative to item_id).
+        cart_id: Exact cart line id from view_cart — the unambiguous way to
+            target one variant when an item occupies several lines.
+        sku_id: Variant id, to disambiguate between lines of the same item.
+    """
+    if quantity < 1:
+        return "quantity must be at least 1 — use remove_from_cart to delete a line."
+    if not cart_id:
+        item_id = _resolve_item_id(item_id, url)
+        if not item_id:
+            return "Provide a cart_id, or an item_id / AliExpress product URL."
+
+    cookies = load_cookies()
+    if not cookies:
+        return AUTH_EXPIRED_MSG
+
+    resp, target, err = _resolve_cart_target(cookies, item_id, cart_id, sku_id)
+    if err:
+        return err
+    if target["qty"] == quantity:
+        return f"Cart line {target['cart_id']} is already ×{quantity} — nothing to do."
+
+    try:
+        ret = _cart_operate(cookies, resp, target["component_id"], "update_quantity",
+                            quantity=quantity)
+    except Exception as e:
+        return f"Quantity change failed: {e}"
+    if ret_problem({"ret": [ret]}) is not None:
+        return f"Could not change cart line {target['cart_id']} — AliExpress said: {ret}"
+
+    # A wrong operationType still returns SUCCESS while doing nothing, so the ack
+    # alone proves nothing — confirm against a fresh read.
+    try:
+        after = _cart_lines(_cart_fetch_all_pages(cookies, _cart_droplet_render(cookies))[0])
+        now = next((r for r in after if r["cart_id"] == target["cart_id"]), None)
+        if not now:
+            return f"Cart line {target['cart_id']} disappeared after the change — check view_cart."
+        if now["qty"] != quantity:
+            return (f"AliExpress accepted the request but cart line {target['cart_id']} is still "
+                    f"×{now['qty']}, not ×{quantity}. It may be capped at {now['qty']} for this listing.")
+        return (f"Set {target['title']!r} (cart line {target['cart_id']}) "
+                f"from ×{target['qty']} to ×{quantity}.")
+    except Exception:
+        return f"Changed cart line {target['cart_id']} to ×{quantity} (could not re-read to confirm)."
+
+
+@mcp.tool(
+    title="Remove from Cart",
+    annotations=ToolAnnotations(
+        readOnlyHint=False, destructiveHint=True, idempotentHint=False,
+        openWorldHint=True
+    ),
+    structured_output=False,
+)
+def remove_from_cart(item_id: str = "", url: str = "", cart_id: str = "", sku_id: str = "") -> str:
+    """
+    Remove one line from your AliExpress cart. This WRITES to your real account
+    and cannot be undone from here — the item would have to be re-added.
+
+    The same product can occupy several cart lines (one per variant), so when
+    `item_id` alone matches more than one line this refuses to guess and lists
+    the candidates with their cart_id values instead.
+
+    Args:
+        item_id: AliExpress item ID of the line to remove.
+        url: Full or short AliExpress product URL (alternative to item_id).
+        cart_id: Exact cart line id, as shown by view_cart. Wins over item_id
+            and is the unambiguous way to target a specific variant.
+        sku_id: Variant id, to disambiguate when one item has several lines.
+    """
+    if not cart_id:
+        item_id = _resolve_item_id(item_id, url)
+        if not item_id:
+            return "Provide a cart_id, or an item_id / AliExpress product URL."
+
+    cookies = load_cookies()
+    if not cookies:
+        return AUTH_EXPIRED_MSG
+
+    resp, target, err = _resolve_cart_target(cookies, item_id, cart_id, sku_id)
+    if err:
+        return err
+
+    try:
+        ret = _cart_operate(cookies, resp, target["component_id"], "delete")
+    except Exception as e:
+        return f"Remove failed: {e}"
+    if ret_problem({"ret": [ret]}) is not None:
+        return f"Could not remove cart line {target['cart_id']} — AliExpress said: {ret}"
+
+    # Destructive, so confirm against a fresh read rather than trusting the ack.
+    try:
+        after = _cart_lines(_cart_fetch_all_pages(cookies, _cart_droplet_render(cookies))[0])
+        if any(r["cart_id"] == target["cart_id"] for r in after):
+            return (f"AliExpress reported success but cart line {target['cart_id']} is still "
+                    "present — nothing was removed. Try again or remove it on the site.")
+        return (f"Removed {target['title']!r} (cart line {target['cart_id']}) from your cart.\n"
+                f"  Cart now holds {len(after)} line(s).")
+    except Exception:
+        return f"Removed cart line {target['cart_id']} (could not re-read the cart to confirm)."
+
+
+@mcp.tool(
+    title="View Cart",
+    annotations=ToolAnnotations(
+        readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True
+    ),
+    structured_output=False,
+)
 def view_cart() -> str:
     """
     View current AliExpress cart contents (read-only).
@@ -2085,13 +3033,42 @@ def view_cart() -> str:
 
     ret = resp.get("ret", [])
     ret_str = ret[0] if ret else ""
-    if not any("SUCCESS" in r for r in ret):
+    if ret_problem(resp):
         return (
             f"Cart API returned: {ret_str}. "
             "If this says TOKEN_EXPIRED, re-save AliExpress cookies via the MCP Auth Bridge."
         )
 
-    cart = _extract_cart(resp)
+    legacy_cart = _extract_cart(resp)
+    page_warning = None
+
+    # The legacy render only ever returns page 1. Re-render in the droplet shape,
+    # which is the only one carrying pagination, and walk the rest. Fall back to
+    # the legacy result if that path yields nothing, so a shape change upstream
+    # degrades to the old behaviour instead of an empty cart.
+    try:
+        droplet = mtop_call(
+            "mtop.aliexpress.trade.cart.render", "1.0",
+            {"_saasRegion": "AEG", "_currency": CURRENCY, "shipToCountry": COUNTRY,
+             "locale": "en_US", "language": "en", "system": "pc",
+             "bizParams": json.dumps({"platformType": "DESKTOP", "pcChoiceNewCart": 1},
+                                     separators=(",", ":"))},
+            cookies=cookies, referer=f"{BASE_URL}/p/shoppingcart/index.html",
+        )
+        if ret_problem(droplet) is None:
+            droplet, page_warning = _cart_fetch_all_pages(cookies, droplet)
+            paged = _extract_cart_droplet(droplet)
+            if len(paged["items"]) > len(legacy_cart["items"]):
+                paged["count"] = legacy_cart.get("count") or paged.get("count")
+                for key in ("subtotal", "shipping_fee", "total"):
+                    paged[key] = legacy_cart.get(key)
+                paged["currency"] = paged.get("currency") or legacy_cart.get("currency")
+                legacy_cart = paged
+    except Exception as e:
+        logger.info("cart pagination unavailable, using first page only: %s", e)
+        page_warning = f"pagination failed ({e})"
+
+    cart = legacy_cart
     items = cart["items"]
     count = cart["count"]
 
@@ -2117,8 +3094,9 @@ def view_cart() -> str:
     if truncated:
         header = (
             f"Cart — showing {n} of {count} items.\n"
-            f"  ⚠ AliExpress paginates the cart; the API exposes only the first page, "
-            f"so {count - n} more item(s) aren't listed here."
+            f"  ⚠ {count - n} more item(s) aren't listed here"
+            + (f" — {page_warning}." if page_warning else
+               " — the cart API stopped returning pages before the full count was reached.")
         )
     else:
         header = f"Cart ({n} item(s)):"
@@ -2159,7 +3137,7 @@ def view_cart() -> str:
             if it.get("delivery_date"):
                 line += f"\n      delivery: {it['delivery_date']}"
             if not it.get("valid", True):
-                line += "\n      ⚠️ invalid (sold out or removed)"
+                line += f"\n      ⚠️ unavailable — {it.get('unavailable_reason') or 'sold out or removed'}"
             line += f"\n      item_id: {it['item_id']}"
             lines.append(line)
         lines.append("")
@@ -2196,19 +3174,6 @@ def view_cart() -> str:
 # (pay/cancel/confirm) — this server is read-only.
 
 ORDER_LIST_API = "mtop.aliexpress.trade.buyer.order.list"
-
-
-def _order_ret_problem(resp: dict) -> Optional[str]:
-    """Return a friendly message if the order response isn't a success, else None."""
-    ret = resp.get("ret", []) if isinstance(resp, dict) else []
-    ret_str = ret[0] if ret else ""
-    if any("SUCCESS" in r for r in ret):
-        return None
-    if any(s in ret_str for s in ("SESSION_EXPIRED", "NEED_LOGIN", "ILLEGAL_ACCESS", "NO_LOGIN")):
-        return FULL_AUTH_MSG
-    if "TOKEN" in ret_str:
-        return AUTH_EXPIRED_MSG
-    return f"AliExpress API returned: {ret_str or 'unknown error'}."
 
 
 def _extract_orders(resp: dict, max_orders: int) -> list[dict]:
@@ -2279,7 +3244,97 @@ def _order_item_line(it: dict, bullet: str = "  • ") -> str:
     return seg
 
 
-@mcp.tool()
+ORDERS_MAX_PAGES = 20
+
+
+def _orders_fetch_all_pages(cookies: dict, first: dict, want: int) -> tuple[dict, Optional[str]]:
+    """
+    Walk the order list past page 1 and merge every page into `first`.
+
+    `order.list` ignores top-level paging params. Further pages come from an
+    Ultron/droplet POST whose `params` is a JSON *string* holding four more
+    JSON *strings* (data / linkage / hierarchy / endpoint) plus `operator`.
+    Nested-string encoding is load-bearing: passing objects gets an empty result.
+
+    Returns (merged_response, warning); `warning` is set if the walk stopped
+    early so the caller can say so instead of under-reporting silently. This
+    includes the server replaying a page (0 net-new order blocks after a merge),
+    which stops immediately instead of burning the rest of the page budget only
+    to blame the cap.
+    """
+    merged = json.loads(json.dumps(first))
+    body_id, body = _block_by_prefix(merged, "pc_om_list_body")
+    if not body_id or not (body.get("fields") or {}).get("hasMore"):
+        return merged, None
+
+    head_id, head = _block_by_prefix(merged, "pc_om_list_header_action")
+    page = int((body.get("fields") or {}).get("pageIndex") or 1)
+
+    def order_count(r):
+        return sum(1 for k in blocks(r) if k.startswith("pc_om_list_order_"))
+
+    for _ in range(ORDERS_MAX_PAGES - 1):
+        if order_count(merged) >= want:
+            return merged, None
+        data = merged.get("data") or {}
+        page += 1
+
+        next_body = json.loads(json.dumps(data["data"][body_id]))
+        next_body.setdefault("fields", {})["pageIndex"] = page
+        components = {body_id: next_body}
+        if head_id:
+            components[head_id] = data["data"][head_id]
+
+        def s(obj):
+            return json.dumps(obj, separators=(",", ":"), ensure_ascii=False)
+
+        inner = {
+            "data": s(components),
+            "linkage": s(data.get("linkage") or {}),
+            "hierarchy": s({"structure": (data.get("hierarchy") or {}).get("structure") or {}}),
+            "endpoint": s(data.get("endpoint") or {}),
+            "operator": body_id,
+        }
+        payload = {"params": s(inner), "shipToCountry": COUNTRY, "_lang": LANG}
+
+        try:
+            resp = mtop_call(
+                ORDER_LIST_API, "1.0", payload, cookies=cookies,
+                referer=f"{BASE_URL}/p/order/index.html", method="POST",
+                extra_query={"post": "1", "isSec": "1", "ecode": "1",
+                             "needLogin": "true", "method": "POST"},
+            )
+        except Exception as e:
+            return merged, f"stopped after page {page - 1} — {e}"
+
+        if ret_problem(resp):
+            return merged, f"stopped after page {page - 1} — API returned {(resp.get('ret') or ['?'])[0]}"
+
+        new_blocks = blocks(resp)
+        new_orders = {k: v for k, v in new_blocks.items() if k.startswith("pc_om_list_order_")}
+        if not new_orders:
+            return merged, None
+
+        before = order_count(merged)
+        merged["data"]["data"].update(new_orders)
+        if order_count(merged) <= before:
+            return merged, f"stopped after page {page} — the server replayed a page"
+        nb_id, nb = _block_by_prefix(resp, "pc_om_list_body")
+        if nb_id:
+            merged["data"]["data"][body_id] = nb
+        if not (nb.get("fields") or {}).get("hasMore"):
+            return merged, None
+
+    return merged, f"stopped at the {ORDERS_MAX_PAGES}-page cap — older orders may exist"
+
+
+@mcp.tool(
+    title="List Orders",
+    annotations=ToolAnnotations(
+        readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True
+    ),
+    structured_output=False,
+)
 def list_orders(max_orders: int = 10) -> str:
     """
     List your recent AliExpress orders (read-only): status, date, store, items, total.
@@ -2287,23 +3342,36 @@ def list_orders(max_orders: int = 10) -> str:
     Requires a FULL login session in the credential file — the quick cookie snippet
     misses HttpOnly login cookies (see README). Does not expose shipping addresses.
 
+    Pages back through your history as needed — AliExpress returns 10 orders per
+    page, so asking for more fetches more pages (one request each). Orders going
+    back years are reachable this way.
+
     Args:
-        max_orders: Max number of orders to list (default 10).
+        max_orders: Max number of orders to list (default 10, one page).
     """
     cookies = load_cookies()
     if not cookies:
         return AUTH_EXPIRED_MSG
     try:
+        # The payload the site actually sends. The previous {"page", "pageSize"}
+        # was accepted with SUCCESS and silently ignored — verified against live
+        # responses, which returned an identical page 1 for every variation.
         resp = mtop_call(
-            ORDER_LIST_API, "1.0", {"page": 1, "pageSize": max(max_orders, 10)},
+            ORDER_LIST_API, "1.0",
+            {"statusTab": None, "renderType": "init", "clientPlatform": "pc",
+             "shipToCountry": COUNTRY, "_lang": LANG, "timeZone": "GMT+0200"},
             cookies=cookies, referer=f"{BASE_URL}/p/order/index.html",
         )
     except Exception as e:
         return f"Order list call failed: {e}"
 
-    problem = _order_ret_problem(resp)
+    problem = ret_problem(resp)
     if problem:
         return problem
+
+    page_warning = None
+    if max_orders > 10:
+        resp, page_warning = _orders_fetch_all_pages(cookies, resp, max_orders)
 
     orders = _extract_orders(resp, max_orders)
     if not orders:
@@ -2331,7 +3399,13 @@ def list_orders(max_orders: int = 10) -> str:
     return "\n".join(lines)
 
 
-@mcp.tool()
+@mcp.tool(
+    title="Get Order",
+    annotations=ToolAnnotations(
+        readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True
+    ),
+    structured_output=False,
+)
 def get_order(order_id: str) -> str:
     """
     Show one AliExpress order in full (read-only): status, date, store, line items, total.
@@ -2355,7 +3429,7 @@ def get_order(order_id: str) -> str:
     except Exception as e:
         return f"Order lookup failed: {e}"
 
-    problem = _order_ret_problem(resp)
+    problem = ret_problem(resp)
     if problem:
         return problem
 
@@ -2399,6 +3473,9 @@ def get_order(order_id: str) -> str:
 # Read-only — we never call the wishlist add/remove endpoints.
 
 WISHLIST_API = "mtop.ae.wishlist.allItems.render"
+# Wishlist *groups* ("lists") are managed by a different API, at v2.0, which takes
+# the group as a JSON string in `groupListString` rather than as an object.
+WISHLIST_GROUP_API = "mtop.aliexpress.wishlist.group.update"
 _ITEM_URL_RE = re.compile(r"/item/(\d+)\.html")
 
 
@@ -2408,7 +3485,7 @@ def _wishlist_container(resp: dict) -> tuple[dict, dict]:
     The live shape is the Ultron container (data.data.data / data.data.global);
     fall back to the flat block-map if a future response reverts to it.
     """
-    outer = resp.get("data", {}).get("data", {})
+    outer = blocks(resp)
     if isinstance(outer, dict) and isinstance(outer.get("data"), dict):
         glob = outer.get("global")
         return outer["data"], (glob if isinstance(glob, dict) else {})
@@ -2474,7 +3551,71 @@ def _extract_wishlist(resp: dict, max_items: int) -> dict:
     return {"items": items[:max_items], "total": glob.get("itemTotalCount"), "has_more": has_more}
 
 
-@mcp.tool()
+@mcp.tool(
+    title="Create Wishlist",
+    annotations=ToolAnnotations(
+        readOnlyHint=False, destructiveHint=False, idempotentHint=False,
+        openWorldHint=True
+    ),
+    structured_output=False,
+)
+def create_wishlist(name: str, public: bool = False) -> str:
+    """
+    Create a new (empty) wishlist on your AliExpress account. This WRITES.
+
+    Creates the list itself, not its contents — there is no tool yet for saving
+    items into it. Names are not checked for duplicates: AliExpress will happily
+    create a second list with the same name, so this reports the new list's id.
+
+    Args:
+        name: Name for the new list, e.g. "3D printer parts".
+        public: Whether the list is visible to others (default private).
+    """
+    name = (name or "").strip()
+    if not name:
+        return "Provide a name for the wishlist."
+
+    cookies = load_cookies()
+    if not cookies:
+        return AUTH_EXPIRED_MSG
+
+    payload = {
+        "_lang": LANG,
+        "_currency": CURRENCY,
+        # Nested JSON string, not an object — the API rejects a real array here.
+        "groupListString": json.dumps(
+            [{"id": "", "name": name, "isPublic": "Y" if public else "N"}],
+            separators=(",", ":"), ensure_ascii=False),
+        "opType": "add",
+    }
+    try:
+        _pace("cart_write", CART_WRITE_MIN_INTERVAL)
+        resp = mtop_call(WISHLIST_GROUP_API, "2.0", payload, cookies=cookies,
+                         referer=f"{BASE_URL}/p/wish-manage/index.html")
+    except Exception as e:
+        return f"Wishlist create failed: {e}"
+
+    ret = (resp.get("ret") or ["?"])[0]
+    data = resp.get("data") or {}
+    if ret_problem(resp) is not None or not data.get("succeed"):
+        return f"Could not create wishlist {name!r} — AliExpress said: {ret}"
+
+    groups = data.get("data") or []
+    made = next((g for g in groups if isinstance(g, dict) and g.get("name") == name), None)
+    if not made:
+        return f"AliExpress reported success but returned no list named {name!r} — check the site."
+    return (f"Created wishlist {made.get('name')!r} "
+            f"({'public' if made.get('isPublic') == 'Y' else 'private'}).\n"
+            f"  List ID: {made.get('id')}")
+
+
+@mcp.tool(
+    title="Get Wishlist",
+    annotations=ToolAnnotations(
+        readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=True
+    ),
+    structured_output=False,
+)
 def get_wishlist(max_items: int = 25) -> str:
     """
     List your saved / liked AliExpress items (wishlist), read-only. Flags items
@@ -2495,7 +3636,7 @@ def get_wishlist(max_items: int = 25) -> str:
     # asking for "page 2" just replays page 1. We therefore fetch the single server
     # page and dedupe defensively rather than looping (which replayed items before).
     payload = {
-        "_lang": "en_US", "_currency": CURRENCY, "country": COUNTRY,
+        "_lang": LANG, "_currency": CURRENCY, "country": COUNTRY,
         "pageIndex": 1, "pageSize": max(max_items, 20), "groupId": "0",
     }
     try:
@@ -2505,7 +3646,7 @@ def get_wishlist(max_items: int = 25) -> str:
         )
     except Exception as e:
         return f"Wishlist call failed: {e}"
-    problem = _order_ret_problem(resp)  # same full-login gate as orders
+    problem = ret_problem(resp)  # same full-login gate as orders
     if problem:
         return problem
 
