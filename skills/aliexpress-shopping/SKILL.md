@@ -21,11 +21,12 @@ description: >-
 These tools wrap AliExpress's own signed mobile API (MTOP) plus its search page, giving
 clean structured data instead of scraped HTML.
 
-Most tools only read. Seven write to the user's real account — `add_to_cart`,
-`set_cart_quantity`, `remove_from_cart`, `add_to_wishlist`, `remove_from_wishlist`,
-`create_wishlist`, `delete_wishlist` — and three of those destroy something. **There is no
-path to checkout, pay, or cancel an order**, which is the reassurance a worried user
-actually wants; don't overstate it into "everything is read-only".
+Most tools only read. Eight write to the user's real account — `add_to_cart`,
+`set_cart_selection`, `set_cart_quantity`, `remove_from_cart`, `add_to_wishlist`,
+`remove_from_wishlist`, `create_wishlist`, `delete_wishlist` — and three of those destroy
+something. **There is no path to checkout, pay, or cancel an order**, which is the
+reassurance a worried user actually wants; don't overstate it into "everything is
+read-only".
 
 Say what a write will do before doing it, and prefer the reversible form: taking an item
 out of one list (`remove_from_wishlist` with `wishlist=`) keeps it saved, while
@@ -41,8 +42,8 @@ the exact table.
 
 | The user wants… | Use |
 | --- | --- |
-| To find products by keyword | `search_products(query, min_rating, max_price, sort_by)` |
-| Specifically *discounted* items, sorted by how deep the discount is | `find_deals(query, min_discount, max_price, min_rating, sort_by)` |
+| To find products by keyword | `search_products(query, min_rating, max_price, sort_by, ship_from)` |
+| Specifically *discounted* items, sorted by how deep the discount is | `find_deals(query, min_discount, max_price, min_rating, sort_by, ship_from)` |
 | The full picture of one item (price, rating, sold count, seller, shipping) | `get_product_details(item_id \| url)` |
 | Which exact config a price buys — RAM / storage / CPU / bundle / size → price | `get_variants(item_id \| url)` |
 | Just the shipping cost and ETA to the configured country | `get_shipping_estimate(item_id \| url)` |
@@ -54,8 +55,9 @@ the exact table.
 | Their saved / liked items, and which got cheaper | `get_wishlist(max_items)` |
 | Their named wishlists / collections, with ids and counts | `list_wishlists()` |
 | To put something in their cart — **write** | `add_to_cart(item_id \| url, sku_id, quantity)` |
-| To change how many of a cart line — **write** | `set_cart_quantity(quantity, item_id \| url \| cart_id)` |
-| To take a line out of the cart — **destructive** | `remove_from_cart(item_id \| url \| cart_id)` |
+| To make sure a cart line will actually be included at checkout, or to leave it in the cart without ordering it — **write** | `set_cart_selection(selected, item_id \| url \| cart_id, sku_id)` |
+| To change how many of a cart line — **write** | `set_cart_quantity(quantity, item_id \| url \| cart_id, sku_id)` |
+| To take a line out of the cart — **destructive** | `remove_from_cart(item_id \| url \| cart_id, sku_id)` |
 | To save an item into one of their lists — **write** | `add_to_wishlist(wishlist, item_id \| url)` |
 | To take an item out of one list, keeping it saved — **write** | `remove_from_wishlist(item_id \| url, wishlist)` |
 | To delete a saved item outright — **destructive, permanent** | `remove_from_wishlist(item_id \| url, permanent=True)` |
@@ -86,11 +88,18 @@ reconciled, convert explicitly and say you did.
 tagged **⚠ MSRP?** because AliExpress's reference prices are frequently inflated. Pass that
 skepticism on — don't present the "savings" as real without the flag.
 
-**The cart shows only its first page.** AliExpress paginates the cart behind an opaque
-cursor, so `view_cart` renders the first page and labels it "showing N of M items". If the
-user's cart is bigger than what's shown, tell them so instead of implying that's everything.
-The subtotal it prints is computed over the shown items; the server's own "checkout
-estimate" covers only the currently checkbox-selected lines and is labelled that way.
+**The cart usually comes back in full.** AliExpress paginates it behind an opaque cursor,
+but `view_cart` walks that automatically (up to 10 pages), so most carts are complete. Only
+when a page fetch fails or a cart exceeds the cap is it labelled "showing N of M items" —
+if you see that, say so rather than implying it's everything.
+
+**AliExpress orders only the TICKED cart lines.** An un-ticked line stays fully visible in
+the cart and simply never arrives, and that is not recoverable after checkout — so it is
+worth checking before the user orders, not after. `view_cart` flags un-ticked lines
+individually and in a summary, and reconciles that against AliExpress's own count of
+selected lines; when the two disagree it says so instead of guessing. `set_cart_selection`
+ticks or un-ticks a line. The subtotal `view_cart` prints covers the shown items; the
+server's own "checkout estimate" covers only the ticked ones and is labelled that way.
 
 **Orders and the wishlist need a full login session.** `list_orders`, `get_order`, and
 `get_wishlist` require the HttpOnly login cookies. If they return a "full login session"

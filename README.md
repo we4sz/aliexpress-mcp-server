@@ -2,19 +2,20 @@
 
 An MCP server that wraps AliExpress search, product detail, cart, orders and wishlist. Destination country and currency are configurable via `ALIEXPRESS_COUNTRY` / `ALIEXPRESS_CURRENCY` (defaults `CA` / `CAD`); shipping, prices and delivery estimates all follow that setting.
 
-Mostly read-only — it searches, fetches product details, checks shipping, and reads your cart/orders/wishlist — but seven tools write to your account (`add_to_cart`, `set_cart_quantity`, `remove_from_cart`, `add_to_wishlist`, `remove_from_wishlist`, `create_wishlist`, `delete_wishlist`); none of them ever checks out or pays.
+Mostly read-only — it searches, fetches product details, checks shipping, and reads your cart/orders/wishlist — but eight tools write to your account (`add_to_cart`, `set_cart_selection`, `set_cart_quantity`, `remove_from_cart`, `add_to_wishlist`, `remove_from_wishlist`, `create_wishlist`, `delete_wishlist`); none of them ever checks out or pays.
 
 ## Tools
 
-- `search_products(query, min_rating, max_price, sort_by)` — searches the public wholesale search URL and parses the embedded JSON.
-- `find_deals(query, min_discount, max_price, min_rating, sort_by)` — same search, filtered to discounted listings and sorted by discount depth.
+- `search_products(query, min_rating, max_price, sort_by, ship_from)` — searches the public wholesale search URL and parses the embedded JSON. `ship_from` restricts results to a warehouse: a two-letter country code, a comma-separated string or list of codes, or `"EU"`/`"EEA"` for the whole customs union (expanded to its highest-stock members, probed via the first one). Empty = any warehouse.
+- `find_deals(query, min_discount, max_price, min_rating, sort_by, ship_from)` — same search, filtered to discounted listings and sorted by discount depth. `ship_from` behaves exactly as in `search_products`.
 - `get_product_details(item_id | url)` — title, price (a range for multi-config listings), discount, rating, sold count, seller, shipping cost & ETA.
 - `get_variants(item_id | url)` — the full per-configuration (SKU) price table, e.g. "DDR4 32GB 1TB SSD · R7 5825U" → 916.63; the price→spec map a bare range can't give. Out-of-stock configs flagged.
 - `get_shipping_estimate(item_id | url)` — shipping cost + ETA to the configured country (freight is computed against your saved delivery address; may report "unreachable" without one).
 - `get_reviews(item_id | url, max_reviews, filter_by)` — rating breakdown (positive / neutral / negative) + individual reviews via the unsigned `feedback.aliexpress.com/pc/searchEvaluation.do` endpoint.
-- `get_seller(item_id | url)` — store rating, positive-feedback rate, seller level, age, and store link (read from the PDP `SHOP_CARD_PC` block).
+- `get_seller(item_id | url)` — positive-feedback rate, feedback volume, how long the store has been open, and where it ships from (read from the PDP `SHOP_CARD_PC` block). Deliberately omits AliExpress's own "seller level" and "seller score": it publishes no scale for either, so neither can be compared across stores.
 - `compare_sellers(title | item_id | url, max_candidates)` — when several storefronts sell the same item (originals, relisters, dropshippers), searches the title, inspects the top hits' sellers, and ranks them **most-established first** (store age → feedback volume → positive rate) so you can prefer the long-running seller over a brand-new relister. Costs one search + one lookup per candidate.
 - `add_to_cart(item_id | url, sku_id, quantity)` — **write.** Adds an item to your real cart via the signed `mtop.aliexpress.trade.cart.add` endpoint (which is signed with a *different* appKey than the read APIs — see `MTOP_CART_APP_KEY`). Buys nothing; the item waits in the cart until you check out on the site. `sku_id` defaults to the item's preselected variant, so pass one from `get_variants` when size/colour matters. To take something back out, use `remove_from_cart`.
+- `set_cart_selection(selected, item_id | url | cart_id, sku_id)` — **write.** Ticks or un-ticks one cart line for checkout — AliExpress orders ONLY the ticked lines. Un-ticking doesn't remove the line: it stays fully visible in `view_cart`, just excluded from what ships, and that is not recoverable after checkout. Same ambiguous-`item_id` refusal as the other cart-line tools; `view_cart` flags un-ticked lines so this doesn't have to be run blind.
 - `set_cart_quantity(quantity, item_id | url | cart_id, sku_id)` — **write.** Sets an *absolute* quantity on one cart line via the same droplet endpoint, using `operationType = "update_quantity"` and replacing `fields.quantityView` with a bare `{"current": N}` — sending the full rendered `quantityView` back returns `SUCCESS` and silently does nothing, so the result is always re-read to confirm. Use `remove_from_cart` to delete a line; quantity 0 is rejected.
 - `remove_from_cart(item_id | url | cart_id, sku_id)` — **destructive write.** Removes one cart line via the Ultron/droplet endpoint `mtop.aliexpress.trade.cart.async`: POST the operated component with `fields.operationType = "delete"` plus the page root (sending the whole component tree is rejected with `AE-CART-PARSE-PARAM-ERROR`). One product can occupy several cart lines (one per variant), so an ambiguous `item_id` lists the candidate `cart_id`s and removes nothing. Re-reads the cart afterwards to confirm.
 - `view_cart()` — current cart contents via the signed `mtop.aliexpress.trade.cart.render` endpoint, grouped by seller, with a computed subtotal over the shown items. Read-only. AliExpress paginates the cart behind an opaque cursor, but `view_cart` walks it automatically (up to 10 pages), so most carts come back in full; only if paging fails partway or a cart exceeds that cap is it shown as "N of M items" (see Known limitations).
@@ -122,7 +123,7 @@ The code is a package, split by domain rather than by layer — `aliexpress_mcp_
 | `catalog.py` | Public catalogue — search, PDP, variants, seller, reviews, shipping, duty logic. |
 | `cart.py` | Cart reads and writes, including its two response shapes and pagination. |
 | `account.py` | Orders and wishlists. |
-| `server.py` | The FastMCP singleton and all 20 tool definitions. The only module that imports `mcp`, and nothing imports it. |
+| `server.py` | The FastMCP singleton and all 21 tool definitions. The only module that imports `mcp`, and nothing imports it. |
 
 The three account domains all speak Alibaba's Ultron/droplet protocol but encode it differently, which is the single most confusing thing in the codebase: the cart nests **gzip+base64** objects, orders nest plain-JSON **strings**, and the wishlist nests plain-JSON **objects**.
 

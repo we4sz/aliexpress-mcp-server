@@ -16,6 +16,9 @@ because neither raises — they just quietly return the wrong thing.
     python3 -m unittest discover -s tests -v
     python3 tests/test_units.py
 """
+import base64
+import gzip
+import json
 import os
 import sys
 import time
@@ -875,10 +878,6 @@ class TestGoldenSkeleton(unittest.TestCase):
         self.assertTrue(self.golden.only_numbers_moved(same, list(same)))
 
 
-if __name__ == "__main__":
-    unittest.main(verbosity=2)
-
-
 class TestSubtotalByCurrency(unittest.TestCase):
     """
     A cart subtotal that silently adds USD to SEK is wrong in every currency
@@ -1044,6 +1043,82 @@ class TestExtractCartSelectionDroplet(unittest.TestCase):
         self.assertIsNone(by_cart_id[777])
 
 
+class TestCartSelectionConstants(unittest.TestCase):
+    """
+    Pin the two selection constants directly, by literal value, independent of
+    any behavioral test that happens to exercise them. Both were wrong guesses
+    once — "checkboxView" (by analogy with quantity -> quantityView) and
+    "update_checkbox" (by analogy with "update_quantity") — and both wrong
+    guesses were plausible enough that a future "tidy-up" could re-derive them
+    the same way. See the CART_SELECT_FIELD / CART_OP_SELECT comments in
+    cart.py for how each was actually confirmed (a live render vs. a browser
+    capture of a real tick).
+    """
+
+    def test_select_field_is_the_bare_noun(self):
+        self.assertEqual(cart.CART_SELECT_FIELD, "checkbox")
+
+    def test_select_operation_is_the_bare_noun_not_update_checkbox(self):
+        self.assertEqual(cart.CART_OP_SELECT, "checkbox")
+
+
+class TestCartOperateChecknbox(unittest.TestCase):
+    """
+    _cart_operate's checkbox branch sends the COMPLETE checkbox object with
+    `enable` preserved and only `selected` flipped — unlike quantityView, which
+    IS replaced with a bare {"current": N}. That asymmetry is counter-intuitive
+    (mirroring the quantity idiom for checkbox was the earlier wrong guess) so
+    it is pinned here rather than left to be "simplified" back to a bare dict.
+
+    _cart_operate ends in a real mtop_call, which normally makes it
+    network-only. It is still testable offline: `mtop_call` and `_pace` are
+    plain module-level names in `cart`'s namespace (imported from core), so
+    swapping them for the duration of one test — the same technique already
+    used for `catalog._pace` / `catalog.search_with_notes` in
+    TestSearchByTitle — intercepts the outgoing payload without ever reaching
+    the network. What's captured is decoded exactly as AliExpress would
+    receive it (gzip + base64 inside `params`), so this checks our own
+    payload-construction logic, not a mocked-away assertion.
+    """
+
+    COMPONENT_ID = "product_component_I_123"
+
+    def _capture_payload(self, resp, selected):
+        captured = {}
+
+        def fake_mtop_call(api, version, payload, **kwargs):
+            captured["payload"] = payload
+            return {"ret": ["SUCCESS::调用成功"]}
+
+        with mock.patch.object(cart, "mtop_call", side_effect=fake_mtop_call), \
+                mock.patch.object(cart, "_pace"):
+            ret = cart._cart_operate({}, resp, self.COMPONENT_ID, cart.CART_OP_SELECT,
+                                     selected=selected)
+        outer = json.loads(gzip.decompress(base64.b64decode(captured["payload"]["params"])))
+        return ret, outer["data"][self.COMPONENT_ID]["fields"]
+
+    def test_existing_checkbox_is_echoed_whole_with_only_selected_flipped(self):
+        resp = {"data": {
+            "data": {self.COMPONENT_ID: {
+                "fields": {"checkbox": {"enable": True, "selected": True}},
+            }},
+            "page": {"root": None},
+        }}
+        ret, fields = self._capture_payload(resp, selected=False)
+        self.assertEqual(ret, "SUCCESS::调用成功")
+        self.assertEqual(fields["checkbox"], {"enable": True, "selected": False})
+        self.assertEqual(fields["operationType"], "checkbox")
+
+    def test_missing_checkbox_still_sends_a_complete_object(self):
+        """No prior checkbox on the component: enable defaults True, not omitted."""
+        resp = {"data": {
+            "data": {self.COMPONENT_ID: {"fields": {}}},
+            "page": {"root": None},
+        }}
+        _ret, fields = self._capture_payload(resp, selected=True)
+        self.assertEqual(fields["checkbox"], {"enable": True, "selected": True})
+
+
 class TestCartVariantLabel(unittest.TestCase):
     """
     Report #8: `add_to_cart` confirmed with an opaque id — "Added item
@@ -1098,3 +1173,7 @@ class TestCartVariantLabel(unittest.TestCase):
         self.assertIsNone(spec)
         self.assertIsNone(price)
         self.assertIsNone(currency)
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)
