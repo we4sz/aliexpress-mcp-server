@@ -42,44 +42,49 @@ from aliexpress_mcp.catalog import _fetch_pdp_mtop, _sku_spec_for_id, _extract_v
 #
 # The *droplet* shape (itemView-nested, `quantityView`/`priceViews`/
 # `logisticsView`/`shopView` siblings — see `_extract_cart_droplet`) is what
-# `_cart_operate` actually writes against, but no droplet-shaped cart render
-# was available to confirm its checkbox field name. Droplet field names
-# consistently differ from their legacy counterparts by a "View" suffix or an
-# outright rename (quantity -> quantityView, prices -> priceViews, freightInfo
-# -> logisticsView), so CART_SELECT_FIELD guesses "checkboxView" by the same
-# pattern. `_cart_line_selected` below tries that guess first and falls back
-# to the legacy name verbatim, so a render that kept the legacy name unchanged
-# still works. If neither is right, callers see `selected: None` rather than
-# a wrong value.
-CART_SELECT_FIELD = "checkboxView"
+# `_cart_operate` actually writes against. It was originally assumed to rename
+# this field to "checkboxView", by analogy with quantity -> quantityView and
+# prices -> priceViews. It does NOT: a live droplet render (Aug 2026) carries
+# a plain `checkbox: {"enable": bool, "selected": bool}` on the product
+# component, exactly as the legacy shape does, alongside all the *View
+# siblings. The "View" rename is not the universal rule it looked like.
+#
+# Reading was correct anyway only because the lookup fell through to the
+# legacy name — worth remembering as a case where a fallback hid a wrong
+# primary for as long as nobody checked which branch was firing.
+CART_SELECT_FIELD = "checkbox"
 
 # Write side operationType, sent as `fields.operationType` through the same
 # `mtop.aliexpress.trade.cart.async` endpoint `_cart_operate` already drives
-# for "update_quantity" and "delete" (see that function). UNVERIFIED — no
-# checkbox-toggle request has been captured live. Reasoning: "update_quantity"
-# pairs an "update_" prefix with the (legacy) field name it's setting
-# ("quantity"); by the same pattern, toggling the field named "checkbox"
-# should be "update_checkbox". If AliExpress rejects that or silently no-ops
-# it, the next things to try, in order: "choose"/"unchoose" or
-# "select"/"unselect" (two bare-verb ops instead of one op + a value, which is
-# how wishlist's sibling endpoint models DELETE_PRODUCT/DELETE_GROUP — see
-# account.py). `_cart_set_selected` always re-reads and compares the actual
-# flag after writing (never trusts `ret`), so a wrong guess here surfaces as
-# an honest "AliExpress accepted the request but nothing changed" instead of
-# a false confirmation.
+# for "update_quantity" and "delete".
+#
+# STILL UNVERIFIED, and "update_checkbox" is now known to be WRONG: tried live
+# against a real cart line, AliExpress answered ret=SUCCESS and changed
+# nothing — the house pattern of acknowledging a no-op. The render response
+# does not advertise its own operation vocabulary either (no `operationType`
+# appears anywhere in a render; it is send-only), so the correct verb cannot
+# be derived from what the server returns and has to be captured from the
+# browser's own request, the way every other write here was.
+#
+# Until then `set_cart_selection` is deliberately NOT exposed as a tool.
+# `_cart_set_selected` always re-reads and compares the flag rather than
+# trusting `ret`, so a wrong verb surfaces as an honest "accepted but nothing
+# changed" instead of a false confirmation — which is exactly how this one was
+# caught. Candidates left to try, cheapest first: "select"/"unselect",
+# "choose"/"unchoose", "check"/"uncheck", "update_selected".
 CART_OP_SELECT = "update_checkbox"
 
 
 def _cart_line_selected(fields: dict) -> Optional[bool]:
     """
-    Pull a cart line's checkbox state out of its `fields` dict, trying the
-    droplet field name first and falling back to the legacy one. Shared by
-    both extractors so the guess (see CART_SELECT_FIELD above) only lives in
-    one place.
+    Pull a cart line's checkbox state out of its `fields` dict.
+
+    Both render shapes name this field the same way, so there is nothing to
+    disambiguate — see CART_SELECT_FIELD. Returns None when the field is
+    missing or malformed: "we could not read it" is not the same fact as "the
+    user un-ticked it", and only one of those is worth warning about.
     """
     cb = fields.get(CART_SELECT_FIELD)
-    if not isinstance(cb, dict):
-        cb = fields.get("checkbox")
     return cb.get("selected") if isinstance(cb, dict) else None
 
 

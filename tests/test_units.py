@@ -931,14 +931,22 @@ class TestCartLineSelected(unittest.TestCase):
     wrong guess.
     """
 
-    def test_prefers_the_droplet_field_name(self):
-        fields = {cart.CART_SELECT_FIELD: {"enable": True, "selected": True},
-                  "checkbox": {"enable": True, "selected": False}}
-        self.assertTrue(cart._cart_line_selected(fields))
+    def test_reads_the_ticked_state(self):
+        self.assertTrue(cart._cart_line_selected(
+            {"checkbox": {"enable": True, "selected": True}}))
 
-    def test_falls_back_to_the_legacy_field_name(self):
-        fields = {"checkbox": {"enable": True, "selected": False}}
-        self.assertFalse(cart._cart_line_selected(fields))
+    def test_reads_the_unticked_state(self):
+        self.assertFalse(cart._cart_line_selected(
+            {"checkbox": {"enable": True, "selected": False}}))
+
+    def test_both_render_shapes_use_the_same_field_name(self):
+        """
+        Confirmed live Aug 2026: the droplet shape carries a plain `checkbox`
+        alongside its quantityView/priceViews/logisticsView siblings — it does
+        NOT rename this one. An earlier "checkboxView" guess was wrong and was
+        only masked because the lookup fell through to the legacy name.
+        """
+        self.assertEqual(cart.CART_SELECT_FIELD, "checkbox")
 
     def test_neither_field_present_is_none_not_false(self):
         """Unknown must never be reported as "unselected" — that's actionable and wrong."""

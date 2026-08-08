@@ -1426,6 +1426,12 @@ def view_cart() -> str:
     # back `selected is None`, which is unknown, not un-ticked. Reporting only
     # what we identified would then understate the problem by exactly the lines
     # we understand least — so when the arithmetic doesn't close, say so.
+    #
+    # This is not hypothetical. Two renders of the SAME 24-line cart minutes
+    # apart parsed 5 and then 4 un-ticked lines, while the server's own
+    # selectItemNum said 19 ticked (i.e. 5) both times — one line's checkbox is
+    # not reliably present across the page merge. Trusting our own count alone
+    # would have silently told the user 4 items were excluded when 5 were.
     server_selected = summary.get("selected_count") if used_droplet else None
     excluded = (len(items) - server_selected
                 if isinstance(server_selected, int) and not truncated else None)
