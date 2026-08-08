@@ -1437,6 +1437,16 @@ class TestBrowserHeaderConsistency(unittest.TestCase):
         # Must still be a well-formed preference list a browser could send.
         self.assertRegex(core.ACCEPT_LANGUAGE, r"^[a-z]{2}(-[A-Za-z]{2,4})?(,[^;]+;q=0\.\d)*$")
 
+    def test_default_is_the_full_captured_weighted_list(self):
+        """
+        Pins the literal default, not just "not en-CA" — a truncated
+        `"en-US,en;q=0.9"` would pass the test above (it's a well-formed
+        preference list, and it's not en-CA/en-SE) while still being a
+        weaker match than the real capture, which carries three more weighted
+        languages. Regression guard for exactly that kind of quiet trim.
+        """
+        self.assertEqual(core.ACCEPT_LANGUAGE, "en-US,en;q=0.9,sv;q=0.8,de;q=0.7,es;q=0.6")
+
     def test_accept_language_is_overridable(self):
         """
         The default matches the browser whose cookies this server borrows, which

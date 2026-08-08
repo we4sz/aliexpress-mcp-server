@@ -59,8 +59,10 @@ logger = logging.getLogger("aliexpress-mcp")
 # makes this client's traffic look less like the Chrome session it borrowed
 # cookies from raises how often the user gets locked out of their own cart.
 # This section builds every header real Chrome attaches — get_client() for
-# page navigations, mtop_call() for the signed XHR/fetch calls — in Chrome's
-# own header order, not just with the right values.
+# page navigations, mtop_call() for the signed XHR/fetch calls — not just
+# with the right values but in a considered order (see the ORDER note below
+# for exactly how much of that order is proven versus this module's own
+# reasonable default).
 #
 # ORDER, verified against httpx's own source (httpx._client.Client's `headers`
 # setter + httpx._models.Headers.update, both read directly, Aug 2026): a
