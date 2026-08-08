@@ -259,7 +259,8 @@ def _cart_droplet_render(cookies: dict) -> dict:
 
 
 def _cart_operate(cookies: dict, resp: dict, component_id: str, operation: str,
-                  quantity: Optional[int] = None, selected: Optional[bool] = None) -> str:
+                  quantity: Optional[int] = None, selected: Optional[bool] = None,
+                  select_all: Optional[bool] = None) -> str:
     """
     Run an Ultron/droplet operation against one cart line and return the MTOP `ret`.
 
@@ -298,6 +299,19 @@ def _cart_operate(cookies: dict, resp: dict, component_id: str, operation: str,
         checkbox = dict(existing) if isinstance(existing, dict) else {"enable": True}
         checkbox["selected"] = bool(selected)
         comp["fields"][CART_SELECT_FIELD] = checkbox
+    if select_all is not None:
+        # The cart HEADER carries TWO selection fields meaning different things,
+        # and the obvious one is not the operative one. `checkbox` is the
+        # pre-click display state; `checkBoxSelected` is the intent. A captured
+        # "select all" click sent:
+        #     checkbox: {"enable": true, "selected": false}, checkBoxSelected: true
+        # i.e. it echoed the OLD state and stated the new one separately.
+        #
+        # Setting `checkbox` here instead — which is exactly what the per-line
+        # path correctly does, so it looks right — leaves checkBoxSelected at
+        # whatever the render held, and un-ticked a whole 22-line cart in
+        # response to a request to tick it. Verified the hard way.
+        comp["fields"]["checkBoxSelected"] = bool(select_all)
     comp["needSubmit"] = True
     data = {component_id: comp}
     if root and root in components:
@@ -745,6 +759,25 @@ def _resolve_cart_target(cookies: dict, item_id: str, cart_id: str, sku_id: str)
             f"Item {item_id} occupies {len(matches)} cart lines — refusing to guess which "
             f"one you mean. Re-run with the cart_id:\n{listing}")
     return resp, matches[0], None
+
+
+# The cart header carries its own "select all" checkbox and IS a real control —
+# a captured click operates on it with the same `operationType: "checkbox"`,
+# differing only in which component is the operator. It is deliberately NOT
+# used here. Two attempts to drive it failed: setting its `checkbox.selected`
+# un-ticked an entire 22-line cart in response to a request to TICK it, and
+# setting its `checkBoxSelected` (the field the capture actually carries the
+# intent in) was an inert no-op. One write instead of N is not worth an
+# operation that can silently empty a checkout, so `all_lines` fans out over
+# the per-line path instead — which IS verified, and whose payload is
+# byte-shape-identical to what Chrome sends (same two components: the operated
+# product and the `global_cart_*` page root).
+#
+# For anyone picking this back up: the header is `app_cart_head_component*`,
+# and its two selection fields mean different things — `checkbox` is the
+# pre-click display state, `checkBoxSelected` is the intent (a capture of a
+# "select all" click sends checkbox.selected=false alongside
+# checkBoxSelected=true). Knowing that still was not enough to make it work.
 
 
 def _selection_map(resp: dict) -> dict:

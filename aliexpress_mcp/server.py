@@ -1202,32 +1202,96 @@ def add_many_to_cart(items: list[dict]) -> str:
     structured_output=False,
 )
 def set_cart_selection(selected: bool, item_id: str = "", url: str = "",
-                       cart_id: str = "", sku_id: str = "") -> str:
+                       cart_id: str = "", sku_id: str = "",
+                       cart_ids: Optional[list] = None,
+                       all_lines: bool = False) -> str:
     """
-    Tick or un-tick one cart line for checkout. This WRITES to your real account.
+    Tick or un-tick cart lines for checkout. This WRITES to your real account.
 
     AliExpress orders ONLY the ticked lines. An un-ticked line stays visibly in
     the cart and simply does not arrive, which is not recoverable after
     checkout — so this is how you make sure something you intend to buy is
     actually included. `view_cart` shows which lines are currently un-ticked.
 
+    Three ways to target, cheapest first:
+      all_lines=True  — every line in the cart. Only the lines that actually
+                        need changing are written, so "make sure everything is
+                        ticked" usually costs one or two requests, and calling
+                        it twice costs nothing the second time.
+      cart_ids=[...]  — several specific lines.
+      cart_id / item_id — a single line.
+
+    Prefer the list forms over calling this once per line: the rate limiter
+    guarding these endpoints answers with a challenge that does NOT clear by
+    waiting, so every extra write is another chance to get locked out of your
+    own cart. One call also reports the whole outcome together.
+
     Buys nothing and pays nothing; it only changes what a future checkout would
     include. One product can occupy several cart lines (one per variant), so an
     ambiguous `item_id` lists the candidate `cart_id`s and changes nothing.
 
     Args:
-        selected: True to tick the line (include it), False to un-tick it.
+        selected: True to tick (include), False to un-tick.
         item_id: AliExpress item ID of the line to change.
         url: Full or short AliExpress product URL (alternative to item_id).
         cart_id: The cart LINE id, from view_cart — the unambiguous way to
             target a line when one product appears more than once.
         sku_id: Variant id, to disambiguate between lines of the same item.
+        cart_ids: Several cart LINE ids to set to the same state in one call.
+        all_lines: Set EVERY line in the cart, in a single request.
     """
     cookies = load_cookies()
     if not cookies:
         return AUTH_EXPIRED_MSG
+
+    # all_lines resolves to the full list of cart_ids and then takes exactly the
+    # same per-line path. The cart header does expose a real "select all"
+    # checkbox and it would be one write instead of N — but two attempts to
+    # drive it failed, the first un-ticking an entire 22-line cart in response
+    # to a request to TICK it. A single write is not worth an operation that
+    # can silently empty a checkout, so this trades requests for predictability.
+    if all_lines:
+        try:
+            merged, _ = _cart_fetch_all_pages(cookies, _cart_droplet_render(cookies))
+            everything = _extract_cart_droplet(merged)["items"]
+        except Exception as e:
+            return f"Could not read the cart to enumerate its lines: {e}"
+        # Only touch lines that actually need changing — makes the common
+        # "make sure everything is ticked" case cost almost nothing, and makes
+        # a repeat call free rather than another N writes at the rate limiter.
+        cart_ids = [str(i["cart_id"]) for i in everything
+                    if i.get("cart_id") and bool(i.get("selected")) != bool(selected)]
+        if not cart_ids:
+            state = "ticked" if selected else "un-ticked"
+            return (f"All {len(everything)} cart line(s) are already {state} — "
+                    "nothing to change, no writes made.")
+
+    if cart_ids:
+        done, failed, warnings = [], [], []
+        for cid in cart_ids:
+            try:
+                line, err, collateral = _cart_set_selected(cookies, "", str(cid), "", bool(selected))
+            except Exception as e:
+                failed.append(f"  {cid}: {e}")
+                continue
+            if err:
+                failed.append(f"  {cid}: {err}")
+            else:
+                done.append(f"  {line.get('title') or cid}")
+            warnings += [f"    {t or c}: {b} → {a}" for c, t, b, a in collateral]
+        verb = "Ticked" if selected else "Un-ticked"
+        out = [f"{verb} {len(done)} of {len(cart_ids)} line(s)."]
+        if done:
+            out += ["", f"{verb}:"] + done
+        if failed:
+            out += ["", "Unchanged:"] + failed
+        if warnings:
+            out += ["", "⚠ OTHER lines changed selection during this — re-check view_cart:"] + warnings
+        return "\n".join(out)
+
     if not (item_id or url or cart_id):
-        return "Provide a cart_id (from view_cart), or an item_id / product URL."
+        return ("Provide a cart_id (from view_cart), an item_id / product URL, "
+                "a cart_ids list, or all_lines=True.")
     if item_id or url:
         item_id = _resolve_item_id(item_id, url) or ""
 
