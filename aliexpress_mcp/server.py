@@ -1,5 +1,5 @@
 """
-The FastMCP server singleton and all 19 @mcp.tool() functions.
+The FastMCP server singleton and all 21 @mcp.tool() functions.
 
 This is the only module in the package that imports `mcp` / registers tools —
 FastMCP registers via decorator side effects, so keeping one registration site
@@ -46,7 +46,7 @@ from aliexpress_mcp.catalog import (
 from aliexpress_mcp.cart import (
     _extract_cart_droplet, _extract_cart_summary,
     _cart_droplet_render, _cart_operate, _cart_lines, _cart_fetch_all_pages,
-    _extract_cart, _resolve_sku_for_cart, _resolve_cart_target,
+    _extract_cart, _resolve_sku_for_cart, _resolve_cart_target, _cart_set_selected,
 )
 from aliexpress_mcp.account import (
     ORDER_LIST_API, _extract_orders, _order_money, _order_item_line,
@@ -66,10 +66,13 @@ mcp = FastMCP(
     instructions=(
         "Browse, search, and manage an AliExpress account: search products, compare "
         "sellers, check reviews/shipping/variants, and inspect your cart, orders, and "
-        "wishlist. Seven tools write to the real, signed-in account (add_to_cart, "
-        "set_cart_quantity, remove_from_cart, add_to_wishlist, remove_from_wishlist, "
-        "create_wishlist, delete_wishlist) but none of them ever checks out, places "
-        "an order, or pays — checkout is not implemented."
+        "wishlist. Eight tools write to the real, signed-in account (add_to_cart, "
+        "set_cart_quantity, set_cart_selection, remove_from_cart, add_to_wishlist, "
+        "remove_from_wishlist, create_wishlist, delete_wishlist) but none of them "
+        "ever checks out, places an order, or pays — checkout is not implemented. "
+        "Note AliExpress orders only the TICKED cart lines: an un-ticked line stays "
+        "visible in the cart and simply never arrives, which view_cart flags and "
+        "set_cart_selection fixes."
     ),
 )
 
@@ -1027,6 +1030,59 @@ def add_to_cart(item_id: str = "", url: str = "", sku_id: str = "", quantity: in
 
 
 @mcp.tool(
+    title="Set Cart Selection",
+    annotations=ToolAnnotations(
+        readOnlyHint=False, destructiveHint=False, idempotentHint=True,
+        openWorldHint=True
+    ),
+    structured_output=False,
+)
+def set_cart_selection(selected: bool, item_id: str = "", url: str = "",
+                       cart_id: str = "", sku_id: str = "") -> str:
+    """
+    Tick or un-tick one cart line for checkout. This WRITES to your real account.
+
+    AliExpress orders ONLY the ticked lines. An un-ticked line stays visibly in
+    the cart and simply does not arrive, which is not recoverable after
+    checkout — so this is how you make sure something you intend to buy is
+    actually included. `view_cart` shows which lines are currently un-ticked.
+
+    Buys nothing and pays nothing; it only changes what a future checkout would
+    include. One product can occupy several cart lines (one per variant), so an
+    ambiguous `item_id` lists the candidate `cart_id`s and changes nothing.
+
+    Args:
+        selected: True to tick the line (include it), False to un-tick it.
+        item_id: AliExpress item ID of the line to change.
+        url: Full or short AliExpress product URL (alternative to item_id).
+        cart_id: The cart LINE id, from view_cart — the unambiguous way to
+            target a line when one product appears more than once.
+        sku_id: Variant id, to disambiguate between lines of the same item.
+    """
+    cookies = load_cookies()
+    if not cookies:
+        return AUTH_EXPIRED_MSG
+    if not (item_id or url or cart_id):
+        return "Provide a cart_id (from view_cart), or an item_id / product URL."
+    if item_id or url:
+        item_id = _resolve_item_id(item_id, url) or ""
+
+    try:
+        line, err = _cart_set_selected(cookies, item_id, cart_id, sku_id, bool(selected))
+    except Exception as e:
+        return f"Cart selection change failed: {e}"
+    if err:
+        return err
+
+    where = line.get("title") or f"line {line.get('cart_id')}"
+    if selected:
+        return (f"Ticked for checkout: {where}\n"
+                f"  cart_id: {line.get('cart_id')} — it will be included when you order.")
+    return (f"Un-ticked: {where}\n"
+            f"  cart_id: {line.get('cart_id')} — it stays in your cart but will NOT be ordered.")
+
+
+@mcp.tool(
     title="Set Cart Quantity",
     annotations=ToolAnnotations(
         readOnlyHint=False, destructiveHint=False, idempotentHint=True,
@@ -1706,13 +1762,16 @@ def list_wishlists() -> str:
 )
 def add_to_wishlist(wishlist: str, item_id: str = "", url: str = "") -> str:
     """
-    Put an ALREADY-SAVED item into one of your wishlists. This WRITES.
+    File a product under one of your wishlists, saving it first if needed. WRITES.
 
-    IMPORTANT — this moves, it does not save. AliExpress's list API only assigns
-    items that are already in your wishlist to a list; it cannot pull in a product
-    you have not saved. Saving a new product is a separate action (the ♡ on the
-    product page) that this server does not yet implement, so for an unsaved item
-    this reports what is missing rather than silently doing nothing.
+    AliExpress models these as two separate actions and this tool does both: the
+    ♡ that saves a product into the wishlist ungrouped, then the list assignment
+    that moves it into a named list. Its list API only assigns items already in
+    the wishlist, so an unsaved product takes two calls rather than one.
+
+    Note that lists are folders, not tags: an item lives in at most one, so
+    filing it into a second list MOVES it out of the first, and the result says
+    so.
 
     The list is required — there is no default. Items landing in the ungrouped
     bucket is how they end up somewhere you never look, so an unknown or ambiguous
@@ -1878,9 +1937,11 @@ def create_wishlist(name: str, public: bool = False) -> str:
     """
     Create a new (empty) wishlist on your AliExpress account. This WRITES.
 
-    Creates the list itself, not its contents — there is no tool yet for saving
-    items into it. Names are not checked for duplicates: AliExpress will happily
-    create a second list with the same name, so this reports the new list's id.
+    Creates the list itself, empty; use add_to_wishlist to put products in it.
+    Names are not checked for duplicates: AliExpress will happily create a second
+    list with the same name, so this reports the new list's id. delete_wishlist
+    is the inverse, and removes only the container — items filed under a deleted
+    list stay in the wishlist, ungrouped.
 
     Args:
         name: Name for the new list, e.g. "3D printer parts".

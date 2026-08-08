@@ -58,21 +58,18 @@ CART_SELECT_FIELD = "checkbox"
 # `mtop.aliexpress.trade.cart.async` endpoint `_cart_operate` already drives
 # for "update_quantity" and "delete".
 #
-# STILL UNVERIFIED, and "update_checkbox" is now known to be WRONG: tried live
-# against a real cart line, AliExpress answered ret=SUCCESS and changed
-# nothing — the house pattern of acknowledging a no-op. The render response
-# does not advertise its own operation vocabulary either (no `operationType`
-# appears anywhere in a render; it is send-only), so the correct verb cannot
-# be derived from what the server returns and has to be captured from the
-# browser's own request, the way every other write here was.
+# VERIFIED from a browser capture of a real tick, Aug 2026. It is the bare
+# noun "checkbox" — not "update_checkbox", which was the natural guess from
+# its sibling "update_quantity" and which AliExpress answered with
+# ret=SUCCESS while changing nothing, the house pattern of acknowledging a
+# no-op. Two guesses, both plausible, both wrong: the verb was not derivable
+# because a render never echoes an operationType back (it is send-only), so
+# there was nothing to read it off.
 #
-# Until then `set_cart_selection` is deliberately NOT exposed as a tool.
-# `_cart_set_selected` always re-reads and compares the flag rather than
-# trusting `ret`, so a wrong verb surfaces as an honest "accepted but nothing
-# changed" instead of a false confirmation — which is exactly how this one was
-# caught. Candidates left to try, cheapest first: "select"/"unselect",
-# "choose"/"unchoose", "check"/"uncheck", "update_selected".
-CART_OP_SELECT = "update_checkbox"
+# `_cart_set_selected` re-reads and compares the flag rather than trusting
+# `ret`, which is the only reason the wrong guess was caught rather than
+# shipped as a working feature.
+CART_OP_SELECT = "checkbox"
 
 
 def _cart_line_selected(fields: dict) -> Optional[bool]:
@@ -290,7 +287,17 @@ def _cart_operate(cookies: dict, resp: dict, component_id: str, operation: str,
     if quantity is not None:
         comp["fields"]["quantityView"] = {"current": int(quantity)}
     if selected is not None:
-        comp["fields"][CART_SELECT_FIELD] = {"selected": bool(selected)}
+        # Unlike quantityView — which is replaced with a bare {"current": N},
+        # and silently no-ops if you echo the whole rendered object back — the
+        # checkbox is sent COMPLETE, with `enable` preserved and only `selected`
+        # flipped. Captured from the browser Aug 2026:
+        #     "checkbox": {"enable": true, "selected": false}
+        # Mirroring the quantity idiom here was wrong in both directions: wrong
+        # verb and wrong payload shape.
+        existing = comp["fields"].get(CART_SELECT_FIELD)
+        checkbox = dict(existing) if isinstance(existing, dict) else {"enable": True}
+        checkbox["selected"] = bool(selected)
+        comp["fields"][CART_SELECT_FIELD] = checkbox
     comp["needSubmit"] = True
     data = {component_id: comp}
     if root and root in components:
