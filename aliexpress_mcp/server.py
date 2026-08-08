@@ -1193,6 +1193,13 @@ def add_many_to_cart(items: list[dict]) -> str:
     return "\n".join(out)
 
 
+# Rounds a converging selection change will attempt before giving up. Each
+# round re-reads the cart and rewrites only the lines still wrong, so a stable
+# cart finishes in one. More than a handful means the server is fighting us and
+# saying so beats looping.
+SELECTION_MAX_ROUNDS = 4
+
+
 @mcp.tool(
     title="Set Cart Selection",
     annotations=ToolAnnotations(
@@ -1214,12 +1221,16 @@ def set_cart_selection(selected: bool, item_id: str = "", url: str = "",
     actually included. `view_cart` shows which lines are currently un-ticked.
 
     Three ways to target, cheapest first:
-      all_lines=True  — every line in the cart. Only the lines that actually
-                        need changing are written, so "make sure everything is
-                        ticked" usually costs one or two requests, and calling
-                        it twice costs nothing the second time.
+      all_lines=True  — every line in the cart.
       cart_ids=[...]  — several specific lines.
       cart_id / item_id — a single line.
+
+    The list forms CONVERGE: they re-read the cart, re-diff against what you
+    asked for, and re-write only what is still wrong, up to a bounded number of
+    rounds. That is not belt-and-braces — setting one line's checkbox reliably
+    flips others off, so a single pass genuinely does not land. The result
+    reports what actually held, verified against a fresh read, and says plainly
+    when something refused to stick rather than claiming success.
 
     Prefer the list forms over calling this once per line: the rate limiter
     guarding these endpoints answers with a challenge that does NOT clear by
@@ -1256,37 +1267,92 @@ def set_cart_selection(selected: bool, item_id: str = "", url: str = "",
             everything = _extract_cart_droplet(merged)["items"]
         except Exception as e:
             return f"Could not read the cart to enumerate its lines: {e}"
-        # Only touch lines that actually need changing — makes the common
-        # "make sure everything is ticked" case cost almost nothing, and makes
-        # a repeat call free rather than another N writes at the rate limiter.
-        cart_ids = [str(i["cart_id"]) for i in everything
-                    if i.get("cart_id") and bool(i.get("selected")) != bool(selected)]
+        # Target EVERY line, not just the ones currently wrong. The convergence
+        # loop below already skips lines that are correct, so this costs nothing
+        # extra on a stable cart — but it is the difference between fixing the
+        # cart and fixing five lines while five others get knocked off behind
+        # you. Targeting only the initially-wrong set did exactly that: it
+        # converged its five and returned "5 of 5" on a cart that was still
+        # 20 of 25.
+        cart_ids = [str(i["cart_id"]) for i in everything if i.get("cart_id")]
         if not cart_ids:
+            return "The cart has no lines to select."
+        if all(bool(i.get("selected")) == bool(selected)
+               for i in everything if i.get("cart_id")):
             state = "ticked" if selected else "un-ticked"
             return (f"All {len(everything)} cart line(s) are already {state} — "
                     "nothing to change, no writes made.")
 
     if cart_ids:
-        done, failed, warnings = [], [], []
-        for cid in cart_ids:
+        # CONVERGE, don't fire-and-hope.
+        #
+        # Setting one line's checkbox reliably flips OTHER lines off — reported
+        # across a whole session and reproduced here (tick 2, watch 2 unrelated
+        # lines go un-ticked; the count stays put while the SET churns). It is
+        # not our payload: decoded browser captures of real ticks and ours is
+        # byte-shape-identical, same two components, same operationType, same
+        # checkbox object. Paginated reads were the other suspect and are
+        # innocent — page-1 state is unchanged across them.
+        #
+        # So the churn is server-side and a single pass cannot be trusted to
+        # land. Re-read, re-diff and re-write only what is still wrong, until
+        # it converges or stops improving. Bounded, because a cart that will
+        # not converge must say so rather than loop forever.
+        want = bool(selected)
+        targets = {str(c) for c in cart_ids}
+        done, failed, rounds = set(), [], 0
+        prev_wrong = None
+        for rounds in range(1, SELECTION_MAX_ROUNDS + 1):
             try:
-                line, err, collateral = _cart_set_selected(cookies, "", str(cid), "", bool(selected))
+                merged, _ = _cart_fetch_all_pages(cookies, _cart_droplet_render(cookies))
+                state = {str(i.get("cart_id")): i for i in _extract_cart_droplet(merged)["items"]}
             except Exception as e:
-                failed.append(f"  {cid}: {e}")
-                continue
-            if err:
-                failed.append(f"  {cid}: {err}")
-            else:
-                done.append(f"  {line.get('title') or cid}")
-            warnings += [f"    {t or c}: {b} → {a}" for c, t, b, a in collateral]
-        verb = "Ticked" if selected else "Un-ticked"
-        out = [f"{verb} {len(done)} of {len(cart_ids)} line(s)."]
-        if done:
-            out += ["", f"{verb}:"] + done
+                failed.append(f"  could not re-read the cart: {e}")
+                break
+            wrong = [c for c in targets
+                     if c in state and bool(state[c].get("selected")) != want]
+            if not wrong:
+                break
+            # No progress since the last round means writing again will not help.
+            if prev_wrong is not None and len(wrong) >= prev_wrong:
+                failed.append(
+                    f"  stopped after round {rounds}: {len(wrong)} line(s) still wrong and "
+                    "the last round changed nothing — AliExpress is not holding this state.")
+                break
+            prev_wrong = len(wrong)
+            for cid in wrong:
+                try:
+                    line, err, _coll = _cart_set_selected(cookies, "", cid, "", want)
+                except Exception as e:
+                    failed.append(f"  {cid}: {e}")
+                    continue
+                if err:
+                    failed.append(f"  {cid}: {err}")
+                else:
+                    done.add(cid)
+
+        try:
+            merged, _ = _cart_fetch_all_pages(cookies, _cart_droplet_render(cookies))
+            final = {str(i.get("cart_id")): i for i in _extract_cart_droplet(merged)["items"]}
+        except Exception:
+            final = {}
+        landed = [c for c in targets if c in final and bool(final[c].get("selected")) == want]
+        stuck = [c for c in targets if c in final and bool(final[c].get("selected")) != want]
+        gone = sorted(targets - set(final))
+
+        verb = "Ticked" if want else "Un-ticked"
+        out = [f"{verb} {len(landed)} of {len(targets)} line(s), verified against a fresh "
+               f"read after {rounds} round(s)."]
+        if stuck:
+            out += ["", f"⚠ NOT {verb.lower()} — these did not hold:"]
+            out += [f"    {str(final[c].get('title') or c)[:70]}" for c in stuck]
+        if gone:
+            out += ["", "Not in the cart at all:"] + [f"    {c}" for c in gone]
         if failed:
-            out += ["", "Unchanged:"] + failed
-        if warnings:
-            out += ["", "⚠ OTHER lines changed selection during this — re-check view_cart:"] + warnings
+            out += ["", "Problems:"] + failed
+        total_ticked = sum(1 for i in final.values() if i.get("selected"))
+        if final:
+            out += ["", f"Cart now: {total_ticked} of {len(final)} line(s) ticked for checkout."]
         return "\n".join(out)
 
     if not (item_id or url or cart_id):
