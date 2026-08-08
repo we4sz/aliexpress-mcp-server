@@ -694,7 +694,16 @@ def get_seller(item_id: str = "", url: str = "") -> str:
             "record — per the page's own EU trader disclosure — is the store above. "
             "The rating and feedback figures on such a page describe the pooled "
             "listing, not this merchant, so they are omitted rather than "
-            "misattributed. Use compare_sellers if you need a store to judge.")
+            "misattributed.")
+        # There is no substitute figure to offer: the merchant's own rating,
+        # volume and age live on their store page, and that page returns no
+        # payload this server can parse (probed live Aug 2026 — the store name
+        # is in the HTML, the structured profile is not). Rather than invent a
+        # number or stay silent, hand over the one thing that does answer the
+        # question: the URL. This is the case where "is this seller legit"
+        # matters MOST, and the honest answer is currently "open this yourself".
+        if d.get("store_url"):
+            lines.append(f"  Judge the merchant here: {d['store_url']}")
     if d.get("positive_rate") is not None:
         pr = f"Positive feedback: {d['positive_rate']}%"
         if d.get("total_reviews") is not None:
