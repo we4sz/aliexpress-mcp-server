@@ -18,7 +18,7 @@ import httpx
 
 from aliexpress_mcp.core import (
     BASE_URL, COUNTRY, CURRENCY, LANG, USER_AGENT, ACCEPT_LANGUAGE, HTTP2, logger,
-    load_cookies, get_client, check_auth_redirect,
+    load_cookies, get_client, check_auth_redirect, _pace,
     AUTH_EXPIRED_MSG, mtop_call, ret_problem,
     _msrp_flag, _fmt_money, parse_price, _normalize_price, _strip_html,
     _parse_sold_count,
@@ -198,6 +198,27 @@ def _search_fetch_parse(query: str, sort_by: str = "best_match",
     return items, total
 
 
+
+# How many countries a multi-country warehouse filter actually queries.
+#
+# The server accepts exactly ONE `shipFromCountry`, so asking for the EU used to
+# mean asking for PL and then "filtering" the PL-only rows against 27 country
+# codes — a filter that can only ever remove, never add. Measured: "heat shrink
+# tubing kit" with ship_from=EU returned 2 rows, both PL, while the SAME query
+# unfiltered surfaced two DE-warehoused listings (1005012541074062,
+# 1005012865757908) that the EU search never saw. Whole-bloc sweeps were
+# therefore biased toward whichever country happened to be probed first, and a
+# "no EU stock exists" conclusion drawn from one was not safe. Purchases were
+# made on such conclusions.
+#
+# So a multi-country request now fans out: one search per country, merged and
+# de-duplicated on item_id. Capped because each country is a full page fetch and
+# the caller is usually behind a timeout — 27 requests is not a search, it is an
+# outage. The cap is applied in EU_PROBE_ORDER, i.e. the highest-stock members
+# first, and the note says how many of the requested set were actually queried
+# so nobody reads a partial sweep as exhaustive.
+SHIP_FROM_FANOUT_MAX = int(os.environ.get("ALIEXPRESS_SHIPFROM_FANOUT", "4"))
+
 def search_with_notes(query: str, sort_by: str = "best_match",
                       ship_from: Any = "") -> tuple[list[dict], Optional[int], list[str]]:
     """
@@ -233,6 +254,45 @@ def search_with_notes(query: str, sort_by: str = "best_match",
     Raises RuntimeError(AUTH_EXPIRED_MSG) if AliExpress bounces us to login.
     """
     wanted = normalize_ship_from(ship_from)
+
+    # Multi-country filters fan out — see SHIP_FROM_FANOUT_MAX. One request per
+    # country, merged on item_id, because the server only honours one at a time
+    # and a single probe silently answers for the whole bloc.
+    if len(wanted) > 1:
+        probes = wanted[:SHIP_FROM_FANOUT_MAX]
+        merged: dict[str, dict] = {}
+        totals: list[int] = []
+        notes_all: list[str] = []
+        for probe in probes:
+            sub_items, sub_total, sub_notes = search_with_notes(query, sort_by, [probe])
+            for it in sub_items:
+                key = str(it.get("item_id") or id(it))
+                merged.setdefault(key, it)
+            if isinstance(sub_total, int):
+                totals.append(sub_total)
+            notes_all += [n for n in sub_notes if "Warehouse filter" not in n]
+            _pace("search_fanout", 1.0)
+        items = list(merged.values())
+        note = (f"Warehouse filter: {'/'.join(probes)} queried separately and merged "
+                f"({len(items)} distinct listings). AliExpress accepts only ONE "
+                f"warehouse per request, so a bloc has to be swept country by country.")
+        if len(wanted) > len(probes):
+            note += (f" Only {len(probes)} of the {len(wanted)} requested countries were "
+                     f"queried (the highest-stock members) — this is a sample of the "
+                     f"bloc, not an exhaustive sweep, so absence here is not proof of "
+                     f"absence EU-wide.")
+        # Dedupe the sub-searches' own notes, keeping first occurrence.
+        seen, uniq = set(), []
+        for n in notes_all:
+            if n not in seen:
+                seen.add(n); uniq.append(n)
+        # No server total describes a UNION. Each country reported its own, and
+        # neither summing (double-counts listings stocked in two warehouses) nor
+        # taking the max (smaller than the merged set) is true — which is how
+        # "Showing 3 of 8 parsed (1 total)" happened. Report none, and let the
+        # header say what it actually counted.
+        return items, None, [note] + uniq
+
     url_path = f"/w/wholesale-{_search_slug(query)}.html"
     params = {}
     if SORT_MAP.get(sort_by):

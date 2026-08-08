@@ -93,6 +93,23 @@ mcp = FastMCP(
 BROADENED_ROW_LIMIT = 3
 
 
+
+def _ship_from_label(ship_from: Any) -> str:
+    """
+    Compact name for a warehouse filter.
+
+    A bloc alias expands to 27 codes, and printing all of them in the header of
+    every result cost more context than the filter conveyed. The note above the
+    rows already states exactly which countries were queried, so the header only
+    needs to name the SET.
+    """
+    codes = normalize_ship_from(ship_from)
+    if not codes:
+        return ""
+    if len(codes) > 5:
+        return f"EU-{len(codes)}"
+    return "/".join(codes)
+
 def _row_limit(products: list, query: str, requested: int,
                ship_from: Any = "") -> tuple[int, Optional[str]]:
     """(rows to print, note) — collapses the listing when the query was replaced."""
@@ -213,7 +230,7 @@ def search_products(
     header += f" for '{query}' (sort: {sort_by}"
     # normalize_ship_from, not .upper() — ship_from accepts a list and "EU", and
     # calling .upper() on a list raises.
-    where = "/".join(normalize_ship_from(ship_from))
+    where = _ship_from_label(ship_from)
     header += f", ships from {where}" if where else ""
     header += "):"
     body = _format_product_lines(products, header, limit=limit)
@@ -288,7 +305,7 @@ def find_deals(
     shown = min(len(deals), limit)
     head = (f"Showing {shown} of {len(deals)} deal(s) for '{query}'"
             if shown < len(deals) else f"Found {len(deals)} deal(s) for '{query}'")
-    where = "/".join(normalize_ship_from(ship_from))
+    where = _ship_from_label(ship_from)
     if where:
         head += f", ships from {where}"
     body = _format_product_lines(deals, head + " (biggest discount first):", limit=limit)
