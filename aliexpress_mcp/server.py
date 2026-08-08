@@ -398,7 +398,22 @@ def get_product_details(item_id: str = "", url: str = "") -> str:
             seller_line += f" — {d['seller_positive_rate']}% positive feedback"
         if d.get("seller_total_reviews"):
             seller_line += f" ({d['seller_total_reviews']} seller feedbacks)"
+        # Store age was the one figure this block lacked, so a research session
+        # comparing sellers had to spend a second call per item on get_seller
+        # purely to learn it. It is also the figure that most changes how the
+        # rest reads: 100% across 10 feedbacks means something very different on
+        # a store opened last month than on a five-year-old one.
+        if d.get("seller_opened"):
+            age = f", {d['seller_opened_years']} yr" if d.get("seller_opened_years") else ""
+            seller_line += f" — opened {d['seller_opened']}{age}"
         lines.append(seller_line)
+        if d.get("seller_aggregated"):
+            lines.append(
+                f"  ⚠ Aggregation listing: the shop card names "
+                f"{d.get('seller_listed_name') or 'another store'}; the seller of record "
+                "per the page's EU trader disclosure is the store above. Feedback and "
+                "age figures describe the pooled listing, not this merchant, so they "
+                "are omitted here rather than misattributed.")
     if d.get("ship_unreachable"):
         lines.append(f"Shipping: does not ship to {COUNTRY}")
     elif d.get("shipping_cost") is not None:
