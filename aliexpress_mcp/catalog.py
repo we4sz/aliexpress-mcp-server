@@ -122,14 +122,19 @@ def apply_sort(products: list[dict], sort_by: str) -> list[dict]:
     121.36 while the header still claimed price_asc. Rather than assert an
     ordering the server did not apply, sort the parsed rows ourselves. Unpriced
     rows sink to the end instead of being dropped or sorting as zero.
+
+    Note the descending case negates the price rather than passing reverse=True:
+    reversing would flip the "unpriced" flag too and float those rows to the very
+    top of a most-expensive-first list, which is the one place they are most
+    likely to be read as the answer.
     """
     if sort_by == "price_asc":
-        key, rev = lambda p: (p.get("price") is None, p.get("price") or 0), False
+        key = lambda p: (p.get("price") is None, p.get("price") or 0)      # noqa: E731
     elif sort_by == "price_desc":
-        key, rev = lambda p: (p.get("price") is None, p.get("price") or 0), True
+        key = lambda p: (p.get("price") is None, -(p.get("price") or 0))   # noqa: E731
     else:
         return products
-    return sorted(products, key=key, reverse=rev)
+    return sorted(products, key=key)
 
 
 def _format_product_lines(products: list[dict], header: str, limit: int = 25) -> str:

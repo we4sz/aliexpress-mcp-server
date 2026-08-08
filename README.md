@@ -111,6 +111,34 @@ Re-run the snippet whenever tools start returning "session expired" — the toke
 
 ## Architecture
 
-Follows the pattern of [dekudeals-mcp-server](../dekudeals-mcp-server/) — FastMCP + httpx + BeautifulSoup — with added MTOP client code in `aliexpress_mcp_server.py`. Session cookies come from the shared credential file written by the [MCP Auth Bridge](https://github.com/justinritchie/mcp-auth-bridge) Chrome extension.
+FastMCP + httpx + BeautifulSoup. Session cookies come from the shared credential file written by the [MCP Auth Bridge](https://github.com/justinritchie/mcp-auth-bridge) Chrome extension.
+
+The code is a package, split by domain rather than by layer — `aliexpress_mcp_server.py` at the root is only a shim that imports and runs it, kept because `.mcp.json` invokes it by path:
+
+| Module | Holds |
+| --- | --- |
+| `core.py` | Config, cookie/session-token cache, request pacing, MTOP signing and `mtop_call`, the block-map helpers, and every shared parser/formatter (money, sold counts, dates). |
+| `scrape.py` | The search page: embedded-JSON extraction and card parsing. The only BeautifulSoup consumer. |
+| `catalog.py` | Public catalogue — search, PDP, variants, seller, reviews, shipping, duty logic. |
+| `cart.py` | Cart reads and writes, including its two response shapes and pagination. |
+| `account.py` | Orders and wishlists. |
+| `server.py` | The FastMCP singleton and all 20 tool definitions. The only module that imports `mcp`, and nothing imports it. |
+
+The three account domains all speak Alibaba's Ultron/droplet protocol but encode it differently, which is the single most confusing thing in the codebase: the cart nests **gzip+base64** objects, orders nest plain-JSON **strings**, and the wishlist nests plain-JSON **objects**.
 
 The MTOP response field paths (`PRODUCT_TITLE.text`, `PRICE.targetSkuPriceInfo.salePriceString`, `PC_RATING.rating`, `SHIPPING.originalLayoutResultList[0].bizData.displayAmount`, etc.) were reverse-engineered live from a real response in April 2026 and are documented inline in `_extract_pdp_fields()`. If AliExpress reorganizes the component layout, that function is the place to update.
+
+### Testing
+
+Two suites, because they answer different questions.
+
+```bash
+python3 -m unittest discover -s tests    # offline; no account needed
+python3 tests/golden.py capture          # live; snapshots every read-only tool
+python3 tests/golden.py capture --label after
+python3 tests/golden.py diff
+```
+
+`tests/test_units.py` pins the pure parsing and formatting logic — localized money strings, abbreviated sold counts, duty expectations, sort ordering. It needs no cookies and no network, so it runs anywhere, and it is the suite to add to when fixing a data-quality bug.
+
+`tests/golden.py` answers the other question, the one that has cost the most time on this project: *did AliExpress change, or did I break it?* It snapshots what every read-only tool actually returns, then diffs. Because it hits a live API where prices and delivery dates legitimately move, it does not fail on any difference — it separates lines whose **numbers** moved (volatile) from lines whose **wording** changed (structural), reports them apart, and leaves the judgement to a human. Snapshots are gitignored: they contain real account data. The write tools are never called.
