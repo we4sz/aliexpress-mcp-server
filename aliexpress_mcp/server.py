@@ -1328,7 +1328,10 @@ def add_many_to_cart(items: list[dict]) -> str:
 
         if r["ok"]:
             note = f"  ⚠ {r['warn']}" if r.get("warn") else ""
-            added.append(f"  {item_id}: {r['descr']} ×{qty}{note}")
+            # cart_id, like the single add returns — without it, cleaning up or
+            # re-targeting a batch costs an extra view_cart.
+            cid = f"  [cart_id: {r['cart_id']}]" if r.get("cart_id") is not None else ""
+            added.append(f"  {item_id}: {r['descr']} ×{qty}{cid}{note}")
         elif r["challenged"]:
             challenge_msg = r["text"]
             failed.append(f"  {item_id}: blocked by the verification challenge")
@@ -1356,8 +1359,17 @@ def add_many_to_cart(items: list[dict]) -> str:
                     "UN-ticked while this batch ran, without being asked to. They stay "
                     "in the cart but will NOT be ordered:"]
         out += [f"    {str(t or c)[:70]}" for c, t in drift]
-        out += ["    Run set_cart_selection(selected=True, all_lines=True) to put them "
-                "back — it re-reads and converges."]
+        # Must not contradict the stall message. On a cart big enough that the
+        # ~20-line ceiling bites, all_lines cannot converge, and telling the
+        # caller otherwise is the same useless advice pattern this codebase has
+        # already deleted three times.
+        big = sel_after is not None and len(sel_after) > 20
+        out += ["    " + ("Cart is large enough that set_cart_selection cannot converge "
+                          "(the ~20-line ceiling) — use the AliExpress app or site's "
+                          "\"Select all\" to restore these."
+                          if big else
+                          "Run set_cart_selection(selected=True, all_lines=True) to put "
+                          "them back — it re-reads and converges.")]
     out += ["", "Nothing has been ordered or paid for."]
     return "\n".join(out)
 
@@ -1389,6 +1401,9 @@ SELECTION_TIME_BUDGET = float(os.environ.get("ALIEXPRESS_SELECTION_BUDGET", "45"
 # page and is not free on a large cart. Without it the loop spends the budget on
 # writes and then overruns while confirming them.
 SELECTION_CLOSING_READ = 10.0
+
+# How many not-held lines to name before summarising the rest.
+STUCK_LIST_MAX = 10
 
 
 @mcp.tool(
@@ -1604,8 +1619,14 @@ def set_cart_selection(selected: bool, item_id: str = "", url: str = "",
                     "cart, the site's own \"Select all\" is faster than any number of "
                     "calls here."]
         if stuck:
+            # Cap the listing. On a large cart this ran to 24 truncated titles,
+            # which is a lot of context to spend on a list the caller is going
+            # to act on wholesale anyway.
             out += ["", f"⚠ NOT {verb.lower()} — these did not hold:"]
-            out += [f"    {str(final[c].get('title') or c)[:70]}" for c in stuck]
+            shown_stuck = stuck[:STUCK_LIST_MAX]
+            out += [f"    {str(final[c].get('title') or c)[:70]}" for c in shown_stuck]
+            if len(stuck) > len(shown_stuck):
+                out.append(f"    … and {len(stuck) - len(shown_stuck)} more")
         if gone:
             out += ["", "Not in the cart at all:"] + [f"    {c}" for c in gone]
         if failed:

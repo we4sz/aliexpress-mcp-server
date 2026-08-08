@@ -217,7 +217,11 @@ def _search_fetch_parse(query: str, sort_by: str = "best_match",
 # outage. The cap is applied in EU_PROBE_ORDER, i.e. the highest-stock members
 # first, and the note says how many of the requested set were actually queried
 # so nobody reads a partial sweep as exhaustive.
-SHIP_FROM_FANOUT_MAX = int(os.environ.get("ALIEXPRESS_SHIPFROM_FANOUT", "4"))
+# Five, not four: CZ-warehoused listings turned up repeatedly in live sweeps
+# (SucceBuy step drills and winches, VEVOR heaters all ship CZ), so a PL/DE/FR/ES
+# probe misses a country that genuinely stocks. IT/NL/SE never appeared in a
+# tagged row across ~30 searches, so they are not worth a request each.
+SHIP_FROM_FANOUT_MAX = int(os.environ.get("ALIEXPRESS_SHIPFROM_FANOUT", "5"))
 
 def search_with_notes(query: str, sort_by: str = "best_match",
                       ship_from: Any = "") -> tuple[list[dict], Optional[int], list[str]]:
@@ -1081,6 +1085,9 @@ def _shipping_unknown(d: dict, reason: str, quoted: Optional[str] = None) -> Non
         quoted=quoted or "somewhere else", country=COUNTRY)
 
 
+_POOLED_EXPLAINED = False
+
+
 def shipping_line(d: dict) -> str:
     """
     The one-line shipping verdict for a PDP dict, in the caller's words.
@@ -1117,10 +1124,20 @@ def shipping_line(d: dict) -> str:
             over = d.get("free_shipping_over")
             waived = (f", and waived entirely once the Choice part of your order reaches "
                       f"{over}" if over else "")
+            # The full explanation earns its length once. Repeated verbatim on
+            # every Choice listing in a research session it is just tax on the
+            # caller's context, and the fact it conveys does not change between
+            # listings — the fee is the same flat per-order figure every time.
+            global _POOLED_EXPLAINED
+            if _POOLED_EXPLAINED:
+                return (f"Shipping: {money} — pooled Choice fee, charged once per order"
+                        + (f", waived over {over}" if over else "") + ".")
+            _POOLED_EXPLAINED = True
             return (f"Shipping: {money} for your whole AliExpress Choice group, not for "
                     f"this item — it is a flat per-order fee shared by every Choice "
                     f"listing in the basket{waived}. Adding this line to an order that "
-                    "already pays it costs no extra freight.")
+                    "already pays it costs no extra freight. (Later Choice listings in "
+                    "this session abbreviate this.)")
         return (f"Shipping: {money} for this line — the seller's own freight, charged "
                 "per line and pooled with nothing. It is added on top of any other "
                 "line's shipping.")
