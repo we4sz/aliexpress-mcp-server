@@ -15,7 +15,7 @@ from urllib.parse import quote_plus
 import httpx
 
 from aliexpress_mcp.core import (
-    BASE_URL, COUNTRY, CURRENCY, LANG, USER_AGENT, logger,
+    BASE_URL, COUNTRY, CURRENCY, LANG, USER_AGENT, ACCEPT_LANGUAGE, logger,
     load_cookies, get_client, check_auth_redirect,
     AUTH_EXPIRED_MSG, _pace, mtop_call, ret_problem,
     _msrp_flag, _fmt_money, parse_price, _normalize_price, _strip_html,
@@ -1139,7 +1139,9 @@ def _fetch_reviews(item_id: str, page: int = 1, page_size: int = 20, filt: str =
     headers = {
         "User-Agent": USER_AGENT,
         "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-CA,en;q=0.9",
+        # Was a third hardcoded "en-CA" — the reviews endpoint is unsigned and
+        # on a different host, so it was missed when the other two were fixed.
+        "Accept-Language": ACCEPT_LANGUAGE,
         "Referer": f"{BASE_URL}/item/{item_id}.html",
     }
     if cookie_str:

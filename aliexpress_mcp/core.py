@@ -38,9 +38,13 @@ CURRENCY = os.environ.get("ALIEXPRESS_CURRENCY", "CAD")
 LANG = f"en_{COUNTRY}"
 
 BASE_URL = "https://www.aliexpress.com"
+# Chrome major version 151 — confirmed against a real capture of this user's
+# own browser (sec-ch-ua brand list, see SEC_CH_UA below), not a guess. Keep
+# this in sync with SEC_CH_UA's version by construction (it's parsed back out
+# below), not by remembering to edit both.
 USER_AGENT = (
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/151.0.0.0 Safari/537.36"
 )
 
 logging.basicConfig(level=logging.INFO)
@@ -76,15 +80,32 @@ logger = logging.getLogger("aliexpress-mcp")
 # first too on the HTTP/1.1 connections this client actually makes (see the
 # transport-layer limits below).
 #
-# VALUES are built from Chrome's publicly documented Client Hints and Fetch
-# Metadata behavior (the sec-ch-ua-* / sec-fetch-* families), not from a
-# byte-for-byte capture of this account's own browser traffic — nobody had
-# one on hand when this was written. Treat the header NAMES, presence, and
-# relative order as the confirmed part; treat exact wire-format strings
-# (Accept's MIME list, the sec-ch-ua brand list, the current Chrome
-# milestone) as a best-effort match pending a live capture, the same
-# confidence split the CART_SELECT_FIELD/CART_OP_SELECT constants in cart.py
-# got before *their* live verification landed.
+# VALUES: a real capture landed (Aug 2026) for mtop_call()'s XHR/fetch shape —
+# see fixtures/chrome_headers_xhr.txt (sanitized: the cookie value carried
+# live session tokens, an account id and an email address, and was redacted;
+# never reconstruct or re-commit it). It's a POST to
+# `mtop.aliexpress.trade.cart.async`, captured via DevTools' JS ("fetch()
+# view") export, which the file itself notes does not surface HTTP/2's
+# pseudo-headers (:method, :authority, …). Below, mtop_call()'s values and
+# relative order for accept / accept-language / content-type / priority /
+# sec-ch-ua* / sec-fetch-* / cookie / referer are taken directly from that
+# capture. get_client()'s page-navigation shape has NOT been captured — its
+# values remain built from Chrome's publicly documented Client Hints / Fetch
+# Metadata behavior, unverified, the same confidence split the
+# CART_SELECT_FIELD/CART_OP_SELECT constants in cart.py got before *their*
+# live verification landed (and got corrected — twice — by that verification;
+# treat "unverified" here exactly as skeptically).
+#
+# Two things the capture corrected that general Chrome knowledge got WRONG,
+# worth recording so nobody "fixes" them back:
+#   - Accept-Language is NOT derivable from the shipping COUNTRY. The capture
+#     shows `en-US,en;q=0.9,sv;q=0.8,de;q=0.7,es;q=0.6` on an SE-shipping
+#     account — a real person's actual OS/browser language preference list,
+#     unrelated to where their orders ship. See ACCEPT_LANGUAGE below.
+#   - mtop_call()'s Accept is bare `application/json`, not
+#     `application/json, text/plain, */*` (jQuery/axios's default, which is
+#     what was there before and is a plausible-looking but wrong guess for
+#     what AliExpress's own JS actually sends).
 #
 # WHAT THIS CANNOT MATCH, so nobody mistakes closer headers for undetectable:
 #   - HTTP/2 framing. Real Chrome negotiates h2 via ALPN and sends HTTP/2's
@@ -105,22 +126,32 @@ logger = logging.getLogger("aliexpress-mcp")
 CHROME_VERSION_MATCH = re.search(r"Chrome/(\d+)\.", USER_AGENT)
 CHROME_MAJOR_VERSION = CHROME_VERSION_MATCH.group(1) if CHROME_VERSION_MATCH else "131"
 
-# Built from USER_AGENT's own Chrome/<N> token rather than a separately
-# hand-maintained number, so the two can never say different versions — the
-# exact failure mode the task called out: "a UA claiming Chrome 131 alongside
+# Brand list, GREASE entry, and their ORDER are copied verbatim from a real
+# Chrome request captured Aug 2026 (fixtures/chrome_headers_xhr.txt):
+#     "Not=A?Brand";v="99", "Google Chrome";v="151", "Chromium";v="151"
+# GREASE first, then Google Chrome, then Chromium. (A first-pass version of
+# this constant, written before the capture, had Chromium first and
+# `"Not(A:Brand";v="24"` for GREASE — a real punctuation/version Chromium has
+# used, just not the one this browser actually sends; kept as a reminder that
+# "plausible-looking" and "correct" are different bars.)
+#
+# Only CHROME_MAJOR_VERSION is templated in below, built from USER_AGENT's own
+# Chrome/<N> token rather than a separately hand-maintained number, so the UA
+# string and this client hint can never say different versions — the exact
+# failure mode the task called out: "a UA claiming Chrome 131 alongside
 # client hints claiming a different major version is a stronger bot signal
-# than sending neither." Bump USER_AGENT and this follows automatically.
+# than sending neither." Bump USER_AGENT's Chrome/<N> and this follows
+# automatically. The GREASE brand's own name/version ("Not=A?Brand";v="99")
+# is left as a literal matching the capture, not derived from anything —
+# Chromium deliberately rotates its exact GREASE punctuation/version per
+# release channel and even per install (its own GreasedBrandVersionInfo) so
+# that string is never meant to be a stable fingerprint on its own; a
+# different genuine Chrome 151 install may show a different one and be
+# equally authentic. This is simply the real value one specific capture showed.
 SEC_CH_UA = (
-    f'"Chromium";v="{CHROME_MAJOR_VERSION}", "Not(A:Brand";v="24", '
-    f'"Google Chrome";v="{CHROME_MAJOR_VERSION}"'
+    f'"Not=A?Brand";v="99", "Google Chrome";v="{CHROME_MAJOR_VERSION}", '
+    f'"Chromium";v="{CHROME_MAJOR_VERSION}"'
 )
-# "Not(A:Brand" is Chromium's own GREASE brand — a deliberately fake vendor
-# entry Chromium inserts so header-parsers can't hardcode "there are exactly
-# 2 real brands". Chromium *intentionally rotates* its exact punctuation and
-# version per release channel (see Chromium's GreasedBrandVersionInfo) so
-# this specific string is not itself a stable fingerprint — two genuine
-# Chrome installs on the same version already show different GREASE strings.
-# There is no single "correct" value to chase here.
 
 # Also derived from USER_AGENT rather than stated separately, for the same
 # never-drift reason as CHROME_MAJOR_VERSION above.
@@ -132,15 +163,26 @@ SEC_CH_UA_PLATFORM = (
     '"Unknown"'
 )
 
-# Accept-Language reflects the browser/OS locale a real Chrome install would
-# report — independent of AliExpress's own `_lang`/`shipToCountry` MTOP
-# params, but it was hardcoded to "en-CA" here regardless of the configured
-# market, the same class of bug as report item #7 (shipto-ignores-country;
-# see the shipto-ignores-country memory note) just in an HTTP header instead
-# of an MTOP param: a SE account sent `Accept-Language: en-CA` on every
-# request while `_lang`/`shipToCountry` correctly said SE elsewhere. Derived
-# from COUNTRY, matching the existing `LANG = f"en_{COUNTRY}"` pattern above.
-ACCEPT_LANGUAGE = f"en-{COUNTRY},en;q=0.9"
+# Accept-Language is the user's LANGUAGE PREFERENCE LIST, not their market.
+#
+# This was hardcoded to "en-CA" on an SE account, which was wrong — but the
+# obvious fix, deriving `en-{COUNTRY}`, is wrong too, and it was tried before
+# the capture arrived. The real browser on this very account sends this exact
+# string, copied verbatim from fixtures/chrome_headers_xhr.txt:
+#     en-US,en;q=0.9,sv;q=0.8,de;q=0.7,es;q=0.6
+# en-US first, Swedish fourth by weight, on an account that ships to Sweden.
+# The header describes what languages a person reads, which has no necessary
+# relationship to where their parcels go — so `en-SE` would have been just as
+# synthetic as `en-CA`, merely wrong in a newer way. Do NOT "fix" this back
+# toward COUNTRY; that is a round trip this file has already made.
+#
+# Kept overridable (not hardcoded-only) because this is one real person's own
+# preference list, not a universal constant — a different account's owner
+# should set their actual one (copy it out of DevTools) rather than inherit
+# this one by default forever.
+ACCEPT_LANGUAGE = os.environ.get(
+    "ALIEXPRESS_ACCEPT_LANGUAGE", "en-US,en;q=0.9,sv;q=0.8,de;q=0.7,es;q=0.6"
+)
 
 
 # ─── Auth ───────────────────────────────────────────────────────────────────
@@ -398,28 +440,46 @@ def mtop_call(
     # Sec-Fetch-* on requests THEY generate — MTOP's own mtop.js issues this
     # as a CORS fetch, same as ours), `Sec-Fetch-Dest: empty` (the response is
     # consumed as data, not rendered). No `Sec-Fetch-User` / `Upgrade-
-    # Insecure-Requests` — both are navigation-only, never sent on XHR/fetch.
-    # See the module-level "Browser header profile" comment (above USER_AGENT)
-    # for the httpx-order technique and what's confirmed vs. best-effort.
+    # Insecure-Requests` — both are navigation-only, confirmed ABSENT on this
+    # capture (see below), not merely assumed.
+    #
+    # Values and relative order for accept / accept-language / content-type /
+    # priority / sec-ch-ua* / sec-fetch-* / cookie / referer are copied from a
+    # real POST to this exact endpoint's family (`cart.async`), captured Aug
+    # 2026 — see fixtures/chrome_headers_xhr.txt and the module-level "Browser
+    # header profile" comment above USER_AGENT for the full story, including
+    # what that capture corrected (Accept-Language, Accept's value) versus
+    # what an earlier, plausible-looking guess had. `Accept` is bare
+    # `application/json` — NOT `application/json, text/plain, */*` (a
+    # jQuery/axios default that looked right but wasn't). User-Agent, Origin,
+    # Accept-Encoding, and Connection are NOT in that capture (DevTools' JS
+    # export doesn't surface headers JS can't set/read, and Connection
+    # specifically doesn't exist at all over the real HTTP/2 connection Chrome
+    # used — see the transport-layer limits in the module comment) but are
+    # still sent here since a real request always carries them; their
+    # position below is this module's own best-effort placement, not
+    # confirmed by the capture the way the other ten headers are.
     headers = {
-        "sec-ch-ua": SEC_CH_UA,
-        "sec-ch-ua-mobile": SEC_CH_UA_MOBILE,
-        "sec-ch-ua-platform": SEC_CH_UA_PLATFORM,
         "User-Agent": USER_AGENT,
-        "Accept": "application/json, text/plain, */*",
-        "Origin": BASE_URL,
-        "Sec-Fetch-Site": "same-site",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Dest": "empty",
-        "Referer": resolved_referer,
+        "Accept": "application/json",
+        "Accept-Language": ACCEPT_LANGUAGE,
+        # (Content-Type is spliced in right here, after Accept-Language, for
+        # POST only — see below.)
         # RFC 9218 Extensible Priorities. "u=1, i" (one band below the
         # top-urgency "u=0" get_client() sends for a main document) is what
         # Chrome uses for a same-page background fetch like this one.
         "Priority": "u=1, i",
-        "Accept-Encoding": "gzip, deflate, br, zstd",
-        "Accept-Language": ACCEPT_LANGUAGE,
-        "Connection": "keep-alive",
+        "sec-ch-ua": SEC_CH_UA,
+        "sec-ch-ua-mobile": SEC_CH_UA_MOBILE,
+        "sec-ch-ua-platform": SEC_CH_UA_PLATFORM,
+        "Origin": BASE_URL,
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-site",
         "Cookie": cookie_str,
+        "Referer": resolved_referer,
+        "Accept-Encoding": "gzip, deflate, br, zstd",
+        "Connection": "keep-alive",
     }
     url = f"{MTOP_BASE}/h5/{api}/{version}/"
 
@@ -432,13 +492,15 @@ def mtop_call(
             # the signature still covers the same `data` string either way.
             #
             # Content-Type is built into its own ordered copy (not appended to
-            # `headers` after the fact) so it lands right after Accept — a
-            # dict's later `key = value` on an already-built dict would just
-            # tack it on at the very end, in the wrong slot for a POST fetch.
+            # `headers` after the fact) so it lands right after Accept-Language —
+            # exactly where the real captured POST has it — rather than at the
+            # very end, which is where a later `dict[key] = value` on the
+            # already-built `headers` would put it (a dict only reorders on a
+            # key's FIRST insertion).
             post_headers = {}
             for k, v in headers.items():
                 post_headers[k] = v
-                if k == "Accept":
+                if k == "Accept-Language":
                     post_headers["Content-Type"] = "application/x-www-form-urlencoded"
             query = {k: v for k, v in params.items() if k != "data"}
             resp = c.post(url, params=query, headers=post_headers, data={"data": data_str})

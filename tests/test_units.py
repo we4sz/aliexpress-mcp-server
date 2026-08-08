@@ -1420,15 +1420,54 @@ class TestBrowserHeaderConsistency(unittest.TestCase):
         self.assertNotIn("Mobile", core.USER_AGENT)
         self.assertEqual(core.SEC_CH_UA_MOBILE, "?0")
 
-    def test_accept_language_tracks_the_configured_country_not_a_fixed_default(self):
+    def test_accept_language_is_a_language_list_not_a_market_code(self):
         """
-        Was hardcoded "en-CA" regardless of ALIEXPRESS_COUNTRY — the same bug
-        class as report #7 (shipto-ignores-country), just in an HTTP header
-        instead of an MTOP param. Module setup above pins
-        ALIEXPRESS_COUNTRY=SE before import, so this must read en-SE.
+        This constant has been wrong twice, in opposite directions, so it is
+        pinned against the capture rather than against a rule.
+
+        It was hardcoded "en-CA" on an SE account. The obvious fix — derive
+        "en-{COUNTRY}" — was then applied, and is also wrong: a real Chrome on
+        this exact account sends `en-US,en;q=0.9,sv;q=0.8,de;q=0.7,es;q=0.6`.
+        The header states which languages a person READS; it has no necessary
+        relation to where their parcels ship. Both "en-CA" and "en-SE" are
+        synthetic; only one of them looks synthetic in a new way.
         """
-        self.assertEqual(core.ACCEPT_LANGUAGE, "en-SE,en;q=0.9")
         self.assertNotIn("en-CA", core.ACCEPT_LANGUAGE)
+        self.assertNotIn(f"en-{core.COUNTRY}", core.ACCEPT_LANGUAGE)
+        # Must still be a well-formed preference list a browser could send.
+        self.assertRegex(core.ACCEPT_LANGUAGE, r"^[a-z]{2}(-[A-Za-z]{2,4})?(,[^;]+;q=0\.\d)*$")
+
+    def test_accept_language_is_overridable(self):
+        """
+        The default matches the browser whose cookies this server borrows, which
+        is the whole point — but someone else's install reads different
+        languages, so it has to be settable without editing source.
+        """
+        # A subprocess, not importlib.reload: reloading core swaps the module
+        # object out from under cart.py and catalog.py, which imported its
+        # functions by value at their own import time. Two header-order tests
+        # failed that way before this was changed — the reload was louder than
+        # the thing it was testing.
+        import subprocess
+        env = dict(os.environ, ALIEXPRESS_ACCEPT_LANGUAGE="fr-FR,fr;q=0.9")
+        out = subprocess.run(
+            [sys.executable, "-c",
+             "from aliexpress_mcp import core; print(core.ACCEPT_LANGUAGE)"],
+            cwd=str(Path(__file__).resolve().parent.parent),
+            env=env, capture_output=True, text=True, timeout=60)
+        self.assertEqual(out.stdout.strip(), "fr-FR,fr;q=0.9", out.stderr[-400:])
+
+    def test_every_outbound_caller_uses_the_shared_constant(self):
+        """
+        Three separate places hardcoded "en-CA": get_client, mtop_call and
+        _fetch_reviews. The first two were fixed together and the third was
+        missed for hours because it lives in catalog.py on a different host.
+        """
+        import pathlib
+        pkg = pathlib.Path(core.__file__).parent
+        offenders = [p.name for p in pkg.glob("*.py")
+                     if "en-CA,en" in p.read_text()]
+        self.assertEqual(offenders, [], f"hardcoded Accept-Language in: {offenders}")
 
 
 class TestGetClientHeaderOrder(unittest.TestCase):
@@ -1536,12 +1575,28 @@ class TestMtopCallHeaderOrder(unittest.TestCase):
             "mtop.aliexpress.trade.cart.render", "1.0", {"a": 1},
             cookies={"_m_h5_tk": "tok_123456789012345"},
             referer="https://www.aliexpress.com/p/shoppingcart/index.html")
-        self.assertEqual(self._last_order(), [
-            "Host", "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
+        # Deliberately NOT an exact wire-order assertion.
+        #
+        # The capture this was built from is DevTools' `fetch()` export, and
+        # that view lists headers ALPHABETICALLY — accept, accept-language,
+        # content-type, priority, sec-ch-ua, sec-ch-ua-mobile, ... is a-to-z,
+        # not the order Chrome put on the wire. So the capture cannot tell us
+        # the order, and an exact-order test pins an invention while looking
+        # like it pins evidence. That is the same trap as the checkbox
+        # constants: confident-looking, unverified, and wrong.
+        #
+        # What IS checkable: the header SET, and that httpx did not silently
+        # drop or reorder anything we listed (Host aside, which httpx always
+        # injects first). Pin those.
+        order = self._last_order()
+        self.assertEqual(order[0], "Host")
+        self.assertEqual(sorted(order[1:]), sorted([
+            "sec-ch-ua", "sec-ch-ua-mobile", "sec-ch-ua-platform",
             "User-Agent", "Accept", "Origin", "Sec-Fetch-Site", "Sec-Fetch-Mode",
             "Sec-Fetch-Dest", "Referer", "Priority", "Accept-Encoding",
             "Accept-Language", "Connection", "Cookie",
-        ])
+        ]))
+        self.assertEqual(len(order), len(set(order)), "a header was sent twice")
         req = self.captured[-1]
         # acs.aliexpress.com from www.aliexpress.com: different host, same
         # registrable site -> same-site, not same-origin and not cross-site.
@@ -1552,19 +1607,29 @@ class TestMtopCallHeaderOrder(unittest.TestCase):
         self.assertNotIn("Sec-Fetch-User", req.headers)
         self.assertNotIn("Upgrade-Insecure-Requests", req.headers)
 
-    def test_post_inserts_content_type_right_after_accept(self):
+    def test_post_does_not_append_content_type_at_the_end(self):
         """
-        A dict's `d["k"] = v` on an already-built headers dict would append
-        Content-Type at the very END (Python dicts only reorder on a NEW
-        key's first insertion) — wrong slot for a POST fetch. This pins that
-        the POST path builds its own copy instead, landing Content-Type where
-        Chrome puts it.
+        The real defect this guards: `d["Content-Type"] = v` on an
+        already-built dict appends at the very END, because a Python dict only
+        reorders on a key's FIRST insertion. The POST path therefore builds its
+        own ordered copy.
+
+        It asserts "not last", not an exact index. The capture cannot settle
+        the exact slot — DevTools' fetch() export is alphabetized — and an
+        earlier version of this test asserted `index(Accept) + 1` while the
+        code deliberately placed it after Accept-Language, so the test and the
+        code it was guarding disagreed with each other and neither was evidence.
         """
         core.mtop_call(
             "mtop.aliexpress.trade.cart.async", "1.0", {"a": 1},
             cookies={"_m_h5_tk": "tok_123456789012345"}, method="POST")
         order = self._last_order()
-        self.assertEqual(order.index("Content-Type"), order.index("Accept") + 1)
+        self.assertIn("Content-Type", order)
+        self.assertLess(order.index("Content-Type"), len(order) - 1,
+                        "Content-Type was appended last — the ordered copy was bypassed")
+        # It belongs with the content-negotiation headers, ahead of the
+        # transport ones httpx keeps at the tail.
+        self.assertLess(order.index("Content-Type"), order.index("Connection"))
 
     def test_get_has_no_content_type(self):
         """No body on GET -> no Content-Type, matching what a real browser sends."""
