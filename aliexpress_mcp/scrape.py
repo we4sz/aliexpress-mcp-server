@@ -62,6 +62,34 @@ def _listing_age(lunch_time: Any) -> Optional[str]:
     return f"{days / 365.0:.1f}y"
 
 
+def _is_sponsored(it: dict) -> bool:
+    """
+    Whether this card is a paid placement rather than an earned rank.
+
+    AliExpress marks bought positions two different ways and — measured over 514
+    live cards, Aug 2026 — NEVER both on the same card, so either one alone is the
+    signal and the union is the count:
+
+      `p4p`                          the ad click-tracking payload (Alibaba's ad
+                                     product is literally "pay for placement"); its
+                                     clickUrl points at us-click.aliexpress.com.
+      `allPlatformInfo.adTag`        the badge the site paints on the card. Its
+                                     tagText read "Ad" on all 96 archived cards
+                                     carrying it — no other value appeared.
+
+    How much of a page this covers varies enormously and is the reason it must be
+    stated per search rather than assumed: across 8 live result pages the sponsored
+    share ran 0/60, 0/60, 0/34, 1/60, 22/60, 27/60, 32/60 and 56/60 — that last one
+    ("usb c cable") is 93% of the page. A consumer reasoning about "the top result"
+    under a header claiming a sort order has no way to know which it is looking at.
+    """
+    if it.get("p4p"):
+        return True
+    api = it.get("allPlatformInfo")
+    tag = api.get("adTag") if isinstance(api, dict) else None
+    return bool(isinstance(tag, dict) and tag.get("tagText"))
+
+
 def _sku_count(it: dict) -> Optional[int]:
     """
     How many buyable configurations the listing has, from `extraParams.sku_images`.
@@ -110,6 +138,7 @@ def _search_signals(it: dict) -> dict:
                     a real landed-cost input, present on 6 of 60 hits.
       free_shipping whether any free-shipping badge is present (None if the card
                     carries no selling points at all, i.e. unknown rather than no).
+      sponsored     whether the row is a paid placement — see `_is_sponsored`.
       variant_count how many SKUs the listing has — see `_sku_count`.
       price_sku_id  `prices.skuId`, the SKU the card's price actually belongs to.
                     Kept because it is the proof that the card quotes ONE
@@ -120,7 +149,10 @@ def _search_signals(it: dict) -> dict:
         "ship_from": None, "is_choice": False, "sold_exact": None,
         "listing_age": None, "duty_offset": None, "free_shipping": None,
         "variant_count": None, "price_sku_id": None, "stock_left": None,
+        "sponsored": False,
     }
+
+    out["sponsored"] = _is_sponsored(it)
     trace = it.get("trace") if isinstance(it.get("trace"), dict) else {}
 
     out["variant_count"] = _sku_count(it)
@@ -303,7 +335,7 @@ SEARCH_ROW_FIELDS: dict[str, Any] = {
     "rating": None, "sold_count": None, "sold_count_num": None,
     "ship_from": None, "is_choice": False, "listing_age": None,
     "duty_offset": None, "free_shipping": None, "variant_count": None,
-    "stock_left": None, "data_source": None,
+    "stock_left": None, "sponsored": None, "data_source": None,
 }
 
 # What each parser cannot supply, named so the renderer can say which facts are
@@ -311,9 +343,9 @@ SEARCH_ROW_FIELDS: dict[str, Any] = {
 # everything, so it is not listed.
 SEARCH_SOURCE_GAPS = {
     "legacy": ("warehouse country", "listing age", "free-shipping badge",
-               "variant count", "stock"),
+               "variant count", "stock", "sponsored/organic"),
     "html": ("warehouse country", "listing age", "free-shipping badge",
-             "variant count", "stock", "currency"),
+             "variant count", "stock", "currency", "sponsored/organic"),
 }
 
 
@@ -416,6 +448,7 @@ def parse_search_results(html: str) -> list[dict]:
             variant_count=sig["variant_count"],
             price_sku_id=sig["price_sku_id"],
             stock_left=sig["stock_left"],
+            sponsored=sig["sponsored"],
             data_source="ssr",
             url=f"{BASE_URL}/item/{pid}.html",
         ))

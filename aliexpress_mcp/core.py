@@ -47,6 +47,102 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("aliexpress-mcp")
 
 
+# ─── Browser header profile ─────────────────────────────────────────────────
+#
+# AliExpress's anti-bot risk engine (RGV587/FAIL_SYS_USER_VALIDATE — see
+# CHALLENGE_MSG below) is the single worst failure mode this server has, and
+# it does NOT clear by waiting, only a browser challenge does. Anything that
+# makes this client's traffic look less like the Chrome session it borrowed
+# cookies from raises how often the user gets locked out of their own cart.
+# This section builds every header real Chrome attaches — get_client() for
+# page navigations, mtop_call() for the signed XHR/fetch calls — in Chrome's
+# own header order, not just with the right values.
+#
+# ORDER, verified against httpx's own source (httpx._client.Client's `headers`
+# setter + httpx._models.Headers.update, both read directly, Aug 2026): a
+# Client's default headers are a fixed {Accept, Accept-Encoding, Connection,
+# User-Agent} dict. `.update(my_headers)` POPS any of those four keys that
+# also appear in `my_headers` out of their default slot, then APPENDS the
+# entirety of `my_headers` at the end, in `my_headers`'s own order. So a
+# request's final header order is: [any of the default four I did NOT
+# override, in httpx's fixed order] + [every header I DID list, in MY dict's
+# order]. Confirmed empirically too: built (not sent) an httpx.Request and
+# read `request.headers.raw`. Practical consequence — and the reason all four
+# of Accept/Accept-Encoding/Connection/User-Agent are listed explicitly below
+# even where the value never changes: as long as every header is named in the
+# dict, the dict's insertion order IS the wire order. The one exception httpx
+# doesn't let us touch is `Host`, which httpx always injects first regardless
+# of what's in the headers dict — harmless here, since real Chrome puts Host
+# first too on the HTTP/1.1 connections this client actually makes (see the
+# transport-layer limits below).
+#
+# VALUES are built from Chrome's publicly documented Client Hints and Fetch
+# Metadata behavior (the sec-ch-ua-* / sec-fetch-* families), not from a
+# byte-for-byte capture of this account's own browser traffic — nobody had
+# one on hand when this was written. Treat the header NAMES, presence, and
+# relative order as the confirmed part; treat exact wire-format strings
+# (Accept's MIME list, the sec-ch-ua brand list, the current Chrome
+# milestone) as a best-effort match pending a live capture, the same
+# confidence split the CART_SELECT_FIELD/CART_OP_SELECT constants in cart.py
+# got before *their* live verification landed.
+#
+# WHAT THIS CANNOT MATCH, so nobody mistakes closer headers for undetectable:
+#   - HTTP/2 framing. Real Chrome negotiates h2 via ALPN and sends HTTP/2's
+#     pseudo-headers (:method, :authority, :scheme, :path) as a block ahead of
+#     regular headers, with no `Connection` header at all (h2 forbids hop-by-
+#     hop headers). This client speaks plain HTTP/1.1 — the `h2` package
+#     isn't a dependency — so it always sends `Connection: keep-alive` the
+#     way a pre-2015 browser would. Any fingerprinter reading the HTTP/2
+#     settings frame or ALPN handshake (not just header bytes) sees this
+#     immediately, independent of anything below. Adding h2 support is a
+#     dependency change (requirements.txt), which is outside this task's
+#     file scope — flagged for a separate decision, not attempted here.
+#   - TLS ClientHello fingerprinting (JA3/JA3S/JA4/Akamai's HTTP/2
+#     fingerprint). httpx delegates TLS to Python's `ssl` module over
+#     OpenSSL; Chrome links BoringSSL. Cipher list, extension order, and
+#     ALPN offer all differ at the TLS layer, before a single HTTP header is
+#     read. No header change closes this gap.
+CHROME_VERSION_MATCH = re.search(r"Chrome/(\d+)\.", USER_AGENT)
+CHROME_MAJOR_VERSION = CHROME_VERSION_MATCH.group(1) if CHROME_VERSION_MATCH else "131"
+
+# Built from USER_AGENT's own Chrome/<N> token rather than a separately
+# hand-maintained number, so the two can never say different versions — the
+# exact failure mode the task called out: "a UA claiming Chrome 131 alongside
+# client hints claiming a different major version is a stronger bot signal
+# than sending neither." Bump USER_AGENT and this follows automatically.
+SEC_CH_UA = (
+    f'"Chromium";v="{CHROME_MAJOR_VERSION}", "Not(A:Brand";v="24", '
+    f'"Google Chrome";v="{CHROME_MAJOR_VERSION}"'
+)
+# "Not(A:Brand" is Chromium's own GREASE brand — a deliberately fake vendor
+# entry Chromium inserts so header-parsers can't hardcode "there are exactly
+# 2 real brands". Chromium *intentionally rotates* its exact punctuation and
+# version per release channel (see Chromium's GreasedBrandVersionInfo) so
+# this specific string is not itself a stable fingerprint — two genuine
+# Chrome installs on the same version already show different GREASE strings.
+# There is no single "correct" value to chase here.
+
+# Also derived from USER_AGENT rather than stated separately, for the same
+# never-drift reason as CHROME_MAJOR_VERSION above.
+SEC_CH_UA_MOBILE = "?1" if ("Mobile" in USER_AGENT or "Android" in USER_AGENT) else "?0"
+SEC_CH_UA_PLATFORM = (
+    '"Windows"' if "Windows" in USER_AGENT else
+    '"macOS"' if "Macintosh" in USER_AGENT else
+    '"Linux"' if "Linux" in USER_AGENT else
+    '"Unknown"'
+)
+
+# Accept-Language reflects the browser/OS locale a real Chrome install would
+# report — independent of AliExpress's own `_lang`/`shipToCountry` MTOP
+# params, but it was hardcoded to "en-CA" here regardless of the configured
+# market, the same class of bug as report item #7 (shipto-ignores-country;
+# see the shipto-ignores-country memory note) just in an HTTP header instead
+# of an MTOP param: a SE account sent `Accept-Language: en-CA` on every
+# request while `_lang`/`shipToCountry` correctly said SE elsewhere. Derived
+# from COUNTRY, matching the existing `LANG = f"en_{COUNTRY}"` pattern above.
+ACCEPT_LANGUAGE = f"en-{COUNTRY},en;q=0.9"
+
+
 # ─── Auth ───────────────────────────────────────────────────────────────────
 
 # MTOP hands out a fresh `_m_h5_tk` whenever the current one is stale, as an
@@ -87,21 +183,48 @@ def load_cookies() -> dict[str, str]:
 
 
 def get_client(referer: str = BASE_URL) -> httpx.Client:
-    """Create an HTTP client with session cookies and realistic browser headers."""
+    """
+    Create an HTTP client with session cookies and Chrome's own navigation
+    headers, in Chrome's own order (see the "Browser header profile" comment
+    above this module's USER_AGENT constant for what's confirmed vs.
+    best-effort, and for why every header below is listed explicitly even
+    where the value is fixed — it's what pins the wire order).
+
+    Every current caller (search's HTML fetch, get_product_details' HTML
+    fallback) navigates to a same-origin path under BASE_URL with `referer`
+    defaulting to BASE_URL itself — a real browser navigating from the
+    AliExpress homepage would send exactly that, hence the fixed
+    `Sec-Fetch-Site: same-origin` (not "none": that value means NO referrer
+    at all, e.g. a freshly typed URL, which is never this client's case since
+    a `referer` is always supplied here).
+    """
     cookies = load_cookies()
     cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items()) if cookies else ""
 
     headers = {
-        "User-Agent": USER_AGENT,
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-CA,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Referer": referer,
+        "sec-ch-ua": SEC_CH_UA,
+        "sec-ch-ua-mobile": SEC_CH_UA_MOBILE,
+        "sec-ch-ua-platform": SEC_CH_UA_PLATFORM,
         "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",
-        "Sec-Fetch-Mode": "navigate",
+        "User-Agent": USER_AGENT,
+        "Accept": (
+            "text/html,application/xhtml+xml,application/xml;q=0.9,"
+            "image/avif,image/webp,image/apng,*/*;q=0.8,"
+            "application/signed-exchange;v=b3;q=0.7"
+        ),
         "Sec-Fetch-Site": "same-origin",
+        "Sec-Fetch-Mode": "navigate",
         "Sec-Fetch-User": "?1",
+        "Sec-Fetch-Dest": "document",
+        "Referer": referer,
+        # RFC 9218 Extensible Priorities — modern Chrome sends this on the
+        # main document request. "u=0, i" is the top urgency band paired with
+        # "incremental" delivery, which is what Chrome uses for the primary
+        # navigated resource.
+        "Priority": "u=0, i",
+        "Accept-Encoding": "gzip, deflate, br, zstd",
+        "Accept-Language": ACCEPT_LANGUAGE,
+        "Connection": "keep-alive",
     }
     if cookie_str:
         headers["Cookie"] = cookie_str
@@ -265,12 +388,37 @@ def mtop_call(
         params.update(extra_query)
 
     cookie_str = "; ".join(f"{k}={v}" for k, v in cookies.items())
+    resolved_referer = referer or f"{BASE_URL}/"
+
+    # This is a fetch/XHR call FROM a www.aliexpress.com page TO
+    # acs.aliexpress.com — a different origin but the same registrable site,
+    # which per the Fetch Metadata spec is `Sec-Fetch-Site: same-site` (not
+    # "same-origin": the hosts differ; not "cross-site": they share
+    # aliexpress.com), `Sec-Fetch-Mode: cors` (real browsers only send
+    # Sec-Fetch-* on requests THEY generate — MTOP's own mtop.js issues this
+    # as a CORS fetch, same as ours), `Sec-Fetch-Dest: empty` (the response is
+    # consumed as data, not rendered). No `Sec-Fetch-User` / `Upgrade-
+    # Insecure-Requests` — both are navigation-only, never sent on XHR/fetch.
+    # See the module-level "Browser header profile" comment (above USER_AGENT)
+    # for the httpx-order technique and what's confirmed vs. best-effort.
     headers = {
+        "sec-ch-ua": SEC_CH_UA,
+        "sec-ch-ua-mobile": SEC_CH_UA_MOBILE,
+        "sec-ch-ua-platform": SEC_CH_UA_PLATFORM,
         "User-Agent": USER_AGENT,
         "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-CA,en;q=0.9",
-        "Referer": referer or f"{BASE_URL}/",
         "Origin": BASE_URL,
+        "Sec-Fetch-Site": "same-site",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Dest": "empty",
+        "Referer": resolved_referer,
+        # RFC 9218 Extensible Priorities. "u=1, i" (one band below the
+        # top-urgency "u=0" get_client() sends for a main document) is what
+        # Chrome uses for a same-page background fetch like this one.
+        "Priority": "u=1, i",
+        "Accept-Encoding": "gzip, deflate, br, zstd",
+        "Accept-Language": ACCEPT_LANGUAGE,
+        "Connection": "keep-alive",
         "Cookie": cookie_str,
     }
     url = f"{MTOP_BASE}/h5/{api}/{version}/"
@@ -282,8 +430,16 @@ def mtop_call(
             # KB — far past the URL length MTOP's front end accepts, which answers
             # with "Http-Header-Length-Exceed". Those must go in the form body;
             # the signature still covers the same `data` string either way.
-            post_headers = dict(headers)
-            post_headers["Content-Type"] = "application/x-www-form-urlencoded"
+            #
+            # Content-Type is built into its own ordered copy (not appended to
+            # `headers` after the fact) so it lands right after Accept — a
+            # dict's later `key = value` on an already-built dict would just
+            # tack it on at the very end, in the wrong slot for a POST fetch.
+            post_headers = {}
+            for k, v in headers.items():
+                post_headers[k] = v
+                if k == "Accept":
+                    post_headers["Content-Type"] = "application/x-www-form-urlencoded"
             query = {k: v for k, v in params.items() if k != "data"}
             resp = c.post(url, params=query, headers=post_headers, data={"data": data_str})
         else:
@@ -379,8 +535,33 @@ def _resolve_item_id(item_id: str = "", url: str = "") -> Optional[str]:
     if candidate.startswith("http") or "aliexpress.com" in candidate:
         target = candidate if candidate.startswith("http") else "https://" + candidate
         try:
+            # A share link (a.aliexpress.com/_xxx) is pasted or tapped from
+            # OUTSIDE the browser (a chat app, a notes app, …), so a real
+            # Chrome has no referring page at all here — `Sec-Fetch-Site:
+            # none` and no Referer header, unlike get_client()'s same-origin
+            # navigations above. See the "Browser header profile" comment
+            # near USER_AGENT for the rest of what these values mean.
             with httpx.Client(
-                follow_redirects=True, timeout=20.0, headers={"User-Agent": USER_AGENT}
+                follow_redirects=True, timeout=20.0,
+                headers={
+                    "sec-ch-ua": SEC_CH_UA,
+                    "sec-ch-ua-mobile": SEC_CH_UA_MOBILE,
+                    "sec-ch-ua-platform": SEC_CH_UA_PLATFORM,
+                    "Upgrade-Insecure-Requests": "1",
+                    "User-Agent": USER_AGENT,
+                    "Accept": (
+                        "text/html,application/xhtml+xml,application/xml;q=0.9,"
+                        "image/avif,image/webp,image/apng,*/*;q=0.8,"
+                        "application/signed-exchange;v=b3;q=0.7"
+                    ),
+                    "Sec-Fetch-Site": "none",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-User": "?1",
+                    "Sec-Fetch-Dest": "document",
+                    "Accept-Encoding": "gzip, deflate, br, zstd",
+                    "Accept-Language": ACCEPT_LANGUAGE,
+                    "Connection": "keep-alive",
+                },
             ) as c:
                 r = c.get(target)
         except Exception:

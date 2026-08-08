@@ -37,7 +37,8 @@ from aliexpress_mcp.core import (
 from aliexpress_mcp.scrape import parse_product_detail
 from aliexpress_mcp.catalog import (
     apply_sort,
-    SEARCH_RENDER_ATTEMPTS, _search_fetch_parse, _format_product_lines,
+    SEARCH_RENDER_ATTEMPTS, _search_fetch_parse, search_with_notes, search_by_title,
+    normalize_ship_from, _format_product_lines,
     _fetch_pdp_mtop, _informative_tax_note, _lot_note,
     _pdp_error_code, _pdp_unavailable_msg, _extract_pdp_fields, _delivery_days,
     _fetch_reviews, _extract_reviews, _clip_review, _common_sku_affixes,
@@ -114,7 +115,7 @@ def search_products(
             weeks and avoids import charges. Empty = any warehouse.
     """
     try:
-        products, total_results = _search_fetch_parse(query, sort_by, ship_from)
+        products, total_results, notes = search_with_notes(query, sort_by, ship_from)
         products = apply_sort(products, sort_by)
     except RuntimeError as e:
         return str(e)
@@ -154,9 +155,18 @@ def search_products(
     if total_results:
         header += f" ({total_results:,} total)"
     header += f" for '{query}' (sort: {sort_by}"
-    header += f", ships from {ship_from.upper()}" if ship_from else ""
+    # normalize_ship_from, not .upper() — ship_from accepts a list and "EU", and
+    # calling .upper() on a list raises.
+    where = "/".join(normalize_ship_from(ship_from))
+    header += f", ships from {where}" if where else ""
     header += "):"
-    return _format_product_lines(products, header)
+    body = _format_product_lines(products, header)
+    # Notes describe ways the rows differ from what was literally asked for — a
+    # warehouse filter that quietly replaced the keywords, for instance. They are
+    # the difference between a caller seeing 25 speed bumps under a header that
+    # says "fan cable" and knowing why, so they print above the rows rather than
+    # below, where a truncated read would miss them.
+    return "\n".join(notes + [""] + [body]) if notes else body
 
 
 @mcp.tool(
@@ -194,7 +204,7 @@ def find_deals(
         ship_from: Two-letter warehouse country (e.g. "ES", "PL", "CN"). Empty = any.
     """
     try:
-        products, total_results = _search_fetch_parse(query, sort_by, ship_from)
+        products, total_results, notes = search_with_notes(query, sort_by, ship_from)
         products = apply_sort(products, sort_by)
     except RuntimeError as e:
         return str(e)
@@ -218,9 +228,11 @@ def find_deals(
     shown = min(len(deals), 25)
     head = (f"Showing {shown} of {len(deals)} deal(s) for '{query}'"
             if shown < len(deals) else f"Found {len(deals)} deal(s) for '{query}'")
-    if ship_from:
-        head += f", ships from {ship_from.upper()}"
-    return _format_product_lines(deals, head + " (biggest discount first):")
+    where = "/".join(normalize_ship_from(ship_from))
+    if where:
+        head += f", ships from {where}"
+    body = _format_product_lines(deals, head + " (biggest discount first):")
+    return "\n".join(notes + [""] + [body]) if notes else body
 
 
 @mcp.tool(
@@ -679,10 +691,17 @@ def compare_sellers(title: str = "", item_id: str = "", url: str = "", max_candi
 
     max_candidates = min(max(max_candidates, 1), 10)
     try:
-        products, _ = _search_fetch_parse(query)
+        # Titles here are usually the keyword-stuffed originals, and AliExpress
+        # 404s a long enough one outright — a real 2600-piece resistor-pack title
+        # returned "No listings found" while a shorter form of the SAME phrase
+        # returned six near-identical hits. search_by_title walks down a ladder of
+        # progressively shorter queries and reports which rung answered.
+        products, query, notes = search_by_title(query)
     except RuntimeError as e:
         return str(e)
     if not products:
+        # Name the query that actually ran: told "nothing found" for the full
+        # title, a caller cannot tell an absent product from an over-long query.
         return f"No listings found for '{query}'."
 
     # Inspect the top hits: read each one's seller, keep its listing price. Collapse
@@ -721,7 +740,10 @@ def compare_sellers(title: str = "", item_id: str = "", url: str = "", max_candi
         return (-float(yrs), -float(vol), -float(pos))
 
     ranked = sorted(sellers.values(), key=rank_key)
-    lines = [
+    # `query` is whatever rung of the shortening ladder actually answered, not
+    # necessarily what the caller passed — naming it here is what lets them see
+    # that the match was made on a trimmed phrase.
+    lines = list(notes) + ([""] if notes else []) + [
         f'Sellers offering "{query[:60]}" '
         f"({len(ranked)} store(s) across the top {inspected} hits, most-established first):",
         "",

@@ -369,9 +369,37 @@ def apply_sort(products: list[dict], sort_by: str) -> list[dict]:
     return sorted(products, key=key)
 
 
+def _sponsored_note(products: list[dict]) -> Optional[str]:
+    """
+    Qualify the header's sort claim with how many of the shown rows were paid for.
+
+    The header says things like "(sort: orders)", which a reader takes to mean every
+    row earned its position. On live pages the sponsored share ran from 0/60 to
+    56/60, so on some searches that reading is almost entirely wrong and on others
+    it is exactly right — which is why this is counted per search rather than left
+    to a static caveat in the docstring. Rows are neither dropped nor reordered:
+    the product may still be the one the caller wants.
+    """
+    shown = [p for p in products if p.get("sponsored") is not None]
+    ads = [p for p in shown if p.get("sponsored")]
+    if not ads:
+        return None
+    if len(ads) == len(shown):
+        head = "Every row below is a sponsored placement"
+    elif len(ads) == 1:
+        head = f"1 of {len(shown)} rows below is a sponsored placement"
+    else:
+        head = f"{len(ads)} of {len(shown)} rows below are sponsored placements"
+    return (f"⚑ {head} (AliExpress labels these \"Ad\"). Their position was paid for, "
+            "not earned by the sort — they are kept in place and marked · sponsored.")
+
+
 def _format_product_lines(products: list[dict], header: str, limit: int = 25) -> str:
     """Render parsed product dicts into the compact text shared by search + deals."""
     lines = [header]
+    ad_note = _sponsored_note(products[:limit])
+    if ad_note:
+        lines.append(ad_note)
     for p in products[:limit]:
         line = f"- {_short_title(p['title'])}"
         cur = p.get("currency") or CURRENCY
@@ -394,6 +422,12 @@ def _format_product_lines(products: list[dict], header: str, limit: int = 25) ->
             line += f" · ships from {p['ship_from']}"
         if p.get("is_choice"):
             line += " · Choice"
+        # Bought position, not earned rank. One word rather than AliExpress's own
+        # "Ad" badge text: this output is read by an agent with no visual card to
+        # anchor it, and beside "Choice" a bare "Ad" is easy to skim as another
+        # programme name. The per-search count sits under the header.
+        if p.get("sponsored"):
+            line += " · sponsored"
         # The price above belongs to ONE configuration — the SKU the card names in
         # `prices.skuId` — and the field it comes from is called `minPrice` without
         # being one: on item 1005007010293617 the card quoted 190.39 while the

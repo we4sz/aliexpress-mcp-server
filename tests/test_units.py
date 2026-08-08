@@ -1574,5 +1574,90 @@ class TestMtopCallHeaderOrder(unittest.TestCase):
         self.assertNotIn("Content-Type", self._last_order())
 
 
+class TestSponsoredPlacements(unittest.TestCase):
+    """
+    Paid position rendered identically to earned rank, under a header claiming a
+    sort order. Live pages ran 0/60 to 56/60 sponsored.
+    """
+
+    @staticmethod
+    def _p4p_card():
+        return {"p4p": {"clickUrl": "//us-click.aliexpress.com/ci_bb?ot=x"}}
+
+    @staticmethod
+    def _adtag_card():
+        return {"allPlatformInfo": {"adTag": {"displayTagType": "text", "tagText": "Ad"}}}
+
+    def test_both_markers_are_recognised(self):
+        """They never co-occur on a card, so either alone has to be enough."""
+        self.assertTrue(scrape._is_sponsored(self._p4p_card()))
+        self.assertTrue(scrape._is_sponsored(self._adtag_card()))
+
+    def test_an_organic_card_is_not_flagged(self):
+        for card in ({}, {"p4p": None}, {"p4p": {}}, {"allPlatformInfo": {}},
+                     {"allPlatformInfo": {"adTag": {}}},
+                     {"allPlatformInfo": {"adTag": {"tagText": ""}}}):
+            with self.subTest(card=card):
+                self.assertFalse(scrape._is_sponsored(card))
+
+    def test_malformed_shapes_do_not_raise(self):
+        for card in ({"allPlatformInfo": "Ad"}, {"allPlatformInfo": {"adTag": "Ad"}},
+                     {"p4p": ""}):
+            with self.subTest(card=card):
+                self.assertFalse(scrape._is_sponsored(card))
+
+    def test_the_signal_reaches_the_row(self):
+        self.assertTrue(scrape._search_signals(self._p4p_card())["sponsored"])
+        self.assertFalse(scrape._search_signals({})["sponsored"])
+
+    def _rows(self, flags):
+        return [scrape._search_row(item_id=str(i), title="Cable", price=9.0,
+                                   currency="SEK", sponsored=f, data_source="ssr")
+                for i, f in enumerate(flags)]
+
+    def test_marked_rows_are_kept_in_place_not_dropped_or_reordered(self):
+        rows = self._rows([True, False, True])
+        out = catalog._format_product_lines(rows, "H:").splitlines()
+        body = [l for l in out if l.startswith("- ")]
+        self.assertEqual(len(body), 3)                      # dropped nothing
+        self.assertEqual([("sponsored" in l) for l in body], [True, False, True])
+
+    def test_the_header_note_counts_only_the_rows_shown(self):
+        rows = self._rows([True] * 3 + [False] * 30)
+        note = catalog._format_product_lines(rows, "H:", limit=5).splitlines()[1]
+        self.assertIn("3 of 5 rows below are", note)
+
+    def test_an_all_sponsored_page_says_so_plainly(self):
+        note = catalog._sponsored_note(self._rows([True, True]))
+        self.assertIn("Every row below is", note)
+
+    def test_the_count_agrees_with_its_verb(self):
+        one = catalog._sponsored_note(self._rows([True, False]))
+        many = catalog._sponsored_note(self._rows([True, True, False]))
+        self.assertIn("1 of 2 rows below is a sponsored placement", one)
+        self.assertIn("2 of 3 rows below are sponsored placements", many)
+
+    def test_the_note_qualifies_the_sort_claim(self):
+        note = catalog._sponsored_note(self._rows([True, False]))
+        self.assertIn("not earned by the sort", note)
+
+    def test_an_organic_page_gets_no_note(self):
+        self.assertIsNone(catalog._sponsored_note(self._rows([False, False])))
+        out = catalog._format_product_lines(self._rows([False]), "H:")
+        self.assertNotIn("sponsored", out)
+
+    def test_unknown_is_not_counted_as_organic(self):
+        """A fallback parse can't tell, so it must not dilute the ratio."""
+        rows = self._rows([True]) + [scrape._search_row(item_id="9", title="C", price=1.0,
+                                                        data_source="legacy")]
+        self.assertIn("Every row below is", catalog._sponsored_note(rows))
+
+    def test_fallback_parsers_declare_sponsorship_unknown(self):
+        for source in ("legacy", "html"):
+            with self.subTest(source=source):
+                self.assertIn("sponsored/organic", scrape.SEARCH_SOURCE_GAPS[source])
+                self.assertIsNone(scrape._search_row(data_source=source)["sponsored"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
