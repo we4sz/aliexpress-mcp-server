@@ -134,6 +134,22 @@ FULL_AUTH_MSG = (
     "then retry."
 )
 
+# AliExpress's anti-bot risk engine (RGV587) answers with FAIL_SYS_USER_VALIDATE
+# when it wants a human to clear a challenge — this is a different failure mode
+# from an expired session/token above, and looks like a raw platform error code
+# if surfaced verbatim (report item #10). Testing that report established two
+# things: it is NOT time-based (retries at 45s and 90s both still failed), and
+# it cleared ONLY once a human completed the challenge in a logged-in browser
+# tab. So the message has to say plainly that waiting won't help — the natural
+# agent instinct to retry with exponential backoff just burns calls and
+# prolongs the block instead of fixing anything.
+CHALLENGE_MSG = (
+    "AliExpress is holding this request behind a human-verification challenge "
+    "(anti-bot check — FAIL_SYS_USER_VALIDATE / RGV587_ERROR). Waiting will NOT "
+    "clear it — do not retry with backoff. Open aliexpress.com in the browser "
+    "tab you're logged into, complete the challenge there, then retry."
+)
+
 
 # ─── MTOP API Client ────────────────────────────────────────────────────────
 #
@@ -304,6 +320,15 @@ def mtop_call(
                 served[name] = val
         remember_session_cookies(served)
 
+        # This must NOT also swallow FAIL_SYS_USER_VALIDATE / RGV587_ERROR (the
+        # anti-bot human-verification challenge, report item #10) — that failure
+        # doesn't clear with time, confirmed by testing 45s and 90s retries that
+        # both still failed, so silently retrying here would just burn calls and
+        # prolong the block instead of fixing anything. Checked: neither string
+        # contains "FAIL_SYS_TOKEN", so today's substring match already excludes
+        # them; this comment is here so that exclusion stays intentional if the
+        # match is ever broadened. See ret_problem()'s CHALLENGE_MSG for the
+        # caller-facing message — callers must surface it, not loop on it.
         if retries > 0 and "FAIL_SYS_TOKEN" in ret_str:
             new_cookies = dict(cookies)
             new_cookies.update(served)
@@ -537,6 +562,14 @@ def ret_problem(resp: dict) -> Optional[str]:
     ret_str = ret[0] if ret else ""
     if any("SUCCESS" in r for r in ret):
         return None
+    if "FAIL_SYS_USER_VALIDATE" in ret_str or any("RGV587" in r for r in ret):
+        # If the server handed back a challenge/verification URL alongside the
+        # error, surface it — but only if it's actually there; never fabricate
+        # one. Seen in practice on the cart-add endpoint as `data.url`; other
+        # endpoints may omit it, and the message above stands on its own either way.
+        data = resp.get("data") if isinstance(resp, dict) else None
+        url = data.get("url") if isinstance(data, dict) else None
+        return CHALLENGE_MSG + (f" Challenge URL: {url}" if url else "")
     if any(s in ret_str for s in ("SESSION_EXPIRED", "NEED_LOGIN", "ILLEGAL_ACCESS", "NO_LOGIN")):
         return FULL_AUTH_MSG
     if "TOKEN" in ret_str:

@@ -20,8 +20,6 @@ Auth: Session cookies from MCP Auth Bridge extension at
 
 import json
 import re
-import time
-import random
 from typing import Any, Optional
 
 from mcp.server.fastmcp import FastMCP
@@ -973,55 +971,37 @@ def add_to_cart(item_id: str = "", url: str = "", sku_id: str = "", quantity: in
         "addFrom": "main_detail",
     }
 
-    def _is_challenged(r: dict) -> bool:
-        rets = r.get("ret") or [""]
-        return "FAIL_SYS_USER_VALIDATE" in rets[0] or any("RGV587" in str(x) for x in rets)
+    # Writes are the rate-limited surface, so hold them further apart than reads.
+    #
+    # There used to be a 6s/15s backoff loop here that absorbed the anti-bot
+    # challenge "transparently", and a message telling the caller it "clears by
+    # itself — wait a minute or two". Both were wrong, and measured: 45s and 90s
+    # waits were tested and BOTH failed; the block cleared only once a human
+    # completed the challenge in a logged-in browser tab. So retrying spends the
+    # user's rate-limit budget prolonging a block that waiting cannot lift, and
+    # the message sent the caller to do exactly that. Fail immediately instead
+    # and let ret_problem() say what actually works.
+    _pace("cart_write", CART_WRITE_MIN_INTERVAL)
+    try:
+        resp = mtop_call(
+            "mtop.aliexpress.trade.cart.add", "1.0", payload,
+            cookies=cookies,
+            referer=f"{BASE_URL}/item/{item_id}.html",
+            app_key=MTOP_CART_APP_KEY,
+        )
+    except Exception as e:
+        return f"MTOP call failed: {e}"
 
-    # Writes are the rate-limited surface, so hold them further apart than reads
-    # and absorb one cooldown transparently — it typically clears in seconds.
-    resp = None
-    for attempt, backoff in enumerate((6.0, 15.0, None)):
-        _pace("cart_write", CART_WRITE_MIN_INTERVAL)
-        try:
-            resp = mtop_call(
-                "mtop.aliexpress.trade.cart.add", "1.0", payload,
-                cookies=cookies,
-                referer=f"{BASE_URL}/item/{item_id}.html",
-                app_key=MTOP_CART_APP_KEY,
-            )
-        except Exception as e:
-            return f"MTOP call failed: {e}"
-        if not _is_challenged(resp) or backoff is None:
-            break
-        logger.info("cart.add rate-limited; retrying in %.0fs (attempt %d)", backoff, attempt + 1)
-        time.sleep(backoff + random.uniform(0, 2.0))
-
-    ret_all = resp.get("ret") or [""]
-    ret = ret_all[0]
+    ret = (resp.get("ret") or [""])[0]
     data = resp.get("data") or {}
 
-    # AliExpress's risk engine (RGV587) challenges writes with a captcha. It is
-    # scoped to the write endpoint — reads keep working — and clears once the
-    # challenge is solved in a browser and fresh cookies are saved.
-    if "FAIL_SYS_USER_VALIDATE" in ret or any("RGV587" in str(x) for x in ret_all):
-        msg = [
-            f"AliExpress rate-limited this write (anti-bot check) — item {item_id} "
-            "was NOT added.",
-            "",
-            "This is usually a short cooldown triggered by adding several items in "
-            "quick succession, and it clears by itself — wait a minute or two and "
-            "retry. Searching and product lookups keep working meanwhile.",
-            "",
-            "Only if it persists across several minutes: open AliExpress in the "
-            "browser you exported cookies from, add anything to the cart manually, "
-            "then re-save credentials.",
-        ]
-        challenge = data.get("url")
-        if challenge:
-            msg += ["", f"(Verification URL, rarely needed: {challenge})"]
-        return "\n".join(msg)
+    # Challenge detection lives in ret_problem() alone now — it used to be
+    # string-matched here as well, which is how the two copies drifted apart.
+    problem = ret_problem(resp)
+    if problem is not None:
+        return f"Item {item_id} was NOT added to your cart. {problem}"
 
-    if ret_problem(resp) is not None or data.get("addFailed"):
+    if data.get("addFailed"):
         return f"Could not add item {item_id} to cart — AliExpress said: {ret or 'no status returned'}."
 
     lines = [f"Added item {item_id} (variant {sku_id}) ×{quantity} to your cart."]
@@ -1156,6 +1136,33 @@ def remove_from_cart(item_id: str = "", url: str = "", cart_id: str = "", sku_id
         return f"Removed cart line {target['cart_id']} (could not re-read the cart to confirm)."
 
 
+def _subtotal_by_currency(items: list[dict],
+                          default_currency: Optional[str] = None) -> dict[Optional[str], float]:
+    """
+    Sum priced cart lines, grouped by each line's OWN currency.
+
+    AliExpress renders a line in its listing's currency, so one cart can
+    legitimately mix them. Adding USD to SEK produces a figure that is wrong in
+    every currency while looking authoritative — the worst kind of number to
+    hand someone reconciling a basket, and a real session lost time to a ~310 kr
+    discrepancy that did not exist. Grouping makes the mix visible instead.
+
+    `default_currency` is only used for lines that state none themselves; when
+    that is also None the key is None, meaning "AliExpress never said".
+    """
+    out: dict[Optional[str], float] = {}
+    for it in items:
+        if it.get("price") is None:
+            continue
+        cur = it.get("currency") or default_currency
+        try:
+            qty = int(it.get("quantity") or 1)
+        except (TypeError, ValueError):
+            qty = 1
+        out[cur] = round(out.get(cur, 0.0) + it["price"] * qty, 2)
+    return out
+
+
 @mcp.tool(
     title="View Cart",
     annotations=ToolAnnotations(
@@ -1253,8 +1260,22 @@ def view_cart() -> str:
             "The cart-line block shape may have changed."
         )
 
-    currency = cart.get("currency") or (summary.get("currency") if used_droplet else None) or CURRENCY
+    # The currency AliExpress actually stated for this cart — deliberately NOT
+    # defaulted to the configured CURRENCY. The cart renders each line in its
+    # listing's own currency, which is often not the configured one, so a
+    # fallback here stamps e.g. "SEK" onto a figure the server reported in USD.
+    # A real session hit exactly that: a cart reconciled against USD values
+    # under a SEK label produced a ~310 kr discrepancy that did not exist, and
+    # the same cart read as USD early in the session and SEK later because the
+    # droplet and legacy paths labelled money differently. None means "unstated"
+    # here, and every place below that prints money copes with that.
+    currency = cart.get("currency") or (summary.get("currency") if used_droplet else None)
     n = len(items)
+
+    def _money(amount: float, cur: Optional[str] = None) -> str:
+        """Never label an amount with a currency the response did not state."""
+        cur = cur or currency
+        return _fmt_money(amount, cur) if cur else f"{amount:.2f} (currency unstated)"
 
     # Honest header. AliExpress paginates the cart (append / infinite-scroll behind
     # an opaque cursor); the render API exposes only the first page, so the shown
@@ -1293,7 +1314,7 @@ def view_cart() -> str:
         sc = it.get("shipping_cost")
         if sc is None:
             return None
-        return "Free" if sc == 0 else _fmt_money(sc, it.get("currency") or currency)
+        return "Free" if sc == 0 else _money(sc, it.get("currency"))
 
     def _prevailing(vals: list[Optional[str]]) -> Optional[str]:
         """Value shared by enough lines that hoisting it is a net saving."""
@@ -1325,7 +1346,7 @@ def view_cart() -> str:
         for it in group:
             line = f"  - {it['title']}"
             if it.get("price") is not None:
-                line += f" — {_fmt_money(it['price'], it.get('currency') or currency)}"
+                line += f" — {_money(it['price'], it.get('currency'))}"
             if it.get("original_price") and it["original_price"] > (it.get("price") or 0):
                 line += f" (was {it['original_price']:.2f})"
             qty = it.get("quantity") or 1
@@ -1367,9 +1388,16 @@ def view_cart() -> str:
     # server's own subtotal/total reflect only the checkbox-*selected* lines
     # (that's why a cart of priced items can report an "Estimated total" of 0.00),
     # so we compute ours and label the server figure honestly.
-    priced = [(it["price"], int(it.get("quantity") or 1)) for it in items if it.get("price") is not None]
+    #
+    # Grouped by each line's OWN currency. AliExpress renders a line in its
+    # listing's currency, so one cart can legitimately mix them, and adding USD
+    # to SEK yields a figure that is wrong in every currency while looking
+    # authoritative — the worst kind of number to hand a caller reconciling a
+    # basket. When every line agrees (the normal case) this prints exactly as
+    # it did before; when they don't, it refuses to fake a single total.
+    priced = [it for it in items if it.get("price") is not None]
+    by_currency = _subtotal_by_currency(priced, currency)
     if priced:
-        shown_subtotal = round(sum(p * q for p, q in priced), 2)
         # Say what the number actually covers. Unpriced lines (unavailable items
         # carry no price) were silently dropped from the sum while the label still
         # claimed "all items shown" — a total narrower than its own description.
@@ -1382,7 +1410,14 @@ def view_cart() -> str:
             scope = f"{len(priced)} of {len(items)} items; {unpriced} unpriced"
         else:
             scope = "all items shown"
-        lines.append(f"Subtotal ({scope}): {_fmt_money(shown_subtotal, currency)}")
+        if len(by_currency) == 1:
+            only = next(iter(by_currency))
+            lines.append(f"Subtotal ({scope}): {_money(by_currency[only], only)}")
+        else:
+            lines.append(f"Subtotal ({scope}) — this cart mixes currencies, so there "
+                         "is no single total; they cannot be added without an FX rate:")
+            for c, amount in sorted(by_currency.items(), key=lambda kv: str(kv[0])):
+                lines.append(f"  {_money(amount, c)}")
     # AliExpress's own totals. On the droplet path they come from that response's
     # summary component, already formatted in its pay currency, and are printed
     # verbatim — never re-formatted under a label from somewhere else. On the
@@ -1405,7 +1440,7 @@ def view_cart() -> str:
             )
     elif cart.get("total") is not None:
         lines.append(
-            f"AliExpress checkout estimate (selected items only): {_fmt_money(cart['total'], currency)}"
+            f"AliExpress checkout estimate (selected items only): {_money(cart['total'])}"
         )
 
     return "\n".join(lines).rstrip()

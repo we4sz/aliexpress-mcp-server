@@ -35,6 +35,36 @@ from aliexpress_mcp.core import (
 ORDER_LIST_API = "mtop.aliexpress.trade.buyer.order.list"
 
 
+def _order_line_variant(sku_attrs) -> Optional[str]:
+    """
+    Turn an order line's `skuAttrs` into a display string, e.g. "Color: 10PCS".
+
+    This is the only place the actually-purchased variant lives. The order-line
+    *title* is the product's generic listing title — for a "5/10PCS ..." listing
+    it names every pack size the seller offers, not the one bought. `skuAttrs` is
+    a list of {id, name, text, vid}; `name` is the seller's own attribute label,
+    which AliExpress reuses loosely (a pack-size choice is commonly filed under
+    the generic "Color" slot, id 14 — verified live: a "10PCS" order line carries
+    `skuAttrs: [{"name": "Color", "text": "10PCS"}]`). We render the label AliExpress
+    gave it rather than guess a better one, since relabeling risks being wrong in
+    the other direction. Some order lines legitimately carry no skuAttrs at all
+    (single-variant products) — that's a normal absence, not a parse failure, so
+    this returns None rather than a placeholder.
+    """
+    if not isinstance(sku_attrs, list) or not sku_attrs:
+        return None
+    parts = []
+    for attr in sku_attrs:
+        if not isinstance(attr, dict):
+            continue
+        text = attr.get("text")
+        if not text:
+            continue
+        name = attr.get("name")
+        parts.append(f"{name}: {text}" if name else str(text))
+    return "; ".join(parts) if parts else None
+
+
 def _extract_orders(resp: dict, max_orders: int) -> list[dict]:
     """
     Parse the order.list block-map. `data.data` is keyed by block id; order blocks
@@ -58,6 +88,10 @@ def _extract_orders(resp: dict, max_orders: int) -> list[dict]:
                 "price": _normalize_price(raw),          # normalized numeric amount
                 "currency": ol.get("currencyCode"),      # ISO code for that amount
                 "quantity": ol.get("quantity"),
+                # Which SKU was actually bought — see _order_line_variant. This is
+                # what answers "which size/pack did I buy", not `quantity` (that's
+                # how many of that SKU, e.g. how many 10-packs).
+                "variant": _order_line_variant(ol.get("skuAttrs")),
                 "product_id": ol.get("productId"),
             })
 
@@ -91,6 +125,12 @@ def _order_money(amount: Optional[float], currency: Optional[str], raw: Optional
 def _order_item_line(it: dict, bullet: str = "  • ") -> str:
     """Render one order line item as a compact text line."""
     seg = f"{bullet}{str(it.get('title') or '')[:100]}"
+    # The variant is what disambiguates a multi-option listing title (a
+    # "5/10PCS ..." title names every pack size the seller sells, not the one
+    # bought) — put it right after the title, before quantity/price, since it
+    # answers the question order history is usually consulted for: which one.
+    if it.get("variant"):
+        seg += f" ({it['variant']})"
     qty = it.get("quantity")
     try:
         if qty and int(qty) != 1:

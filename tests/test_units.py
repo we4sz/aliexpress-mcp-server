@@ -29,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 os.environ["ALIEXPRESS_COUNTRY"] = "SE"
 os.environ["ALIEXPRESS_CURRENCY"] = "SEK"
 
-from aliexpress_mcp import catalog, core, scrape  # noqa: E402
+from aliexpress_mcp import account, catalog, core, scrape  # noqa: E402
 
 
 class TestNormalizePrice(unittest.TestCase):
@@ -334,11 +334,45 @@ class TestRetProblem(unittest.TestCase):
                          core.AUTH_EXPIRED_MSG)
 
     def test_unknown_failure_is_surfaced_verbatim(self):
-        msg = core.ret_problem({"ret": ["RGV587_ERROR::SM"]})
-        self.assertIn("RGV587_ERROR", msg)
+        msg = core.ret_problem({"ret": ["FAIL_SOME_NEW_CODE::SM"]})
+        self.assertIn("FAIL_SOME_NEW_CODE", msg)
 
     def test_missing_ret(self):
         self.assertIn("unknown error", core.ret_problem({}))
+
+    def test_user_validate_challenge_says_not_to_wait(self):
+        # Report item #10: this code looked like an opaque platform string and
+        # invited the natural-but-wrong response of retrying with backoff.
+        # Testing established it is NOT time-based (45s and 90s retries both
+        # still failed) and clears only once a human completes the challenge
+        # in a logged-in browser tab — the message must say so plainly.
+        msg = core.ret_problem({"ret": ["FAIL_SYS_USER_VALIDATE::访问被拒绝"]})
+        self.assertIn("human-verification challenge", msg)
+        self.assertIn("Waiting will NOT clear it", msg)
+        self.assertIn("do not retry with backoff", msg)
+        self.assertIn("logged into", msg)
+
+    def test_rgv587_variant_is_also_detected(self):
+        # AliExpress doesn't always lead with FAIL_SYS_USER_VALIDATE — the raw
+        # RGV587_ERROR code shows up too. Both must map to the same actionable
+        # message, not fall through to the generic "unknown error" text.
+        msg = core.ret_problem({"ret": ["RGV587_ERROR::SM"]})
+        self.assertEqual(msg, core.CHALLENGE_MSG)
+
+    def test_challenge_url_is_included_when_present(self):
+        resp = {
+            "ret": ["FAIL_SYS_USER_VALIDATE::访问被拒绝"],
+            "data": {"url": "https://verify.aliexpress.com/some-challenge"},
+        }
+        msg = core.ret_problem(resp)
+        self.assertIn("https://verify.aliexpress.com/some-challenge", msg)
+
+    def test_challenge_message_stands_alone_without_a_url(self):
+        # No URL in the payload must never produce a fabricated one — the
+        # message should still be complete and actionable on its own.
+        msg = core.ret_problem({"ret": ["FAIL_SYS_USER_VALIDATE::访问被拒绝"]})
+        self.assertEqual(msg, core.CHALLENGE_MSG)
+        self.assertNotIn("Challenge URL", msg)
 
 
 class TestBlockHelpers(unittest.TestCase):
@@ -370,6 +404,119 @@ class TestBlockHelpers(unittest.TestCase):
 
     def test_block_by_prefix_miss(self):
         self.assertEqual(core._block_by_prefix(self.RESP, "nope"), (None, {}))
+
+
+class TestOrderLineVariant(unittest.TestCase):
+    """
+    skuAttrs -> a "Name: text" display string. This is the only place the
+    actually-purchased option lives — the order-line *title* is the listing's
+    generic title (a "5/10PCS ..." title names every pack size the seller
+    offers), not the one bought.
+    """
+
+    def test_single_attr(self):
+        attrs = [{"id": 14, "name": "Color", "text": "10PCS", "vid": 350852}]
+        self.assertEqual(account._order_line_variant(attrs), "Color: 10PCS")
+
+    def test_multiple_attrs_join_in_order(self):
+        attrs = [
+            {"name": "Color", "text": "30cm"},
+            {"name": "Specification", "text": "3Pse-1Set"},
+            {"name": "Length", "text": "20pin"},
+        ]
+        self.assertEqual(
+            account._order_line_variant(attrs),
+            "Color: 30cm; Specification: 3Pse-1Set; Length: 20pin",
+        )
+
+    def test_missing_name_falls_back_to_bare_text(self):
+        self.assertEqual(account._order_line_variant([{"text": "10PCS"}]), "10PCS")
+
+    def test_absence_is_none_not_a_placeholder(self):
+        """Single-variant products legitimately carry no skuAttrs — don't invent one."""
+        for absent in (None, [], "not-a-list", [{"name": "Color"}], [{"text": ""}]):
+            with self.subTest(absent=absent):
+                self.assertIsNone(account._order_line_variant(absent))
+
+    def test_skips_non_dict_entries(self):
+        attrs = [{"name": "Color", "text": "Red"}, "junk", None]
+        self.assertEqual(account._order_line_variant(attrs), "Color: Red")
+
+
+class TestExtractOrders(unittest.TestCase):
+    """
+    Trimmed excerpt of a real `order.list` response (captured Aug 2026): one
+    order line whose listing title is a multi-pack "5/10PCS ..." — the title
+    alone can't say which pack size arrived, only skuAttrs can. A second,
+    variant-less line checks that absence comes through as None, not invented.
+    """
+
+    RESP = {"data": {"data": {
+        "pc_om_list_order_1": {"fields": {
+            "orderId": "3067411194489960",
+            "statusText": "Completed",
+            "orderDateText": "Jan 8, 2026",
+            "storeName": "Shop1103734083 Store",
+            "totalPriceText": "US $6.19",
+            "currencyCode": "USD",
+            "orderLines": [
+                {
+                    "itemTitle": "5/10PCS Smart 3pin KY-015 DHT-11 DHT11 Digital Temperature Sensor",
+                    "itemPriceText": "US $6.19",
+                    "currencyCode": "USD",
+                    "quantity": 1,
+                    "productId": "1005006252875198",
+                    "skuAttrs": [{"id": 14, "name": "Color", "text": "10PCS", "vid": 350852}],
+                },
+                {
+                    "itemTitle": "5 Pair DC 12V Male Female Socket Panel Mount Barrels Jack Plug",
+                    "itemPriceText": "US $1.99",
+                    "currencyCode": "USD",
+                    "quantity": 1,
+                    "productId": "1005006979680743",
+                    "skuAttrs": None,
+                },
+            ],
+        }},
+    }}}
+
+    def test_variant_carries_the_purchased_pack_size(self):
+        orders = account._extract_orders(self.RESP, 10)
+        self.assertEqual(orders[0]["items"][0]["variant"], "Color: 10PCS")
+
+    def test_line_without_skuattrs_reports_none(self):
+        orders = account._extract_orders(self.RESP, 10)
+        self.assertIsNone(orders[0]["items"][1]["variant"])
+
+    def test_quantity_still_comes_through(self):
+        orders = account._extract_orders(self.RESP, 10)
+        self.assertEqual(orders[0]["items"][0]["quantity"], 1)
+
+
+class TestOrderItemLine(unittest.TestCase):
+    """
+    Rendering: the variant sits right after the title, before ×qty / price —
+    it answers "which one", which is what order history gets consulted for.
+    """
+
+    def test_variant_is_parenthesized_after_the_title(self):
+        it = {"title": "5/10PCS Smart 3pin KY-015 DHT-11", "variant": "Color: 10PCS",
+              "quantity": 1, "price": 6.19, "currency": "USD"}
+        line = account._order_item_line(it)
+        self.assertIn("(Color: 10PCS)", line)
+        self.assertLess(line.index("(Color: 10PCS)"), line.index("6.19"))
+
+    def test_variant_and_multi_quantity_together(self):
+        it = {"title": "Cooling Fan", "variant": "Color: BK-1pcs",
+              "quantity": 5, "price": 8.99, "currency": "USD"}
+        line = account._order_item_line(it)
+        self.assertIn("(Color: BK-1pcs)", line)
+        self.assertIn("×5", line)
+        self.assertLess(line.index("(Color: BK-1pcs)"), line.index("×5"))
+
+    def test_no_variant_omits_the_parens_entirely(self):
+        it = {"title": "Plain item", "variant": None, "quantity": 1, "price": 1.99, "currency": "USD"}
+        self.assertNotIn("(", account._order_item_line(it))
 
 
 class TestGoldenSkeleton(unittest.TestCase):
@@ -407,3 +554,41 @@ class TestGoldenSkeleton(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestSubtotalByCurrency(unittest.TestCase):
+    """
+    A cart subtotal that silently adds USD to SEK is wrong in every currency
+    while looking authoritative. One real session lost time chasing a ~310 kr
+    discrepancy that did not exist, so this is pinned.
+    """
+
+    def setUp(self):
+        import aliexpress_mcp.server as server
+        self.fn = server._subtotal_by_currency
+
+    def test_single_currency_reads_as_one_total(self):
+        items = [{"price": 10.0, "currency": "SEK", "quantity": 2},
+                 {"price": 5.5, "currency": "SEK"}]
+        self.assertEqual(self.fn(items), {"SEK": 25.5})
+
+    def test_mixed_currencies_stay_separate(self):
+        items = [{"price": 10.0, "currency": "SEK"},
+                 {"price": 4.0, "currency": "USD", "quantity": 3}]
+        self.assertEqual(self.fn(items), {"SEK": 10.0, "USD": 12.0})
+
+    def test_unpriced_lines_are_skipped_not_zeroed(self):
+        items = [{"price": None, "currency": "SEK"}, {"price": 7.0, "currency": "SEK"}]
+        self.assertEqual(self.fn(items), {"SEK": 7.0})
+
+    def test_line_currency_wins_over_the_cart_default(self):
+        items = [{"price": 3.0, "currency": "USD"}, {"price": 2.0}]
+        self.assertEqual(self.fn(items, "SEK"), {"USD": 3.0, "SEK": 2.0})
+
+    def test_unstated_currency_is_none_not_the_configured_one(self):
+        """The whole point: never invent a currency the response did not state."""
+        self.assertEqual(self.fn([{"price": 9.0}]), {None: 9.0})
+
+    def test_bad_quantity_falls_back_to_one(self):
+        self.assertEqual(self.fn([{"price": 2.0, "currency": "SEK", "quantity": "x"}]),
+                         {"SEK": 2.0})
